@@ -1,0 +1,193 @@
+{
+  "frames": [
+    {
+      "id": "frame-00.png",
+      "url": "/api/assets/29613309b2a3418ebb0c32569772d6f5/frame-00.png",
+      "observation_id": "2025W17_4B_0021_1D6",
+      "observed_at": "2025-04-24T21:06:38.390400+00:00",
+      "detector": "D6",
+      "wavelength_um": 4.443903926648308,
+      "bandwidth_um": 0.036778750523679814,
+      "release": "DR1",
+      "source_url": "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/level2/2025W17_4B/l2b-v27-2026-196/6/level2_2025W17_4B_0021_1D6_spx_l2b-v27-2026-196.fits?center=248.16723307280128%2C66.75502382666444d&size=0.08333333333333333",
+      "warnings": [
+        "Display preview; no PSF/background matching or photometric inference."
+      ],
+      "units": "MJy/sr",
+      "processing_version": "7.0.5",
+      "mask_fraction": 0.23615160349854228
+    },
+    {
+      "id": "frame-01.png",
+      "url": "/api/assets/29613309b2a3418ebb0c32569772d6f5/frame-01.png",
+      "observation_id": "2025W18_1B_0085_3D6",
+      "observed_at": "2025-04-29T02:14:40.214400+00:00",
+      "detector": "D6",
+      "wavelength_um": 4.456189181341491,
+      "bandwidth_um": 0.036429393944030206,
+      "release": "DR1",
+      "source_url": "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/level2/2025W18_1B/l2b-v27-2026-196/6/level2_2025W18_1B_0085_3D6_spx_l2b-v27-2026-196.fits?center=248.16723307280128%2C66.75502382666444d&size=0.08333333333333333",
+      "warnings": [
+        "Display preview; no PSF/background matching or photometric inference."
+      ],
+      "units": "MJy/sr",
+      "processing_version": "7.0.5",
+      "mask_fraction": 0.23990004164931278
+    },
+    {
+      "id": "frame-02.png",
+      "url": "/api/assets/29613309b2a3418ebb0c32569772d6f5/frame-02.png",
+      "observation_id": "2025W19_1B_0228_4D6",
+      "observed_at": "2025-05-06T10:18:17.308800+00:00",
+      "detector": "D6",
+      "wavelength_um": 4.457177602199502,
+      "bandwidth_um": 0.03655027700757516,
+      "release": "DR1",
+      "source_url": "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/level2/2025W19_1B/l2b-v27-2026-197/6/level2_2025W19_1B_0228_4D6_spx_l2b-v27-2026-197.fits?center=248.16723307280128%2C66.75502382666444d&size=0.08333333333333333",
+      "warnings": [
+        "Display preview; no PSF/background matching or photometric inference."
+      ],
+      "units": "MJy/sr",
+      "processing_version": "7.0.5",
+      "mask_fraction": 0.26322365680966264
+    }
+  ],
+  "warnings": [
+    "Metadata limited to the earliest 100 matching exposures; narrow the date range to inspect later observations.",
+    "Inspecting 24 exposures sampled across available dates and detectors D2/D6.",
+    "21 candidate exposure(s) omitted; see the manifest for reasons.",
+    "Detector D2/D6 candidate search; not all 102 spectral channels.",
+    "Spectral response matched at the target and four points in the central 3 arcminutes within half the narrower bandwidth; exploratory comparison, not a full-field spectral equivalence guarantee.",
+    "All archive flags except SOURCE (bit 21) are masked; invalid pixels remain transparent."
+  ],
+  "retrieved_at": "2026-11-13T17:01:23.733633+00:00",
+  "cached": false,
+  "grid": "ICRS TAN; north up, east left; 6.14 arcsec/pixel",
+  "stretch": "asinh (one shared intensity scale)",
+  "query": {
+    "ra_deg": 248.16723307280128,
+    "dec_deg": 66.75502382666444,
+    "start_utc": null,
+    "end_utc": null
+  },
+  "processing": {
+    "version": "1.0.0",
+    "spectral_tolerance": 0.5,
+    "flag_policy": "mask all FLAGS except SOURCE (bit 21)",
+    "zodi_subtracted": false,
+    "grid_header": {
+      "WCSAXES": 2,
+      "CRPIX1": 25.0,
+      "CRPIX2": 25.0,
+      "CDELT1": -0.0017055555555556,
+      "CDELT2": 0.0017055555555556,
+      "CUNIT1": "deg",
+      "CUNIT2": "deg",
+      "CTYPE1": "RA---TAN",
+      "CTYPE2": "DEC--TAN",
+      "CRVAL1": 248.1672330728,
+      "CRVAL2": 66.755023826664,
+      "LONPOLE": 180.0,
+      "LATPOLE": 66.755023826664,
+      "MJDREF": 0.0,
+      "RADESYS": "ICRS"
+    },
+    "stretch": {
+      "vmin": 0.5255713462494219,
+      "vmax": 38.833349079738085,
+      "asinh_a": 0.1,
+      "units": "MJy/sr"
+    },
+    "output_shape": [
+      49,
+      49
+    ],
+    "psf_matched": false
+  },
+  "omissions": [
+    {
+      "observation_id": "2025W24_1A_0215_3D2",
+      "reason": "An archive cutout could not be downloaded"
+    },
+    {
+      "observation_id": "2025W24_1A_0631_2D6",
+      "reason": "An archive cutout could not be downloaded"
+    },
+    {
+      "observation_id": "2025W26_1A_0506_2D2",
+      "reason": "Exposure does not cover the target and interior field samples"
+    },
+    {
+      "observation_id": "2025W26_1A_0517_1D2",
+      "reason": "Exposure does not cover the target and interior field samples"
+    },
+    {
+      "observation_id": "2025W27_1A_0541_1D2",
+      "reason": "An archive cutout could not be downloaded"
+    },
+    {
+      "observation_id": "2025W27_1A_0555_3D2",
+      "reason": "Exposure does not cover the target and interior field samples"
+    },
+    {
+      "observation_id": "2025W17_4B_0145_3D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W17_4B_0431_1D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W18_1B_0263_3D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W18_2B_0015_1D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W18_2B_0202_3D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W21_1B_0329_1D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W23_1C_0021_4D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W23_2B_0696_1D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W23_2B_0696_4D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W24_1A_0123_3D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W24_2D_0074_1D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W24_2D_0534_1D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W24_2D_0534_4D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W27_1A_0331_2D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W47_1A_0388_2D2",
+      "reason": "Outside selected spectral group or frame limit"
+    }
+  ]
+}

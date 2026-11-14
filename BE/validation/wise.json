@@ -1,0 +1,122 @@
+{
+  "target": "wise",
+  "checked_at": "2026-11-13T16:54:50.845956+00:00",
+  "query": {
+    "ra_deg": 133.7951291667,
+    "dec_deg": -7.2451472222,
+    "start_utc": null,
+    "end_utc": null
+  },
+  "frames": 2,
+  "dates": [
+    "2025-05-05T16:48:02.419200+00:00",
+    "2026-05-11T02:18:44.640000+00:00"
+  ],
+  "sources": [
+    "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/level2/2025W19_1B/l2b-v27-2026-197/6/level2_2025W19_1B_0116_1D6_spx_l2b-v27-2026-197.fits?center=133.7951291667%2C-7.2451472222d&size=0.08333333333333333",
+    "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/level2/2026W20_1A/l2b-v27-2026-246/6/level2_2026W20_1A_0033_1D6_spx_l2b-v27-2026-246.fits?center=133.7951291667%2C-7.2451472222d&size=0.08333333333333333"
+  ],
+  "mask_fractions": [
+    0.23198667221990837,
+    0.18908788004997917
+  ],
+  "warnings": [
+    "Inspecting 24 exposures sampled across available dates and detectors D2/D6.",
+    "22 candidate exposure(s) omitted; see the manifest for reasons.",
+    "Detector D2/D6 candidate search; not all 102 spectral channels.",
+    "Spectral response matched at the target and four points in the central 3 arcminutes within half the narrower bandwidth; exploratory comparison, not a full-field spectral equivalence guarantee.",
+    "All archive flags except SOURCE (bit 21) are masked; invalid pixels remain transparent."
+  ],
+  "omissions": [
+    {
+      "observation_id": "2025W46_2A_0226_1D6",
+      "reason": "An archive cutout could not be downloaded"
+    },
+    {
+      "observation_id": "2025W50_2A_0391_1D2",
+      "reason": "An archive cutout could not be downloaded"
+    },
+    {
+      "observation_id": "2026W17_1B_0507_2D6",
+      "reason": "An archive cutout could not be downloaded"
+    },
+    {
+      "observation_id": "2026W17_1B_0634_3D6",
+      "reason": "An archive cutout could not be downloaded"
+    },
+    {
+      "observation_id": "2025W19_1B_0181_1D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W19_1B_0231_1D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W45_2A_0164_2D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W45_2A_0192_2D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W45_2A_0278_4D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W45_2A_0308_1D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W46_1A_0076_1D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W46_1A_0090_2D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W46_1A_0108_1D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W46_2A_0214_1D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2025W46_2A_0289_1D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2026W17_1B_0227_2D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2026W17_2A_0609_2D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2026W18_2A_0247_2D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2026W18_2A_0441_2D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2026W19_2A_0568_1D6",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2026W20_1A_0214_1D2",
+      "reason": "Outside selected spectral group or frame limit"
+    },
+    {
+      "observation_id": "2026W20_1A_1166_1D2",
+      "reason": "Outside selected spectral group or frame limit"
+    }
+  ],
+  "outcome": "playable sequence",
+  "detection_claim": "none; visual inspection is required"
+}
