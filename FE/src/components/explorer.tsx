@@ -7,6 +7,7 @@ import {
   useMemo,
   useLayoutEffect,
   FormEvent,
+  type ReactNode,
 } from "react";
 import {
   ArrowUpRight,
@@ -68,6 +69,37 @@ const stages: Record<string, string> = {
   render: "Preparing images",
   queued: "Waiting for processing",
 };
+function Notification({
+  children,
+  label,
+  onDismiss,
+  variant,
+}: {
+  children: ReactNode;
+  label: string;
+  onDismiss: () => void;
+  variant?: "error" | "processing";
+}) {
+  return (
+    <p className={variant} role={variant === "error" ? "alert" : undefined}>
+      {variant === "processing" ? (
+        <LoaderCircle size={14} className="spin" />
+      ) : (
+        <Info size={14} />
+      )}
+      <span className="notification-copy">{children}</span>
+      <button
+        type="button"
+        className="notification-close"
+        aria-label={`Dismiss ${label}`}
+        title="Dismiss notification"
+        onClick={onDismiss}
+      >
+        <X size={14} />
+      </button>
+    </p>
+  );
+}
 export default function Explorer() {
   const [targets, setTargets] = useState(presets),
     [selected, setSelected] = useState(""),
@@ -85,10 +117,14 @@ export default function Explorer() {
     [error, setError] = useState(""),
     [notice, setNotice] = useState(""),
     [copied, setCopied] = useState(false);
+  const [dismissedDraft, setDismissedDraft] = useState("");
+  const [progressDismissed, setProgressDismissed] = useState(false);
+  const [previousDismissed, setPreviousDismissed] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(true);
   const [datesOpen, setDatesOpen] = useState(false);
   const [fov, setFov] = useState("300");
+  const draftKey = JSON.stringify([ra, dec, fov, start, end]);
   const [fieldJobId, setFieldJobId] = useState("");
   const [sequenceId, setSequenceId] = useState("");
   const [viewMode, setViewMode] = useState<"browse" | "matched">("browse");
@@ -160,6 +196,12 @@ export default function Explorer() {
     [allFrames],
   );
   const observations = manifest?.observations;
+  const pointingCount = useMemo(
+    () =>
+      new Set((observations || []).map((o) => o.id.replace(/D[1-6]$/, "")))
+        .size,
+    [observations],
+  );
   const filteredObservations = useMemo(
     () =>
       (observations || []).filter(
@@ -255,6 +297,9 @@ export default function Explorer() {
       setBusy(true);
       setError("");
       setNotice("");
+      setDismissedDraft("");
+      setProgressDismissed(false);
+      setPreviousDismissed(false);
       if (!more) setPlaying(false);
       setCommitted(query);
       if (!more) {
@@ -531,7 +576,11 @@ export default function Explorer() {
       if (e.key === "Escape") {
         setInspectorOpen(false);
       }
-      if ((e.target as HTMLElement).closest("input,select,textarea,button,a"))
+      if (
+        (e.target as HTMLElement).closest(
+          'input,select,textarea,button,a,[role="button"]',
+        )
+      )
         return;
       if (e.code === "Space") {
         if (!canPlay && !playing) return;
@@ -913,6 +962,14 @@ export default function Explorer() {
                     matching wavelengths before interpreting changes in
                     brightness.
                   </p>
+                  <p>
+                    Observation counts refer to detector images covering the
+                    coordinate, not distinct objects or dates. Multiple
+                    detectors can contribute images from one pointing. Blink
+                    aligned observations from different dates to inspect motion
+                    relative to background stars. Use Matched for compatible
+                    wavelength and calibration groups.
+                  </p>
                 </>
               ) : (
                 <>
@@ -941,45 +998,56 @@ export default function Explorer() {
           <div className="feedback" aria-live="polite">
             {committed &&
               !busy &&
+              dismissedDraft !== draftKey &&
               (Number(fov) !== (committed.fov_arcsec || 300) ||
                 Number(ra) !== committed.ra_deg ||
                 Number(dec) !== committed.dec_deg ||
                 start !== (committed.start_utc?.slice(0, 10) || "") ||
                 end !== (committed.end_utc?.slice(0, 10) || "")) && (
-                <p>
-                  <Info size={14} />
+                <Notification
+                  label="query change notice"
+                  onDismiss={() => setDismissedDraft(draftKey)}
+                >
                   Query edited. The viewer still shows the last searched field.
                   Search to apply changes.
-                </p>
+                </Notification>
               )}
-            {busy && (
-              <p className="processing">
-                <LoaderCircle size={14} className="spin" />
+            {busy && !progressDismissed && (
+              <Notification
+                variant="processing"
+                label="search progress"
+                onDismiss={() => setProgressDismissed(true)}
+              >
                 {stage}.
                 {manifest?.frames.length ? " Previous field shown." : ""}
-              </p>
+              </Notification>
             )}
             {!busy &&
+              !previousDismissed &&
               displayedQuery &&
               committed &&
               displayedQuery !== committed &&
               frames.length > 0 && (
-                <p>
-                  <Info size={14} />
+                <Notification
+                  label="previous field notice"
+                  onDismiss={() => setPreviousDismissed(true)}
+                >
                   Showing the previous field. The latest search has no result.
-                </p>
+                </Notification>
               )}
             {error && (
-              <p role="alert" className="error">
-                <Info size={15} />
+              <Notification
+                variant="error"
+                label="error"
+                onDismiss={() => setError("")}
+              >
                 {error}
-              </p>
+              </Notification>
             )}
             {notice && (
-              <p>
-                <Info size={15} />
+              <Notification label="notice" onDismiss={() => setNotice("")}>
                 {notice}
-              </p>
+              </Notification>
             )}
           </div>
           <div
@@ -1338,8 +1406,16 @@ export default function Explorer() {
                 <Layers size={14} />
                 <strong>Observations</strong>
                 <span className="count-badge">
-                  {observations?.length ?? allFrames.length}
+                  {observations?.length ?? allFrames.length} images
                 </span>
+                {observations && (
+                  <span
+                    className="pointing-count"
+                    title="Unique observation IDs before the detector suffix. One pointing can contribute multiple detector images."
+                  >
+                    {pointingCount} pointings
+                  </span>
+                )}
                 <ChevronDown size={14} />
               </button>
               <button

@@ -65,6 +65,56 @@ def test_compatibility_is_pairwise_and_rejects_different_calibration():
     assert not compatible(a, replace(a, observation=replace(OBS, detector="D2")), 0.5)
 
 
+def test_spectral_sample_uses_original_brightness_variance_and_native_wavelength():
+    c = decode(FIXTURE, OBS, QUERY, SOURCE)
+    s = c.spectral_sample
+    assert s is not None and s.reason is None
+    assert (s.pixel_x, s.pixel_y) == (24, 24)
+    with fits.open(FIXTURE) as h:
+        assert s.value_mjy_sr == pytest.approx(float(h["IMAGE"].data[24, 24]))
+        assert s.sigma_mjy_sr == pytest.approx(np.sqrt(h["VARIANCE"].data[24, 24]))
+    assert s.value_mjy_sr == pytest.approx(0.8620197773)
+    assert s.wavelength_um == pytest.approx(4.9685167903)
+    assert s.bandwidth_um == pytest.approx(0.0371872811)
+    assert s.flags == 1 << 21  # SOURCE identifies real sources, not damaged pixels.
+    sky = c.wcs.pixel_to_world(24, 24)
+    assert s.ra_deg == pytest.approx(sky.ra.deg)
+    assert s.dec_deg == pytest.approx(sky.dec.deg)
+
+
+@pytest.mark.parametrize("defect", ["flag", "variance", "variance_unit"])
+def test_spectral_sample_never_turns_a_masked_or_unscaled_pixel_into_flux(tmp_path, defect):
+    path = tmp_path / "sample.fits"
+    with fits.open(FIXTURE) as h:
+        if defect == "flag":
+            h["FLAGS"].data[24, 24] |= 1 << 3
+        elif defect == "variance":
+            h["VARIANCE"].data[24, 24] = 0
+        else:
+            del h["VARIANCE"].header["BUNIT"]
+        h.writeto(path)
+    s = decode(path, OBS, QUERY, SOURCE).spectral_sample
+    assert s.reason
+    assert s.value_mjy_sr is None and s.sigma_mjy_sr is None
+    assert s.wavelength_um is not None  # Coverage remains inspectable.
+
+
+def test_spectral_sample_preserves_negative_values_and_converts_variance_units(tmp_path):
+    path = tmp_path / "units.fits"
+    with fits.open(FIXTURE) as h:
+        expected_sigma = np.sqrt(float(h["VARIANCE"].data[24, 24]))
+        h["IMAGE"].data[24, 24] = -2
+        h["IMAGE"].data *= 1e6
+        h["IMAGE"].header["BUNIT"] = "Jy / sr"
+        h["VARIANCE"].data *= 1e12
+        h["VARIANCE"].header["BUNIT"] = "Jy2 / sr2"
+        h.writeto(path)
+    s = decode(path, OBS, QUERY, SOURCE).spectral_sample
+    assert s.reason is None
+    assert s.value_mjy_sr == pytest.approx(-2)
+    assert s.sigma_mjy_sr == pytest.approx(expected_sigma)
+
+
 def test_stationary_source_stays_aligned_and_invalid_support_stays_masked():
     grid, shape = target_grid(QUERY)
     yy, xx = np.indices(shape)
@@ -145,6 +195,7 @@ def test_full_pipeline_with_recorded_fits_and_a_failed_exposure(tmp_path):
     assert len(result.frames) == 1
     assert result.omissions[0]["observation_id"] == "bad"
     assert result.frames[0].source_url == SOURCE
+    assert result.frames[0].spectral_sample.value_mjy_sr == pytest.approx(0.8620197773)
     assert Image.open(tmp_path / result.frames[0].id).size == (49, 49)
     assert (
         json.loads((tmp_path / "manifest.json").read_text())["frames"][0]["id"]

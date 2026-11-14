@@ -438,6 +438,27 @@ h1 {
   color: #efb1a7;
   background: #302323;
 }
+.notification-copy {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.notification-close {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  margin: -5px -6px -5px 0;
+  border-radius: 3px;
+  color: inherit;
+}
+.notification-close:hover {
+  background: #ffffff12;
+}
+.feedback .notification-close svg {
+  margin: 0;
+}
 .workspace-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 246px;
@@ -620,6 +641,9 @@ h1 {
   color: #17291d;
   margin: 0 3px;
   width: 32px;
+}
+.transport .play:hover:enabled {
+  background: #c8e4d4;
 }
 .speed {
   display: flex;
@@ -1645,5 +1669,16 @@ tr.active td {
   }
   .image-readout {
     font-size: 9px;
+  }
+}
+
+.pointing-count {
+  color: #81998a;
+  font-size: 9px;
+  white-space: nowrap;
+}
+@media (max-width: 700px) {
+  .pointing-count {
+    font-size: 8px;
   }
 }

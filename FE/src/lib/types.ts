@@ -17,6 +17,7 @@ export type Frame = {
   source_url?: string;
   sequence_id?: string;
   warnings?: string[];
+  processing_version?: string;
 };
 export type Observation = {
   id: string;

@@ -123,12 +123,22 @@ Identical active searches reuse the same job. Existing images remain accessible 
 
 The frontend contract is preserved: `manifest.frames` includes image URL, acquisition time, detector, wavelength/bandwidth, release, source URL, observation ID, and warnings. The manifest also records query, WCS, processing version, fixed display stretch, mask fractions, and omitted exposures.
 
+## Spectral samples
+
+Pipeline version `2.1.0` adds `frame.spectral_sample` to each newly processed image. This contains native pixel indices and sky coordinates, wavelength/bandwidth, surface brightness (`value_mjy_sr`), uncertainty (`sigma_mjy_sr`), flags, method, and any rejection reason. Old prepared bundles are bypassed when their pipeline version differs; rebuild them with the proof script if needed. Redeploy both applications and submit a fresh search to obtain samples.
+
+The extraction uses the nearest original IMAGE pixel to the requested coordinate, before display reprojection or stretch. Brightness is converted to MJy/sr; uncertainty is √VARIANCE after converting its squared brightness units. Quality-masked pixels, invalid variance/units, and invalid wavelength metadata produce a reason with null flux and uncertainty. Negative valid measurements are retained. SOURCE flags alone remain usable. The original sampled sky position is included because nearest pixel centres vary between observations.
+
+The frontend plots these measurements with 1σ errors and bandwidth bars and exports provenance to CSV. This is a quick-look **surface-brightness spectrum**, including sky and zodiacal background, not extracted source flux. No background subtraction, aperture/ePSF correction, proper-motion tracking, or temporal averaging is applied. WCS-WAVE is intended for wavelength visualization; precision work needs the full CWAVE/CBAND calibration and source photometry. [IRSA product documentation](https://caltech-ipac.github.io/spherex-archive-documentation/spherex-data-products/) describes those distinctions.
+
+Counts are unique detector-image products, not objects or independent visits. One pointing can contribute multiple overlapping detector images. Image identities are deduplicated across collections/releases; footprint matches can still fail pixel-level validation. The frontend now distinguishes image count from unique pointing count.
+
 ## Scientific limits
 
 - Uses the official SIA image search across DR1/QR3 wide and deep collections, with a bounded TAP fallback, followed by the archive cutout service. DR1 is preferred for duplicate exposures; QR3 is also supported; QR2 is excluded. All six detectors are discoverable and individually loadable. Archive result limits and collection failures are reported rather than silently interpreted as complete coverage.
 - Compatibility requires the same detector and processing version, and pairwise wavelength separation ≤ half the narrower bandwidth at the target plus four interior samples scaled with the requested field of view. This is a conservative display selection policy, **not validated full-field spectrophotometry**.
 - SOURCE (bit 21) identifies known objects and is retained. All other flags, nonfinite pixels, and nonpositive variances are masked. This deliberately conservative policy can mask saturated star cores and other useful pixels. Masks remain transparent; they are never filled with generated detail.
-- Reprojection uses a north-up/east-left ICRS TAN grid near native 6.14 arcsec/pixel (49×49 pixels for this field). All frames use the same asinh scale. PNGs are display products, not photometric data. No PSF matching, background fitting, ZODI subtraction, flux measurement, or discovery classification is performed.
+- Reprojection uses a north-up/east-left ICRS TAN grid near native 6.14 arcsec/pixel (49×49 pixels for this field). Each compatible sequence uses a fixed asinh scale. PNGs are display products, not photometric data. Native-pixel samples are extracted separately. No PSF matching, background fitting, ZODI subtraction, point-source flux extraction, or discovery classification is performed.
 - The reference targets are approximate field centers. Four use SIMBAD/Sesame reference coordinates and linear proper motion to J2026.0; WISE 0855 retains the challenge-supplied position with unspecified epoch. Positions are for field retrieval, not precise epoch astrometry. Detection of any named target is not guaranteed.
 
 ## Genuine cached demonstrations and validation

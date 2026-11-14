@@ -50,6 +50,37 @@ def finished(client, job_id):
     pytest.fail("Background job did not finish")
 
 
+def test_original_fits_spectral_sample_survives_job_api_serialization(tmp_path):
+    import shutil
+    from pathlib import Path
+    from app.archive import Observation
+    from app.pipeline import Pipeline
+
+    fixture = Path(__file__).parent / "fixtures" / "wise-d6.fits"
+    source = "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/recorded.fits"
+    observation = Observation("2025W19_1B_0116_1D6", source, 60800.700028, "D6", "DR1")
+
+    class RecordedArchive:
+        def search(self, *_):
+            return [observation], []
+
+        def fetch(self, obs, query, path, deadline):
+            shutil.copyfile(fixture, path)
+            return source
+
+    config = settings(tmp_path)
+    with TestClient(create_app(config, Pipeline(config, RecordedArchive()))) as client:
+        response = client.post("/api/jobs", json={"ra_deg": 133.795129, "dec_deg": -7.245147})
+        result = finished(client, response.json()["job_id"])
+        frame = result["manifest"]["frames"][0]
+        sample = frame["spectral_sample"]
+        assert sample["method"] == "nearest_native_pixel"
+        assert sample["value_mjy_sr"] == pytest.approx(0.8620197773)
+        assert sample["sigma_mjy_sr"] == pytest.approx(0.0726717991)
+        assert sample.get("reason") is None
+        assert client.get(frame["url"]).status_code == 200
+
+
 def test_job_assets_cache_and_contract(tmp_path):
     with TestClient(create_app(settings(tmp_path), StubPipeline())) as client:
         r = client.post("/api/jobs", json={"ra_deg": 1, "dec_deg": 2})

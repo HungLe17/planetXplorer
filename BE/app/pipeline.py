@@ -20,9 +20,9 @@ from reproject import reproject_interp
 
 from .archive import Archive, ArchiveError, Observation
 from .config import Settings
-from .schemas import Frame, Manifest, Query, ObservationRecord, Sequence
+from .schemas import Frame, Manifest, Query, ObservationRecord, Sequence, SpectralSample
 
-PIPELINE_VERSION = "2.0.0"
+PIPELINE_VERSION = "2.1.0"
 # SOURCE (21) identifies known objects, not defective pixels. Mask all other bits.
 # Official IRSA flag semantics: https://irsa.ipac.caltech.edu/onlinehelp/spherex/spherex/sp.html
 SOURCE_BIT = 1 << 21
@@ -39,6 +39,45 @@ class Cutout:
     bandwidths: np.ndarray
     version: str
     source: str
+    spectral_sample: SpectralSample | None = None
+
+
+def native_sample(data, variance_hdu, flags, valid, wcs, spectral, pixel):
+    """Sample one original pixel. Never infer physical flux from a rendered PNG.
+
+    This is surface brightness including sky background, not point-source
+    photometry. Native sampling avoids an unpropagated interpolation covariance.
+    WCS-WAVE wavelengths are suitable for visualization, not precision analysis.
+    """
+    x, y = (int(np.floor(float(v) + 0.5)) for v in pixel)
+    sample = SpectralSample(pixel_x=x, pixel_y=y)
+    if not (0 <= y < data.shape[0] and 0 <= x < data.shape[1]):
+        sample.reason = "Nearest native pixel is outside the cutout."
+        return sample
+    sample.flags = int(flags[y, x])
+    sky = wcs.pixel_to_world(x, y)
+    sample.ra_deg, sample.dec_deg = float(sky.ra.deg), float(sky.dec.deg)
+    wave, band = spectral.pixel_to_world(x, y)
+    wave, band = float(wave.to_value(u.um)), float(band.to_value(u.um))
+    if not (np.isfinite(wave) and np.isfinite(band) and wave > 0 and band > 0):
+        sample.reason = "Native pixel has invalid wavelength metadata."
+        return sample
+    sample.wavelength_um, sample.bandwidth_um = wave, band
+    if not valid[y, x]:
+        sample.reason = "Target pixel is quality-masked or has invalid image/variance data."
+        return sample
+    try:
+        variance_unit = u.Unit(variance_hdu.header.get("BUNIT", ""))
+        variance = float(variance_hdu.data[y, x]) * variance_unit.to((u.MJy / u.sr) ** 2)
+    except (ValueError, TypeError):
+        sample.reason = "Variance units are unavailable or unsupported."
+        return sample
+    if not (np.isfinite(variance) and variance > 0):
+        sample.reason = "Target pixel has invalid variance."
+        return sample
+    sample.value_mjy_sr = float(data[y, x])
+    sample.sigma_mjy_sr = math.sqrt(variance)
+    return sample
 
 
 def decode(path: Path, obs: Observation, query: Query, source: str) -> Cutout:
@@ -129,6 +168,7 @@ def decode(path: Path, obs: Observation, query: Query, source: str) -> Cutout:
             bands,
             str(hdus[0].header.get("VERSION", "unknown")),
             source,
+            native_sample(data, hdus["VARIANCE"], flags, valid, wcs, spectral, pixels[0]),
         )
 
 
@@ -273,6 +313,7 @@ class Pipeline:
                 "flag_policy": "mask all FLAGS except SOURCE (bit 21)",
                 "zodi_subtracted": False,
                 "psf_matched": False,
+                "spectral_sampling": "nearest_native_pixel; IMAGE in MJy/sr; 1-sigma from VARIANCE; WCS-WAVE visualization wavelengths; no background subtraction or PSF/aperture correction",
             },
         )
         # Start one detector in chronological order; every other record remains loadable.
@@ -420,6 +461,7 @@ class Pipeline:
                             wavelength_um=float(c.wavelengths[0]),
                             bandwidth_um=float(c.bandwidths[0]),
                             source_url=c.source,
+                            spectral_sample=c.spectral_sample,
                             processing_version=c.version,
                             mask_fraction=float(np.mean(~np.isfinite(array))),
                             sequence_id=sequence.id,

@@ -82,7 +82,7 @@ export default function SkyViewer({
     (next: ViewTransform) => {
       const image = url ? cache.current.get(url)?.image : undefined,
         rect = box.current?.getBoundingClientRect();
-      if (image?.naturalWidth && rect) {
+      if (image?.naturalWidth && rect && rect.width > 0 && rect.height > 0) {
         const fit =
           Math.min(
             rect.width / image.naturalWidth,
@@ -221,6 +221,7 @@ export default function SkyViewer({
       if (!c || !b) return;
       const rect = b.getBoundingClientRect(),
         ratio = window.devicePixelRatio || 1;
+      if (!rect.width || !rect.height) return;
       const w = Math.round(rect.width * ratio),
         h = Math.round(rect.height * ratio);
       if (c.width !== w) c.width = w;

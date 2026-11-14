@@ -30,6 +30,23 @@ class Query(BaseModel):
         return self
 
 
+class SpectralSample(BaseModel):
+    """Quick-look native pixel measurement, before reprojection or display stretch."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+    method: Literal["nearest_native_pixel"] = "nearest_native_pixel"
+    value_mjy_sr: float | None = None
+    sigma_mjy_sr: float | None = None
+    wavelength_um: float | None = None
+    bandwidth_um: float | None = None
+    pixel_x: int
+    pixel_y: int
+    ra_deg: float | None = None
+    dec_deg: float | None = None
+    flags: int | None = None
+    reason: str | None = None
+
+
 class Frame(BaseModel):
     id: str
     url: str
@@ -47,6 +64,7 @@ class Frame(BaseModel):
     sequence_id: str = ""
     match_wavelengths: list[float | None] = Field(default_factory=list)
     match_bandwidths: list[float | None] = Field(default_factory=list)
+    spectral_sample: SpectralSample | None = None
 
 
 class ObservationRecord(BaseModel):

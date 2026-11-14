@@ -6,12 +6,18 @@ Set `NEXT_PUBLIC_API_BASE_URL` to the FastAPI base URL, including `https://` for
 
 ## Playback and navigation
 
+The main workspace is a single image viewport, with no spectrum tab or wavelength plots. For motion inspection, blink aligned images of the same field from different dates and compare source positions relative to background stars. Prefer compatible wavelengths and calibration. Apparent motion identifies a candidate for further investigation; this app does not measure an orbit or classify an object as a planet.
+
 - **Browse** is the default: play loaded images in acquisition order, including observations in different wavelength groups. The viewer shows the current detector, wavelength, and UTC acquisition time. A visible warning identifies unmatched observations; this mode is for browsing and does not establish brightness variability.
 - **Matched** restricts playback to the selected backend-validated wavelength/calibration sequence. Select a sequence with two or more loaded images to blink it. If only one matches, the UI explains that limitation and offers a direct return to browsing all loaded images.
 - Play/pause, first/last, stepping, timeline scrubbing, playback interval, and loop toggle operate on the current mode. Space toggles playback and arrow keys step when focus is outside form controls. Images remain usable while more records load; new arrivals preserve the selected observation by URL rather than shifting its index.
 - Drag one pointer to pan a magnified image. Scroll or pinch to zoom around the pointer or two-finger midpoint. Double-click or double-tap toggles between a closer view and Fit. The gestures affect the image, not the page.
 - **Fit** resets magnification and pan. **1:1** displays one image pixel per CSS pixel. Plus/minus zoom, `F` or `0` fits, and `1` selects native scale while the canvas is focused. Fullscreen is available when the browser supports it.
 - The canvas retains nearest-neighbor display at magnification. Zoom/inversion do not change scientific measurements. A bounded cache keeps at most 12 image elements and prefetches neighboring frames, so a slow or failed distant image does not block the whole player. Failed images can be retried or stepped past.
+
+## Observation counts
+
+Observation counts refer to **unique detector-image products whose catalog footprints cover the coordinate**, not objects, independent observing nights, or guaranteed usable measurements. The dock also shows unique pointings (observation IDs without the detector suffix). Multiple detectors can cover the coordinate at one pointing. Backend discovery deduplicates product identities across collections/releases and prefers DR1 over QR3 for the same identity. Some footprint matches can fail later pixel-level validation. DR1 plus QR3 form the current searchable image set; QR2 has been superseded. The 102-channel all-sky cube is a separate product, not 102 observation dates.
 
 ## Managing observations
 
