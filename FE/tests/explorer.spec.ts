@@ -264,7 +264,9 @@ test("settings tabs expose resources and preserve the query", async ({
   await expect(
     page.getByRole("textbox", { name: "Right ascension" }),
   ).toHaveValue("");
-  await expect(page.getByLabel("Field of view")).toBeDisabled();
+  await expect(
+    page.getByRole("spinbutton", { name: "Field of view (arcsec)" }),
+  ).toHaveValue("300");
 });
 
 test("opens an available archive field on startup and honors shared coordinates", async ({
@@ -331,7 +333,7 @@ test("opens an available archive field on startup and honors shared coordinates"
   ).toBeEnabled();
   expect(submitted).toEqual([
     { ra_deg: 269.4462685, dec_deg: 4.7682045 },
-    { ra_deg: 12, dec_deg: -4 },
+    { ra_deg: 12, dec_deg: -4, fov_arcsec: 300, live: true },
   ]);
 });
 

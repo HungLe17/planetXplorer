@@ -221,3 +221,47 @@ def test_sia_unavailable_falls_back_to_tap():
         assert "TAP" in notes[0]
     finally:
         a.close()
+
+
+def test_tap_pages_equal_times_and_prefers_numeric_processing_version():
+    header = "uri,time_bounds_lower,energy_bandpassname"
+    newer = uri(identity="visitD2", version=10)
+    older = uri(identity="visitD2", version=9)
+    other = uri(identity="alsoD2", version=11)
+    pages = [[(older, 60801.0), (newer, 60801.0)], [(newer, 60801.0), (other, 60800.0)], [(other, 60800.0)]]
+    calls = []
+
+    def handler(request):
+        sql = request.url.params["QUERY"]
+        calls.append(sql)
+        page = pages[len(calls)-1]
+        return httpx.Response(200, text="\n".join([header, *(f"{u},{t},SPHEREx-D2" for u,t in page)]))
+
+    archive = archive_with(handler, Settings(metadata_limit=1))
+    try:
+        rows, notes = archive._search_tap(Query(ra_deg=0, dec_deg=0), time.monotonic() + 10)
+    finally:
+        archive.close()
+    assert notes == []
+    assert [o.identity for o in rows] == ["alsoD2", "visitD2"]
+    assert rows[1].uri.endswith(newer)
+    assert "ORDER BY p.time_bounds_lower DESC,a.uri DESC" in calls[0]
+    assert f"a.uri < '{older}'" in calls[1]
+    assert f"a.uri < '{newer}'" in calls[2]
+
+
+def test_discovery_checks_once_and_reports_unconfigured_collection():
+    calls = []
+
+    def handler(req):
+        calls.append(req)
+        return httpx.Response(200, text="SIA2 Collection\tDescription\nspherex_dr1\timages\nspherex_dr1_cube\tcube\nspherex_dr4\timages\n")
+
+    archive = archive_with(handler)
+    try:
+        first = archive.discovery()
+        assert "spherex_dr4" in first and "spherex_dr1_cube" in first
+        assert archive.discovery() == first
+        assert len(calls) == 1
+    finally:
+        archive.close()

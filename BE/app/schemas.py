@@ -6,6 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 class Query(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    fov_arcsec: float = Field(default=300, ge=60, le=1800)
+    live: bool = False
     ra_deg: float = Field(ge=0, lt=360)
     dec_deg: float = Field(ge=-90, le=90)
     start_utc: datetime | None = None
@@ -42,6 +44,10 @@ class Frame(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     units: str = "MJy/sr"
     processing_version: str = ""
+    pixels: str | None = None
+    channel: str = ""
+    exposure_flags: dict[str, str | int | float] = Field(default_factory=dict)
+    flag_names: dict[int, str] = Field(default_factory=dict)
     mask_fraction: float = 0
 
 

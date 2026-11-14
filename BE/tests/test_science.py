@@ -187,3 +187,25 @@ def test_cutouts_download_concurrently_with_progress(tmp_path):
     assert len(result.frames) == 2
     assert "fetch:2/2" in stages
     assert not list(tmp_path.glob("raw-*.fits"))
+
+
+def test_numeric_frames_match_masked_data_and_requested_fov(tmp_path):
+    import shutil
+    from app.config import Settings
+    from app.pipeline import Pipeline
+
+    query = QUERY.model_copy(update={"live": True, "fov_arcsec": 120})
+    class LocalArchive:
+        def search(self, *_):
+            return [OBS], []
+        def fetch(self, obs, query, path, deadline):
+            shutil.copyfile(FIXTURE, path)
+            return SOURCE
+
+    m = Pipeline(Settings(), LocalArchive()).run(query,tmp_path,"live",lambda stage: None)
+    grid, shape = target_grid(query)
+    assert shape == (20,20)
+    array = np.fromfile(tmp_path/m.frames[0].pixels,dtype="<f4").reshape(shape)
+    expected = np.flipud(align(decode(FIXTURE,OBS,query,SOURCE),grid,shape))
+    np.testing.assert_allclose(array,expected,rtol=1e-6,equal_nan=True)
+    assert m.frames[0].exposure_flags["L2DQAFLG"] == "Pass"

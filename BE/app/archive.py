@@ -1,11 +1,22 @@
-"""IRSA TAP/MEF client. No user-supplied URLs or database dependencies."""
+"""Dataset setup for maintainers
+Add a release path to RELEASES with its priority and SIA collection IDs for
+wide and deep Level 2 spectral images. Higher priority supersedes a duplicate.
+Retire a release by removing its entry. Restart the backend after changing it.
+For a compatible IRSA mirror set ORIGIN and ASSET_PREFIX. For bearer auth set
+TOKEN_ENV to the name of a server-side environment variable holding the key.
+The reader expects IRSA SIA2/TAP metadata and spectral image FITS products.
+https://caltech-ipac.github.io/spherex-archive-documentation/spherex-data-access/
+"""
 
 import csv
 import io
+import os
 import re
 import ssl
+import threading
 import time
 from dataclasses import dataclass
+from math import isfinite
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlsplit
@@ -18,6 +29,18 @@ from astropy.io.votable import parse_single_table
 
 from .config import Settings
 from .schemas import Query
+
+
+ORIGIN = "https://irsa.ipac.caltech.edu"
+ASSET_PREFIX = "/ibe/data/spherex/"
+TOKEN_ENV = None
+RELEASES = {
+    "dr1": (2, ("spherex_dr1", "spherex_dr1_deep")),
+    "qr3": (1, ("spherex_qr3", "spherex_qr3_deep")),
+}
+COLLECTION_TABLE = "/include/SIA2_collection_info.tsv"
+METADATA_PAGES = 8
+DETECTORS = tuple(f"D{i}" for i in range(1, 7))
 
 
 class ArchiveError(RuntimeError):
@@ -55,11 +78,11 @@ def checked_url(url: str) -> str:
     p = urlsplit(url)
     if (
         p.scheme != "https"
-        or p.hostname != "irsa.ipac.caltech.edu"
+        or p.hostname != urlsplit(ORIGIN).hostname
         or p.port not in (None, 443)
         or p.username
         or p.password
-        or not p.path.startswith("/ibe/data/spherex/")
+        or not p.path.startswith(ASSET_PREFIX)
         or ".." in p.path
         or "%" in p.path
     ):
@@ -80,7 +103,12 @@ def evenly_spaced(rows: list, limit: int) -> list:
 class Archive:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.discovery_lock = threading.Lock()
+        self.discovery_until = 0.0
+        self.discovery_note = ""
+        token = os.getenv(TOKEN_ENV) if TOKEN_ENV else None
         self.client = httpx.Client(
+            headers={"Authorization": f"Bearer {token}"} if token else None,
             verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
             timeout=httpx.Timeout(settings.request_seconds, connect=5),
             follow_redirects=False,
@@ -89,10 +117,38 @@ class Archive:
     def close(self):
         self.client.close()
 
+    def discovery(self) -> str:
+        with self.discovery_lock:
+            if time.monotonic() >= self.discovery_until:
+                try:
+                    # Same catalog used by IRSA's SIA2 "Available datasets" table.
+                    response = self.client.get(ORIGIN + COLLECTION_TABLE, timeout=6)
+                    response.raise_for_status()
+                    reader = csv.DictReader(io.StringIO(response.text), delimiter="\t")
+                    if "SIA2 Collection" not in (reader.fieldnames or ()):
+                        raise ValueError("Unexpected collection table")
+                    known = {name for _, names in RELEASES.values() for name in names}
+                    other = []
+                    for row in reader:
+                        name = row["SIA2 Collection"]
+                        if name.lower().startswith("spherex") and name not in known:
+                            other.append(f"{name} ({row.get('Description', 'unknown product')})")
+                    self.discovery_note = (
+                        "Other published SPHEREx collections: " + ", ".join(sorted(other))
+                        if other else ""
+                    )
+                    self.discovery_until = time.monotonic() + 3600
+                except (httpx.HTTPError, KeyError, ValueError):
+                    self.discovery_note = "Collection discovery unavailable; using configured releases."
+                    self.discovery_until = time.monotonic() + 60
+            return self.discovery_note
+
     def search(
         self, query: Query, deadline: float
     ) -> tuple[list[Observation], list[str]]:
         deadline = min(deadline, time.monotonic() + self.settings.metadata_seconds)
+        discovery = self.discovery() if query.live else ""
+        discovery_notes = [discovery] if discovery else []
         try:
             # SIA indexes the image collections directly; reserve half the budget
             # for TAP if the image-search service is temporarily unavailable.
@@ -100,14 +156,14 @@ class Archive:
                 query,
                 min(deadline, time.monotonic() + self.settings.metadata_seconds / 2),
             )
-            return rows, ["Metadata retrieved via IRSA SIA.", *notes]
+            return rows, ["Metadata retrieved via IRSA SIA.", *discovery_notes, *notes]
         except ArchiveError as sia_error:
             if time.monotonic() >= deadline:
                 raise
             try:
                 rows, notes = self._search_tap(query, deadline)
                 return rows, [
-                    "Metadata retrieved via IRSA TAP after SIA was unavailable.",
+                    "Metadata retrieved via IRSA TAP after SIA was unavailable.", *discovery_notes,
                     *notes,
                 ]
             except ArchiveError as tap_error:
@@ -134,7 +190,7 @@ class Archive:
                 chunks, total = [], 0
                 with self.client.stream(
                     "GET",
-                    "https://irsa.ipac.caltech.edu/SIA",
+                    ORIGIN + "/SIA",
                     params=params,
                     timeout=max(
                         0.1,
@@ -152,14 +208,16 @@ class Archive:
                             )
                         chunks.append(chunk)
                 payload = b"".join(chunks)
+                overflow = False
                 root = ET.fromstring(payload)
                 for info in root.iter():
                     if (
                         info.tag.rsplit("}", 1)[-1] == "INFO"
                         and info.attrib.get("name") == "QUERY_STATUS"
-                        and info.attrib.get("value") == "ERROR"
                     ):
-                        raise ArchiveError("IRSA SIA returned a query error")
+                        if info.attrib.get("value") == "ERROR":
+                            raise ArchiveError("IRSA SIA returned a query error")
+                        overflow |= info.attrib.get("value") == "OVERFLOW"
                 table = parse_single_table(io.BytesIO(payload)).to_table(
                     use_names_over_ids=True
                 )
@@ -168,7 +226,7 @@ class Archive:
                 result = []
                 for row in table:
                     uri = str(row["access_url"])
-                    detector = re.search(r"level2_.+?(D[26])_spx", uri)
+                    detector = re.search(r"level2_.+?(D[1-6])_spx", uri)
                     if not detector:
                         continue
                     mjd = float(row["t_min"])
@@ -183,7 +241,7 @@ class Archive:
                             "energy_bandpassname": "SPHEREx-" + detector[1],
                         }
                     )
-                return result
+                return result, overflow or len(table) >= self.settings.metadata_limit + 1
             except (
                 httpx.HTTPError,
                 ValueError,
@@ -193,55 +251,95 @@ class Archive:
             ) as exc:
                 raise ArchiveError("IRSA SIA metadata service is unavailable") from exc
 
-        names = ("spherex_dr1", "spherex_qr3", "spherex_dr1_deep", "spherex_qr3_deep")
+        names = [n for _, collections in RELEASES.values() for n in collections]
         rows, failures = [], []
+        capped = False
         # Do not mistake an unavailable collection for zero sky coverage.
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {pool.submit(collection, name): name for name in names}
             for future in as_completed(futures):
                 try:
-                    rows.extend(future.result())
+                    batch, truncated = future.result()
+                    rows.extend(batch)
+                    capped |= truncated
                 except ArchiveError:
                     failures.append(futures[future])
         if failures and not rows:
             raise ArchiveError(
                 "IRSA SIA metadata search was incomplete; coverage could not be established"
             )
-        rows.sort(key=lambda row: float(row["time_bounds_lower"]))
-        selected, notes = self._select_rows(rows)
-        notes.append(
-            f"SIA queries are capped at {self.settings.metadata_limit + 1} records per collection; narrow the date range for additional observations."
-        )
-        if failures:
-            notes.append(
-                "Partial metadata: SIA collections unavailable: "
-                + ", ".join(sorted(failures))
-            )
-        return selected, notes
+        if capped or failures:
+            # TAP supports ordered keyset pagination. Fall back to the available
+            # SIA records if the supplemental service cannot complete the field.
+            try:
+                recent, notes = self._search_tap(query, deadline)
+            except ArchiveError as exc:
+                notes = [f"Partial metadata: {exc}"]
+                recent = []
+            rows.extend({"uri": obs.uri, "time_bounds_lower": obs.mjd,
+                         "energy_bandpassname": obs.detector} for obs in recent)
+        else:
+            notes = []
+        return self._select_rows(rows), notes
 
     def _search_tap(
         self, query: Query, deadline: float
     ) -> tuple[list[Observation], list[str]]:
+        detector_names = ",".join(f"'SPHEREx-{d}'" for d in DETECTORS)
+        root = ASSET_PREFIX.lstrip("/")
+        releases = " OR ".join(f"a.uri LIKE '%{root}{release}/level2/%'" for release in RELEASES)
         filters = [
             f"1=CONTAINS(POINT('ICRS',{query.ra_deg:.10f},{query.dec_deg:.10f}),p.poly)",
-            "p.energy_bandpassname IN ('SPHEREx-D2','SPHEREx-D6')",
+            f"p.energy_bandpassname IN ({detector_names})",
+            f"({releases})",
         ]
         if query.start_utc:
             filters.append(f"p.time_bounds_lower >= {Time(query.start_utc).mjd:.10f}")
         if query.end_utc:
             filters.append(f"p.time_bounds_lower <= {Time(query.end_utc).mjd:.10f}")
-        sql = (
-            f"SELECT TOP {self.settings.metadata_limit + 1} a.uri,p.time_bounds_lower,p.energy_bandpassname FROM spherex.artifact a JOIN spherex.plane p ON a.planeid=p.planeid WHERE "
-            + " AND ".join(filters)
-            + " ORDER BY p.time_bounds_lower"
-        )
         deadline = min(deadline, time.monotonic() + self.settings.metadata_seconds)
+        limit = self.settings.metadata_limit
+        prefix = (
+            f"SELECT TOP {limit + 1} a.uri,p.time_bounds_lower,p.energy_bandpassname "
+            "FROM spherex.artifact a JOIN spherex.plane p ON a.planeid=p.planeid WHERE "
+            + " AND ".join(filters)
+        )
+        cursor = ""
+        rows, notes = [], []
+        for _ in range(METADATA_PAGES):
+            if rows and time.monotonic() >= deadline:
+                notes.append("Partial metadata: time budget reached during pagination.")
+                break
+            try:
+                batch = self._tap_page(prefix + cursor + " ORDER BY p.time_bounds_lower DESC,a.uri DESC", deadline)
+            except ArchiveError as exc:
+                if not rows:
+                    raise
+                notes.append(f"Partial metadata: {exc}")
+                break
+            rows.extend(batch[:limit])
+            if len(batch) <= limit:
+                break
+            last = batch[limit - 1]
+            stamp = float(last["time_bounds_lower"])
+            safe_uri = last["uri"].replace("'", "''")
+            next_cursor = (f" AND (p.time_bounds_lower < {stamp!r} OR "
+                           f"(p.time_bounds_lower = {stamp!r} AND a.uri < '{safe_uri}'))")
+            if cursor == next_cursor:
+                notes.append("Partial metadata: archive returned a repeated page.")
+                break
+            cursor = next_cursor
+        else:
+            notes.append(f"Partial metadata: newest {limit * METADATA_PAGES} records inspected; narrow dates to see earlier visits.")
+        return self._select_rows(rows), notes
+
+    def _tap_page(self, sql: str, deadline: float) -> list[dict[str, str]]:
         text = None
         for attempt in range(2):
             try:
                 with self.client.stream(
                     "GET",
-                    "https://irsa.ipac.caltech.edu/TAP/sync",
+                    ORIGIN + "/TAP/sync",
                     params={
                         "REQUEST": "doQuery",
                         "LANG": "ADQL",
@@ -277,19 +375,14 @@ class Archive:
             reader.fieldnames or []
         ):
             raise ArchiveError("IRSA returned an unexpected metadata format")
-        return self._select_rows(list(reader))
+        return list(reader)
 
     def _select_rows(self, rows):
-        notes = []
-        if len(rows) > self.settings.metadata_limit:
-            notes.append(
-                f"Metadata limited to the earliest {self.settings.metadata_limit} matching exposures; narrow the date range to inspect later observations."
-            )
         unique = {}
-        for row in rows[: self.settings.metadata_limit]:
-            uri = checked_url(urljoin("https://irsa.ipac.caltech.edu/", row["uri"]))
-            match = re.search(r"/spherex/(dr1|qr3|qr2)/", uri)
-            if not match or match[1] == "qr2":
+        for row in rows:
+            uri = checked_url(urljoin(ORIGIN + "/", row["uri"]))
+            match = re.search(re.escape(ASSET_PREFIX) + r"([^/]+)/level2/", uri)
+            if not match or match[1] not in RELEASES:
                 continue
             identity = re.search(r"level2_(.+?D[1-6])_spx", uri)
             if not identity:
@@ -301,33 +394,40 @@ class Archive:
                 row["energy_bandpassname"].replace("SPHEREx-", ""),
                 match[1].upper(),
             )
-            if not 40000 < obs.mjd < 100000:
+            if obs.detector != identity[1][-2:]:
+                continue
+            if not isfinite(obs.mjd):
                 raise ArchiveError("IRSA observation time has unexpected units")
             previous = unique.get(obs.identity)
-            if previous is None or (obs.release == "DR1", uri) > (
-                previous.release == "DR1",
-                previous.uri,
-            ):
+            if previous is None or self._version_key(obs) > self._version_key(previous):
                 unique[obs.identity] = obs
-        # Reserve candidates for both detector ranges and cover the full returned time span.
-        selected = []
-        for detector in ("D2", "D6"):
-            group = sorted(
-                (o for o in unique.values() if o.detector == detector),
-                key=lambda o: o.mjd,
-            )
-            selected.extend(evenly_spaced(group, self.settings.max_candidates // 2))
-        if len(unique) > len(selected):
-            notes.append(
-                f"Inspecting {len(selected)} exposures sampled across available dates and detectors D2/D6."
-            )
-        return sorted(selected, key=lambda o: o.mjd), notes
+        return sorted(unique.values(), key=lambda o: (o.mjd, o.identity))
+
+    @staticmethod
+    def _version_key(obs):
+        match = re.search(r"_spx_l2[a-z]*-v(\d+)-(\d+)-(\d+)", obs.uri)
+        version = tuple(map(int, match.groups())) if match else ()
+        return RELEASES[obs.release.lower()][0], version, obs.uri
+
+    @staticmethod
+    def candidates(observations: list[Observation], limit: int) -> list[Observation]:
+        """Reserve downloads for each available detector and both ends of its timeline."""
+        groups = {det: sorted((o for o in observations if o.detector == det),
+                              key=lambda o: (o.mjd, o.identity)) for det in DETECTORS}
+        quotas = {det: 0 for det in groups}
+        for _ in range(min(limit, len(observations))):
+            eligible = [det for det in groups if quotas[det] < len(groups[det])]
+            det = min(eligible, key=lambda d: (quotas[d], -groups[d][-1].mjd))
+            quotas[det] += 1
+        selected = [obs for det, quota in quotas.items() if quota
+                    for obs in (groups[det][-1:] if quota == 1 else evenly_spaced(groups[det], quota))]
+        return sorted(selected, key=lambda o: (o.mjd, o.identity))
 
     def fetch(self, obs: Observation, query: Query, path: Path, deadline: float):
         url = (
             checked_url(obs.uri)
             + "?"
-            + urlencode({"center": f"{query.ra_deg},{query.dec_deg}d", "size": 5 / 60})
+            + urlencode({"center": f"{query.ra_deg},{query.dec_deg}d", "size": query.fov_arcsec / 3600})
         )
         for attempt in range(2):
             try:

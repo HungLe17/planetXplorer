@@ -100,6 +100,31 @@ Render references: [FastAPI deployment](https://render.com/docs/deploy-fastapi),
 
 ## API
 
+The explorer's **Surveys** tab sends separate `POST /api/surveys/neowise`,
+`/api/surveys/euclid`, and `/api/surveys/desi` requests with `ra_deg` and
+`dec_deg`. These show field context across all dates. The blink sequence and
+its date filters use SPHEREx alone.
+
+NEOWISE returns four-arcminute FITS links and PNG previews for the newest
+quality-10 W1/W2 pair. Euclid returns DR1/Q1 calibrated VIS and NIR exposure
+counts, dates and links to matching product records. Individual detector frames
+are large, so the API requests exposure metadata only. DESI returns observed BGS,
+LRG and ELG clustering-catalog galaxies inside a 2.5-arcminute radius.
+
+From `BE`, run `python scripts/prepare_desi.py` once to install the six
+northern/southern DR1 v1.5 catalog indices. Preparation streams about 1.23 GB
+and removes each temporary FITS after indexing. Set `PLANETX_DESI_DIR` on both
+the preparation command and service to use persistent storage across deploys.
+Without the index the DESI endpoint returns 503. The other archives remain usable.
+
+Run `python scripts/check_motion.py wise` (or `barnard`) for a metadata-only
+footprint check on the two candidate dates in the prepared sequence. Add
+`--fetch` to check the two small cutouts on one sky grid. The check reports
+predicted shift, isolated target centroids and registration scatter from common
+field sources. A candidate still requires visual review. It uses the WISE
+[dated HST position and proper motion/parallax fit](https://www.aanda.org/articles/aa/pdf/2016/08/aa28662-16.pdf)
+or the Barnard proper-motion preset.
+
 | Endpoint | Contract |
 |---|---|
 | `POST /api/jobs` | `{ra_deg, dec_deg, start_utc?, end_utc?}` → HTTP 202 `{job_id}`. Dates must include timezone and be ordered. |

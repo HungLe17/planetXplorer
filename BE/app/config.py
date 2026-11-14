@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 @dataclass(frozen=True)
 class Settings:
+    desi_dir: Path = ROOT / ".cache-surveys" / "desi-dr1-v1.5"
     cache_dir: Path = ROOT / ".cache"
     demo_dir: Path = ROOT / "demos"
     max_jobs: int = 3
@@ -57,6 +58,7 @@ class Settings:
     @classmethod
     def from_env(cls):
         return cls(
+            desi_dir=Path(os.environ.get("PLANETX_DESI_DIR", str(ROOT / ".cache-surveys" / "desi-dr1-v1.5"))).resolve(),
             cache_dir=Path(
                 os.environ.get("PLANETX_CACHE_DIR", str(ROOT / ".cache"))
             ).resolve(),

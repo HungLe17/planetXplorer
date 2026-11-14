@@ -39,6 +39,8 @@ class Cutout:
     bandwidths: np.ndarray
     version: str
     source: str
+    metadata: dict | None = None
+    flag_names: dict | None = None
 
 
 def decode(path: Path, obs: Observation, query: Query, source: str) -> Cutout:
@@ -84,7 +86,7 @@ def decode(path: Path, obs: Observation, query: Query, source: str) -> Cutout:
         # Match spectral response at the target and four points within the field.
         # A wavelength match at the center alone is not sufficient for field blinking.
         positions = [coord] + [
-            coord.spherical_offsets_by(x * u.arcmin, y * u.arcmin)
+            coord.spherical_offsets_by(x * query.fov_arcsec / 300 * u.arcmin, y * query.fov_arcsec / 300 * u.arcmin)
             for x, y in [(-1.5, -1.5), (-1.5, 1.5), (1.5, -1.5), (1.5, 1.5)]
         ]
         pixels = [wcs.world_to_pixel(c) for c in positions]
@@ -122,6 +124,10 @@ def decode(path: Path, obs: Observation, query: Query, source: str) -> Cutout:
             bands,
             str(hdus[0].header.get("VERSION", "unknown")),
             source,
+            {k: image.header[k] for k in image.header
+             if k in ("L1DQAFLG", "L2DQAFLG", "SPS_FLAGS", "NON_SURVEY", "PXSRCMSK") or k.startswith("L2 N_")},
+            {int(k[4:]): str(hdus["FLAGS"].header[k]) for k in hdus["FLAGS"].header
+             if k.startswith("MSKN") and k[4:].isdigit()},
         )
 
 
@@ -168,7 +174,7 @@ def choose_group(cutouts: list[Cutout], tolerance: float) -> list[Cutout]:
 
 def target_grid(query: Query) -> tuple[WCS, tuple[int, int]]:
     scale = 6.14 / 3600
-    n = math.ceil((5 / 60) / scale)
+    n = math.ceil(query.fov_arcsec / 3600 / scale)
     w = WCS(naxis=2)
     w.wcs.crpix = [(n + 1) / 2, (n + 1) / 2]
     w.wcs.crval = [query.ra_deg, query.dec_deg]
@@ -225,11 +231,27 @@ class Pipeline:
         self.settings, self.archive = settings, archive
 
     def run(
-        self, query: Query, directory: Path, job_id: str, report: Callable[[str], None]
+        self, query: Query, directory: Path, job_id: str, report: Callable[[str], None],
+        reuse: Callable[[dict[str, str]], Manifest | None] | None = None,
     ) -> Manifest:
         deadline = time.monotonic() + self.settings.job_seconds
         report("query")
-        observations, notes = self.archive.search(query, deadline)
+        all_observations, notes = self.archive.search(query, deadline)
+        products = {o.identity: o.uri for o in all_observations}
+        complete = not any(note.startswith("Partial metadata:") for note in notes)
+        if complete and reuse:
+            manifest = reuse(products)
+            if manifest:
+                report("render")
+                manifest.warnings = notes + ["Previously aligned frames reused after archive revalidation."]
+                atomic_json(directory / "manifest.json", manifest.model_dump(mode="json"))
+                return manifest
+        observations = Archive.candidates(all_observations, self.settings.max_candidates)
+        if len(observations) < len(all_observations):
+            notes.append(
+                f"Processing {len(observations)} of {len(all_observations)} distinct exposures "
+                "sampled across dates and detectors. Narrow dates for additional frames."
+            )
         omissions, cutouts = [], []
         download_deadline = deadline - min(10, self.settings.job_seconds / 4)
 
@@ -270,8 +292,8 @@ class Pipeline:
                 + (omissions[0]["reason"] if omissions else "")
             )
         group = evenly_spaced(
-            choose_group(cutouts, self.settings.spectral_tolerance),
-            self.settings.max_frames,
+            cutouts if query.live else choose_group(cutouts, self.settings.spectral_tolerance),
+            self.settings.max_candidates if query.live else self.settings.max_frames,
         )
         selected = {id(c) for c in group}
         for c in cutouts:
@@ -309,9 +331,23 @@ class Pipeline:
         paths = [directory / f"frame-{i:02}.png" for i in range(len(arrays))]
         stretch = render_pngs(arrays, paths) if arrays else {}
         frames = []
+        channels = []
         for i, (c, array) in enumerate(zip(accepted, arrays)):
+            channel = next((g for g in channels if all(
+                compatible(c, old, self.settings.spectral_tolerance) for old in g)), None)
+            if channel is None:
+                channel = []
+                channels.append(channel)
+            channel.append(c)
+            anchor = channel[0]
+            pixel_file = f"frame-{i:02}.bin"
+            np.flipud(array).astype("<f4").tofile(directory / pixel_file)
             frames.append(
                 Frame(
+                    pixels=pixel_file,
+                    channel=f"{anchor.observation.detector} {anchor.wavelengths[0]:.6f} µm ({anchor.version})",
+                    exposure_flags=c.metadata or {},
+                    flag_names=c.flag_names or {},
                     id=f"frame-{i:02}.png",
                     url=f"/api/assets/{job_id}/frame-{i:02}.png",
                     observation_id=c.observation.identity,
@@ -334,13 +370,13 @@ class Pipeline:
             notes.append(
                 f"{len(omissions)} candidate exposure(s) omitted; see the manifest for reasons."
             )
-        if len(frames) < 2:
+        if not any(len(channel) >= 2 for channel in channels):
             notes.append(
                 "Fewer than two compatible frames; motion playback is unavailable."
             )
         notes += [
-            "Detector D2/D6 candidate search; not all 102 spectral channels.",
-            "Spectral response matched at the target and four points in the central 3 arcminutes within half the narrower bandwidth; exploratory comparison, not a full-field spectral equivalence guarantee.",
+            "Bounded exposure sample across available detectors.",
+            "Wavelength groups match the detector, processing version and spectral response at five field positions within half the narrower bandwidth.",
             "All archive flags except SOURCE (bit 21) are masked; invalid pixels remain transparent.",
         ]
         result = Manifest(
@@ -351,6 +387,8 @@ class Pipeline:
             omissions=omissions,
             processing={
                 "version": PIPELINE_VERSION,
+                "archive_products": products,
+                "archive_complete": complete,
                 "spectral_tolerance": self.settings.spectral_tolerance,
                 "flag_policy": "mask all FLAGS except SOURCE (bit 21)",
                 "zodi_subtracted": False,

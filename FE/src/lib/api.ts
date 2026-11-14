@@ -7,9 +7,10 @@ export async function request<T>(
   path: string,
   signal: AbortSignal,
   body?: unknown,
+  timeoutMs = 30000,
 ): Promise<T> {
   const response = await fetch(base + path, {
-    signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
+    signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
     headers: {
       Accept: "application/json",
       ...(body ? { "Content-Type": "application/json" } : {}),
@@ -40,7 +41,7 @@ export function assetUrl(path: string) {
   return url.href;
 }
 export function validateManifest(input: Manifest): Manifest {
-  if (!input || !Array.isArray(input.frames) || input.frames.length > 12)
+  if (!input || !Array.isArray(input.frames) || input.frames.length > 48)
     throw new Error("The service returned an invalid observation sequence.");
   const frames = input.frames.map((f: Frame) => {
     if (

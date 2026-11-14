@@ -1,4 +1,6 @@
 export type Query = {
+  fov_arcsec?: number;
+  live?: boolean;
   ra_deg: number;
   dec_deg: number;
   start_utc?: string;
@@ -12,6 +14,11 @@ export type Frame = {
   detector: string;
   wavelength_um?: number;
   bandwidth_um?: number;
+  pixels?: string;
+  channel?: string;
+  processing_version?: string;
+  exposure_flags?: Record<string, string | number>;
+  flag_names?: Record<string, string>;
   release?: string;
   source_url?: string;
   warnings?: string[];
@@ -21,7 +28,12 @@ export type Manifest = {
   warnings?: string[];
   retrieved_at?: string;
   cached?: boolean;
-  processing?: { stretch?: { vmin?: number; vmax?: number; units?: string } };
+  processing?: {
+    output_shape?: number[];
+    archive_complete?: boolean;
+    archive_products?: Record<string, string>;
+    stretch?: { vmin?: number; vmax?: number; units?: string };
+  };
   grid?: string;
   stretch?: string;
 };

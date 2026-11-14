@@ -230,6 +230,17 @@ input[name="dec"],
   scrollbar-width: thin;
   scrollbar-color: #3b4741 transparent;
 }
+.field-surveys { padding: 14px 18px; overflow-wrap: anywhere; }
+.field-surveys h2, .field-surveys h3 { margin: 0; }
+.field-surveys h2 { font-size: 16px; }
+.field-surveys h3 { font-size: 14px; }
+.field-surveys p { margin: 4px 0 8px; color: var(--muted); }
+.field-surveys section { padding: 14px 0; border-top: 1px solid var(--line); }
+.field-surveys a { color: var(--accent); }
+.survey-images { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.survey-images img { display: block; width: 100%; background: var(--sky); }
+.survey-row { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 8px; padding: 6px 0; }
+.survey-row small, .survey-images small { display: block; width: 100%; color: var(--muted); }
 .search-panel {
   padding: 18px 19px 17px;
 }
@@ -1176,3 +1187,34 @@ tr.active td {
     padding-top: 5px;
   }
 }
+
+.science-controls {
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  min-width: 0;
+}
+.science-controls h3 { font-size: 13px; margin: 0 0 8px; }
+.science-controls label, .science-controls output { display: block; margin: 6px 0; }
+.science-controls details { padding: 5px 0; }
+.science-controls summary { cursor: pointer; }
+.science-controls input:not([type="checkbox"]), .science-controls select,
+.science-controls textarea { max-width: 100%; width: 100%; }
+.science-controls button, .export-tools button {
+  background: #202a27; color: #e3ece7; border: 1px solid #45564e;
+  padding: 3px 7px; border-radius: 4px; margin: 2px;
+}
+.science-controls button[aria-pressed="true"] { color: #112317; background: #a7ddba; }
+.science-controls textarea { min-height: 5em; }
+.science-controls article { border-top: 1px solid var(--line); margin-top: 8px; overflow-wrap: anywhere; }
+.color-stop, .export-tools { display: flex; gap: 5px; align-items: center; }
+.color-stop input[type="color"] { max-width: 40px; }
+.export-tools { flex-wrap: wrap; padding: 2px 8px; font-size: 11px; background: #111715; }
+.zoom-buttons input[type="range"] { width: 85px; }
+.search-panel .fixed-field { display: block; }
+.fixed-field input { display: block; width: 100%; }
+.workspace-save-prompt { position: fixed; z-index: 8; bottom: 18px; left: 16px;
+  max-width: min(320px,90vw); background: #18221d; color: #eef6f0; padding: 14px;
+  border: 1px solid #617469; border-radius: 8px; box-shadow: 0 4px 16px #0008; }
+.settings-scroll > .science-controls { padding: 12px 18px; }
+.preview-note { margin: 0 18px 8px; color: #a7b2ab; font-size: 11px; }

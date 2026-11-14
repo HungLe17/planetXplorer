@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import shutil
 import threading
@@ -7,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+from .archive import ASSET_PREFIX, ORIGIN, RELEASES
 from .config import Settings
 from .pipeline import PIPELINE_VERSION, Pipeline, atomic_json
 from .schemas import Job, Manifest, Query
@@ -80,11 +82,12 @@ class Jobs:
     def submit(self, query: Query) -> str:
         with self.lock:
             self.cleanup()
-            key = hashlib.sha256(query.model_dump_json().encode()).hexdigest()
+            identity = (query.model_dump_json(), PIPELINE_VERSION, ORIGIN, ASSET_PREFIX, RELEASES)
+            key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
             cached = self.cache.get(key)
             if cached and self.records[cached].status in ("running", "queued"):
                 return cached
-            if cached and self.records[cached].manifest:
+            if not query.live and cached and self.records[cached].manifest:
                 self.records[cached].manifest.cached = True
                 atomic_json(
                     self.root / cached / "manifest.json",
@@ -121,7 +124,7 @@ class Jobs:
             )
             directory = self.root / job_id
             directory.mkdir()
-            demo = self._demo(query, directory, job_id)
+            demo = None if query.live else self._demo(query, directory, job_id)
             if demo:
                 self.records[job_id].manifest = demo
                 self.records[job_id].status = result_status(demo)
@@ -131,7 +134,7 @@ class Jobs:
             self.cancel_events[job_id] = threading.Event()
             self.cache[key] = job_id
             self.futures[job_id] = self.executor.submit(
-                self._run, job_id, query, directory, key
+                self._run, job_id, query, directory, key, cached
             )
             return job_id
 
@@ -157,7 +160,12 @@ class Jobs:
                     for f in manifest.frames
                 ):
                     continue
+                if any(f.pixels and (f.pixels != Path(f.id).with_suffix(".bin").name
+                       or not (folder / f.pixels).is_file()) for f in manifest.frames):
+                    continue
                 for frame in manifest.frames:
+                    if frame.pixels:
+                        shutil.copyfile(folder / frame.pixels, directory / frame.pixels)
                     shutil.copyfile(folder / frame.id, directory / frame.id)
                     frame.url = f"/api/assets/{job_id}/{frame.id}"
                 manifest.cached = True
@@ -165,7 +173,7 @@ class Jobs:
                     0,
                     "Prepared archive sequence; retrieved "
                     + manifest.retrieved_at
-                    + ". Change the date range for a fresh live query.",
+                    + ". Search this field again to check the archive.",
                 )
                 atomic_json(
                     directory / "manifest.json", manifest.model_dump(mode="json")
@@ -194,7 +202,25 @@ class Jobs:
                 self.cache = {k: v for k, v in self.cache.items() if v != job_id}
             return job.model_copy(deep=True) if job else None
 
-    def _run(self, job_id: str, query: Query, directory: Path, key: str):
+    def _reuse(self, previous_id, products, directory, job_id):
+        # cleanup() may expire the previous job. Hold the same lock during copying.
+        with self.lock:
+            old = self.records.get(previous_id)
+            prior = old.manifest if old else None
+            if (not prior or prior.omissions or not prior.processing.get("archive_complete")
+                    or prior.processing.get("archive_products") != products):
+                return None
+            manifest = prior.model_copy(deep=True)
+            for frame in manifest.frames:
+                assets = [frame.id, frame.pixels] if frame.pixels else [frame.id]
+                for name in assets:
+                    shutil.copyfile(self.root / previous_id / name, directory / name)
+                frame.url = f"/api/assets/{job_id}/{frame.id}"
+            manifest.cached = True
+            manifest.retrieved_at = datetime.now(UTC).isoformat()
+            return manifest
+
+    def _run(self, job_id: str, query: Query, directory: Path, key: str, previous_id):
         def report(stage):
             with self.lock:
                 if self.cancel_events[job_id].is_set():
@@ -205,7 +231,12 @@ class Jobs:
         with self.lock:
             self.records[job_id].status = "running"
         try:
-            result = self.pipeline.run(query, directory, job_id, report)
+            if query.live and previous_id and isinstance(self.pipeline, Pipeline):
+                def reuse(products):
+                    return self._reuse(previous_id, products, directory, job_id)
+                result = self.pipeline.run(query, directory, job_id, report, reuse=reuse)
+            else:
+                result = self.pipeline.run(query, directory, job_id, report)
             with self.lock:
                 if self.cancel_events[job_id].is_set():
                     raise JobCancelled("Search cancelled")
@@ -250,6 +281,7 @@ class Jobs:
             if not job or job.status not in ("complete", "partial") or not job.manifest:
                 return None
             allowed = {f.id for f in job.manifest.frames} | {"manifest.json"}
+            allowed.update(f.pixels for f in job.manifest.frames if f.pixels)
             if asset_id not in allowed:
                 return None
             path = self.root / job_id / asset_id

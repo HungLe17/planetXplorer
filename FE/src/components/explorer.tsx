@@ -22,6 +22,21 @@ import {
   ChevronDown,
 } from "lucide-react";
 import SkyViewer from "./sky-viewer";
+import Spectrum from "./spectrum";
+import ImageControls from "./image-controls";
+import WorkspacePanel from "./workspace-panel";
+import { defaults, skyPixel, skyPosition, type Display } from "@/lib/imaging";
+import { useImages } from "@/lib/use-images";
+import {
+  storageKey,
+  readBackup,
+  readDisplay,
+  snapshot,
+  type Backup,
+  type Config,
+  type Entry,
+} from "@/lib/workspace";
+import FieldSurveys from "./field-surveys";
 import { presets, Frame, Manifest, Query, Preset } from "@/lib/types";
 import {
   poll,
@@ -31,7 +46,7 @@ import {
   assetUrl,
   cancelJob,
 } from "@/lib/api";
-import { parseQuery, queryUrl } from "@/lib/view-url";
+import { angularWidth, parseQuery, queryUrl } from "@/lib/view-url";
 const empty: Frame[] = [];
 const stamp = (date?: string) =>
   date
@@ -64,7 +79,6 @@ export default function Explorer() {
   const [manifest, setManifest] = useState<Manifest | null>(null),
     [index, setIndex] = useState(0),
     [playing, setPlaying] = useState(false),
-    [speed, setSpeed] = useState(1),
     [ready, setReady] = useState(false),
     [busy, setBusy] = useState(false),
     [stage, setStage] = useState(""),
@@ -74,112 +88,225 @@ export default function Explorer() {
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [datesOpen, setDatesOpen] = useState(false);
   const [tab, setTab] = useState("Settings");
-  const [zoom, setZoom] = useState(1);
-  const [invert, setInvert] = useState(false);
+  const [display, setDisplay] = useState(defaults);
+  const update = useCallback(
+    (patch: Partial<Display>) => setDisplay((old) => ({ ...old, ...patch })),
+    [],
+  );
+  const setZoom = useCallback((zoom: number) => update({ zoom }), [update]);
+  const setSpeed = (speed: number) => update({ speed });
+  const setInvert = (invert: boolean) => update({ invert });
+  const { speed, zoom, invert } = display;
+  const [fov, setFov] = useState("300");
+  const [entries, setEntries] = useState<Entry[]>([]);
+  const [consent, setConsent] = useState<boolean | null>(null);
+  const [pixel, setPixel] = useState<[number, number] | null>(null);
+  const restoreFrame = useRef("");
+  const restorePosition = useRef<Entry["position"] | null>(null);
+  const lastSaved = useRef<Backup | null>(null);
+  const science = useImages(manifest, display);
   const [dockOpen, setDockOpen] = useState(true);
   const [committed, setCommitted] = useState<Query | null>(null);
   const controller = useRef<AbortController | null>(null),
     generation = useRef(0),
     activeJob = useRef<string | null>(null);
   const [displayedQuery, setDisplayedQuery] = useState<Query | null>(null);
-  const frames = manifest?.frames || empty,
+  const frames = science.frames,
     frame = frames[index];
-  const canPlay = ready && frames.length > 1 && !busy;
-  const load = useCallback(async (query: Query) => {
-    controller.current?.abort();
-    const abort = new AbortController();
-    controller.current = abort;
-    const current = ++generation.current;
-    setBusy(true);
-    setError("");
-    setNotice("");
-    setPlaying(false);
-    setCommitted(query);
-    setStage("Finding observations");
-    window.history.replaceState({}, "", queryUrl(query));
-    try {
-      const id = await submit(query, abort.signal),
-        deadline = Date.now() + 150000;
-      if (abort.signal.aborted || current !== generation.current) {
-        void cancelJob(id).catch(() => {});
-        return;
-      }
-      activeJob.current = id;
-      while (!abort.signal.aborted) {
-        if (Date.now() > deadline) {
-          void cancelJob(id).catch(() => {});
-          throw new Error(
-            "Search timed out. Narrow the date range or try again later.",
-          );
+  const product = science.result[index];
+  const configuration: Config = {
+    query: displayedQuery,
+    display,
+    frame: frame?.observation_id ?? "",
+    fov:
+      Number(fov) >= 60 && Number(fov) <= 1800
+        ? Number(fov)
+        : (displayedQuery?.fov_arcsec ?? 300),
+  };
+  const backup: Backup = {
+    version: 1,
+    exported: new Date().toISOString(),
+    locations: entries,
+    config: configuration,
+    snapshot: snapshot(manifest),
+    snapshotComplete: manifest?.processing?.archive_complete === true,
+  };
+  const position =
+    displayedQuery && pixel && science.width
+      ? skyPosition(displayedQuery, ...pixel, science.width, science.height)
+      : displayedQuery;
+  const selectedEntry =
+    position && frame
+      ? {
+          position: { ra_deg: position.ra_deg, dec_deg: position.dec_deg },
+          config: configuration,
+          sources: (product
+            ? [...product.inputs, ...product.reference]
+            : [frame]
+          ).map((f) => f.observation_id),
+          metadata: frame.exposure_flags ?? {},
+          snapshot: snapshot(manifest),
+          snapshotComplete: manifest?.processing?.archive_complete === true,
         }
-        const job = await poll(id, abort.signal);
-        if (current !== generation.current) return;
-        const progress = job.stage?.match(/^fetch:(\d+)\/(\d+)$/);
-        setStage(
-          progress
-            ? `Checked ${progress[1]} of ${progress[2]} cutouts`
-            : stages[job.stage || job.status] || "Processing observations",
-        );
-        if (job.status === "cancelled" || job.status === "cancelling") {
-          setNotice("Search cancelled.");
-          return;
-        }
-        if (job.status === "failed")
-          throw new Error(
-            typeof job.error === "string"
-              ? job.error
-              : "The observations could not be processed. Please try another field.",
-          );
-        if (job.status === "complete" || job.status === "partial") {
-          if (!job.manifest)
-            throw new Error("The service returned no observation manifest.");
-          const result = validateManifest(job.manifest);
-          setManifest({
-            ...result,
-            warnings: [...(result.warnings || []), ...(job.warnings || [])],
-          });
-          setDisplayedQuery(query);
-          setIndex(0);
-          if (!result.frames.length)
-            setNotice(
-              "No comparable observations were found for this field and date range.",
-            );
-          else if (result.frames.length === 1)
-            setNotice(
-              "One observation is available. At least two comparable observations are needed for playback.",
-            );
-          else if (job.status === "partial")
-            setNotice(
-              "Some observations could not be processed. Available frames are shown.",
-            );
-          return;
-        }
-        await new Promise<void>((resolve) => {
-          const done = () => {
-            clearTimeout(timer);
-            abort.signal.removeEventListener("abort", done);
-            resolve();
-          };
-          const timer = setTimeout(done, 2000);
-          abort.signal.addEventListener("abort", done, { once: true });
-        });
+      : null;
+  useEffect(() => {
+    if (frames.length && restoreFrame.current) {
+      const found = frames.findIndex(
+        (f) => f.observation_id === restoreFrame.current,
+      );
+      setIndex(Math.max(0, found));
+      restoreFrame.current = "";
+    } else if (index >= frames.length && index !== 0) setIndex(0);
+  }, [frames, index]);
+  useEffect(() => {
+    if (consent === true)
+      try {
+        const previous = lastSaved.current;
+        const pending = !displayedQuery && previous?.config?.query;
+        const next = pending
+          ? {
+              ...backup,
+              config: { ...previous.config!, display, fov: configuration.fov },
+              snapshot: previous.snapshot,
+              snapshotComplete: previous.snapshotComplete,
+            }
+          : backup;
+        if (restoreFrame.current && next.config)
+          next.config = { ...next.config, frame: restoreFrame.current };
+        localStorage.setItem(storageKey, JSON.stringify(next));
+        lastSaved.current = next;
+      } catch {
+        setError("Could not save the workspace on this device.");
       }
-    } catch (e) {
-      if (!abort.signal.aborted && current === generation.current)
-        setError(
-          e instanceof TypeError
-            ? "The observation service is unavailable. Please try again when the service is connected."
-            : e instanceof Error
-              ? e.message
-              : "Unable to retrieve observations.",
-        );
-    } finally {
-      if (current === generation.current) {
-        setBusy(false);
-        activeJob.current = null;
-      }
+  }, [consent, display, displayedQuery, entries, fov, frame, manifest]);
+  useEffect(() => {
+    if (restorePosition.current && displayedQuery && science.width) {
+      setPixel(
+        skyPixel(
+          displayedQuery,
+          restorePosition.current,
+          science.width,
+          science.height,
+        ),
+      );
+      restorePosition.current = null;
     }
-  }, []);
+  }, [displayedQuery, science.width, science.height]);
+  function allowSave(yes: boolean) {
+    try {
+      if (!yes) localStorage.removeItem(storageKey);
+      setConsent(yes);
+    } catch {
+      setError("Device storage is unavailable.");
+    }
+  }
+  const canPlay = ready && frames.length > 1 && !busy;
+  const load = useCallback(
+    async (
+      query: Query,
+      wantedFrame = "",
+      wantedPosition: Entry["position"] | null = null,
+    ) => {
+      controller.current?.abort();
+      const abort = new AbortController();
+      controller.current = abort;
+      const current = ++generation.current;
+      setBusy(true);
+      setError("");
+      setNotice("");
+      setPlaying(false);
+      setCommitted(query);
+      setStage("Finding observations");
+      restorePosition.current = null;
+      window.history.replaceState({}, "", queryUrl(query));
+      try {
+        const id = await submit(query, abort.signal),
+          deadline = Date.now() + 150000;
+        if (abort.signal.aborted || current !== generation.current) {
+          void cancelJob(id).catch(() => {});
+          return;
+        }
+        activeJob.current = id;
+        while (!abort.signal.aborted) {
+          if (Date.now() > deadline) {
+            void cancelJob(id).catch(() => {});
+            throw new Error(
+              "Search timed out. Narrow the date range or try again later.",
+            );
+          }
+          const job = await poll(id, abort.signal);
+          if (current !== generation.current) return;
+          const progress = job.stage?.match(/^fetch:(\d+)\/(\d+)$/);
+          setStage(
+            progress
+              ? `Checked ${progress[1]} of ${progress[2]} cutouts`
+              : stages[job.stage || job.status] || "Processing observations",
+          );
+          if (job.status === "cancelled" || job.status === "cancelling") {
+            setNotice("Search cancelled.");
+            return;
+          }
+          if (job.status === "failed")
+            throw new Error(
+              typeof job.error === "string"
+                ? job.error
+                : "The observations could not be processed. Please try another field.",
+            );
+          if (job.status === "complete" || job.status === "partial") {
+            if (!job.manifest)
+              throw new Error("The service returned no observation manifest.");
+            const result = validateManifest(job.manifest);
+            setManifest({
+              ...result,
+              warnings: [...(result.warnings || []), ...(job.warnings || [])],
+            });
+            restoreFrame.current = wantedFrame;
+            restorePosition.current = wantedPosition;
+            setPixel(null);
+            setDisplayedQuery(query);
+            setIndex(0);
+            if (!result.frames.length)
+              setNotice(
+                "No comparable observations were found for this field and date range.",
+              );
+            else if (result.frames.length === 1)
+              setNotice(
+                "One observation is available. At least two comparable observations are needed for playback.",
+              );
+            else if (job.status === "partial")
+              setNotice(
+                "Some observations could not be processed. Available frames are shown.",
+              );
+            return;
+          }
+          await new Promise<void>((resolve) => {
+            const done = () => {
+              clearTimeout(timer);
+              abort.signal.removeEventListener("abort", done);
+              resolve();
+            };
+            const timer = setTimeout(done, 2000);
+            abort.signal.addEventListener("abort", done, { once: true });
+          });
+        }
+      } catch (e) {
+        if (!abort.signal.aborted && current === generation.current)
+          setError(
+            e instanceof TypeError
+              ? "The observation service is unavailable. Please try again when the service is connected."
+              : e instanceof Error
+                ? e.message
+                : "Unable to retrieve observations.",
+          );
+      } finally {
+        if (current === generation.current) {
+          setBusy(false);
+          activeJob.current = null;
+        }
+      }
+    },
+    [],
+  );
   function cancelSearch() {
     const id = activeJob.current;
     controller.current?.abort();
@@ -199,6 +326,36 @@ export default function Explorer() {
     if (window.innerWidth < 1024) setInspectorOpen(false);
     const abort = new AbortController();
     const params = new URLSearchParams(window.location.search);
+    let saved: Backup | undefined;
+    try {
+      const viaUrl = params.has("ra") || params.has("dec");
+      const raw = localStorage.getItem(storageKey);
+      if (raw) {
+        saved = readBackup(raw);
+        lastSaved.current = saved;
+        setEntries(saved.locations ?? []);
+        setConsent(true);
+      }
+      const state = params.get("view");
+      if (state) setDisplay(readDisplay(JSON.parse(state)));
+      else if (!viaUrl && saved?.config) setDisplay(saved.config.display);
+      if (!params.has("ra") && saved?.config?.query) {
+        const q = saved.config.query;
+        params.set("ra", String(q.ra_deg));
+        params.set("dec", String(q.dec_deg));
+        params.set("fov", String(q.fov_arcsec ?? 300));
+        if (q.start_utc) params.set("start", q.start_utc.slice(0, 10));
+        if (q.end_utc) params.set("end", q.end_utc.slice(0, 10));
+        params.set("frame", saved.config.frame);
+      }
+      setFov(
+        viaUrl
+          ? (params.get("fov") ?? "300")
+          : String(saved?.config?.fov ?? 300),
+      );
+    } catch {
+      setError("Could not restore saved settings.");
+    }
     const hasSharedField = params.has("ra") || params.has("dec");
     request<{
       presets?: Array<{
@@ -259,10 +416,15 @@ export default function Explorer() {
       setEnd(e);
       if (s || e) setDatesOpen(true);
       try {
-        const query = parseQuery(r, d, s, e);
+        const query = {
+          ...parseQuery(r, d, s, e),
+          fov_arcsec: angularWidth(params.get("fov") ?? "300"),
+          live: true,
+        };
         // Strict Mode cleans up its first mount before this task runs.
         queueMicrotask(() => {
-          if (!abort.signal.aborted) void load(query);
+          if (!abort.signal.aborted)
+            void load(query, params.get("frame") ?? "");
         });
       } catch (err) {
         setError((err as Error).message);
@@ -336,14 +498,57 @@ export default function Explorer() {
     e.preventDefault();
     if (busy) return;
     try {
-      void load(parseQuery(ra, dec, start, end));
+      void load({
+        ...parseQuery(ra, dec, start, end),
+        fov_arcsec: angularWidth(fov),
+        live: true,
+      });
     } catch (err) {
       setError((err as Error).message);
     }
   }
+  function restoreConfig(
+    c: Config,
+    wantedPosition: Entry["position"] | null = null,
+  ) {
+    setDisplay(c.display);
+    setFov(String(c.fov));
+    if (c.query) {
+      const q = c.query;
+      setRa(String(q.ra_deg));
+      setDec(String(q.dec_deg));
+      setStart(q.start_utc?.slice(0, 10) ?? "");
+      setEnd(q.end_utc?.slice(0, 10) ?? "");
+      setSelected("");
+      void load({ ...q, live: true }, c.frame, wantedPosition);
+    }
+  }
+  function importBackup(b: Backup) {
+    if (b.locations)
+      setEntries((old) =>
+        Array.from(
+          new Map([...old, ...b.locations!].map((e) => [e.id, e])).values(),
+        ),
+      );
+    if (b.config) restoreConfig(b.config);
+  }
+  useEffect(() => {
+    if (!displayedQuery || busy || displayedQuery !== committed) return;
+    const url = queryUrl(
+      displayedQuery,
+      display,
+      playing ? undefined : frame?.observation_id,
+    );
+    window.history.replaceState({}, "", url);
+  }, [displayedQuery, committed, busy, display, frame, playing]);
   async function share() {
     if (!committed) return;
-    const url = queryUrl(committed);
+    const url = queryUrl(
+      displayedQuery ?? committed,
+      display,
+      frame?.observation_id,
+    );
+    window.history.replaceState({}, "", url);
     try {
       await navigator.clipboard.writeText(url);
       setCopied(true);
@@ -383,7 +588,7 @@ export default function Explorer() {
       </header>
       <aside className="sidebar" aria-label="Query and display settings">
         <nav className="panel-tabs" aria-label="Settings navigation">
-          {["Settings", "Links", "Help", "About"].map((value) => (
+          {["Settings", "Surveys", "Links", "Help", "About"].map((value) => (
             <button
               key={value}
               onClick={() => setTab(value)}
@@ -447,15 +652,25 @@ export default function Explorer() {
                     />
                   </label>
                 </div>
-                <div
-                  className="fixed-field"
-                  title="The current service uses a fixed 5 arcminute cutout."
-                >
-                  <label htmlFor="fov">Field of view</label>
-                  <div>
-                    <input id="fov" value="300" disabled />
-                    <span>arcsec</span>
-                  </div>
+                <div className="fixed-field">
+                  <label htmlFor="fov">Field of view (arcsec)</label>
+                  <input
+                    id="fov"
+                    type="number"
+                    min="60"
+                    max="1800"
+                    required
+                    value={fov}
+                    onChange={(e) => setFov(e.target.value)}
+                  />
+                  <input
+                    aria-label="Field of view slider"
+                    type="range"
+                    min="60"
+                    max="1800"
+                    value={fov}
+                    onChange={(e) => setFov(e.target.value)}
+                  />
                 </div>
                 <div className="dataset-field">
                   <label htmlFor="dataset">Dataset</label>
@@ -529,9 +744,8 @@ export default function Explorer() {
                         setStart("");
                         setEnd("");
                         setSelected("");
-                        setZoom(1);
-                        setInvert(false);
-                        setSpeed(1);
+                        setDisplay(defaults);
+                        setFov("300");
                         setError("");
                         setNotice("");
                       }}
@@ -541,6 +755,30 @@ export default function Explorer() {
                   )}
                 </div>
               </form>
+              {manifest?.frames.length && !science.numeric ? (
+                <p className="preview-note">
+                  Prepared PNG preview. Search observations to load calibrated
+                  brightness values for color and band controls.
+                </p>
+              ) : null}
+              {science.numeric && (
+                <ImageControls
+                  s={display}
+                  update={update}
+                  frames={manifest?.frames ?? empty}
+                  bounds={science.bounds}
+                />
+              )}
+              <WorkspacePanel
+                backup={backup}
+                saveEntries={setEntries}
+                selected={selectedEntry}
+                consent={consent}
+                setConsent={allowSave}
+                restore={importBackup}
+                reopen={(e) => restoreConfig(e.config, e.position)}
+                onError={setError}
+              />
               <section className="control-section">
                 <div className="control-section-heading">
                   <span>Playback & scale</span>
@@ -560,56 +798,45 @@ export default function Explorer() {
                   value={Math.round(1000 / speed)}
                   onChange={(e) => setSpeed(1000 / Number(e.target.value))}
                 />
-                <label className="slider-label" htmlFor="zoom">
-                  Zoom{" "}
-                  <span>
-                    {zoom.toFixed(2)}
-                    <small> × fit</small>
-                  </span>
-                </label>
-                <input
-                  id="zoom"
-                  type="range"
-                  min="1"
-                  max="8"
-                  step="0.25"
-                  value={zoom}
-                  onChange={(e) => setZoom(Number(e.target.value))}
-                  disabled={!ready}
-                />
               </section>
               <section className="control-section">
                 <div className="control-section-heading">
                   <span>Image appearance</span>
                 </div>
-                <label className="slider-label" htmlFor="stretch">
-                  Display stretch <span>Shared</span>
-                </label>
-                <select id="stretch" disabled>
-                  <option>{manifest?.stretch || "Asinh"}</option>
-                </select>
-                <div className="range-fields">
-                  <label>
-                    Min pixel value
-                    <input
-                      disabled
-                      value={
-                        manifest?.processing?.stretch?.vmin?.toPrecision(4) ??
-                        "—"
-                      }
-                    />
-                  </label>
-                  <label>
-                    Max pixel value
-                    <input
-                      disabled
-                      value={
-                        manifest?.processing?.stretch?.vmax?.toPrecision(4) ??
-                        "—"
-                      }
-                    />
-                  </label>
-                </div>
+                {!science.numeric && (
+                  <>
+                    <label className="slider-label" htmlFor="stretch">
+                      Display stretch <span>Shared</span>
+                    </label>
+                    <select id="stretch" disabled>
+                      <option>{manifest?.stretch || "Asinh"}</option>
+                    </select>
+                    <div className="range-fields">
+                      <label>
+                        Min pixel value
+                        <input
+                          disabled
+                          value={
+                            manifest?.processing?.stretch?.vmin?.toPrecision(
+                              4,
+                            ) ?? "—"
+                          }
+                        />
+                      </label>
+                      <label>
+                        Max pixel value
+                        <input
+                          disabled
+                          value={
+                            manifest?.processing?.stretch?.vmax?.toPrecision(
+                              4,
+                            ) ?? "—"
+                          }
+                        />
+                      </label>
+                    </div>
+                  </>
+                )}
                 <label className="check-row">
                   <input
                     type="checkbox"
@@ -617,10 +844,21 @@ export default function Explorer() {
                     onChange={(e) => setInvert(e.target.checked)}
                     disabled={!ready}
                   />
-                  Invert grayscale
+                  {science.numeric ? "Invert colors" : "Invert grayscale"}
                 </label>
               </section>
             </>
+          ) : tab === "Surveys" ? (
+            committed ? (
+              <FieldSurveys
+                key={`${committed.ra_deg},${committed.dec_deg}`}
+                query={committed}
+              />
+            ) : (
+              <p className="panel-copy">
+                Search a sky position to load survey data.
+              </p>
+            )
           ) : (
             <section className="panel-copy">
               {tab === "Links" ? (
@@ -691,6 +929,7 @@ export default function Explorer() {
               !busy &&
               (Number(ra) !== committed.ra_deg ||
                 Number(dec) !== committed.dec_deg ||
+                Number(fov) !== (committed.fov_arcsec ?? 300) ||
                 start !== (committed.start_utc?.slice(0, 10) || "") ||
                 end !== (committed.end_utc?.slice(0, 10) || "")) && (
                 <p>
@@ -763,6 +1002,20 @@ export default function Explorer() {
                 zoom={zoom}
                 onZoom={setZoom}
                 invert={invert}
+                display={display}
+                update={update}
+                query={displayedQuery}
+                bounds={
+                  science.numeric
+                    ? science.bounds
+                    : [
+                        manifest?.processing?.stretch?.vmin ?? 0,
+                        manifest?.processing?.stretch?.vmax ?? 1,
+                      ]
+                }
+                colors={science.colors}
+                onPixel={(x, y) => setPixel([x, y])}
+                message={science.message}
                 grid={manifest?.grid}
               />
               <div className="playback">
@@ -879,6 +1132,27 @@ export default function Explorer() {
                   <p className="inspector-empty">Select an observation.</p>
                 ) : (
                   <>
+                    {product && (
+                      <div className="detail-group">
+                        <h3>Contributing exposures</h3>
+                        {product.inputs.map((f) => (
+                          <p key={f.id}>
+                            {f.channel} · {stamp(f.observed_at)}
+                          </p>
+                        ))}
+                        {product.reference.map((f) => (
+                          <p key={f.id}>Reference · {stamp(f.observed_at)}</p>
+                        ))}
+                        {display.mode === "rgb" && (
+                          <Spectrum
+                            product={product}
+                            pixel={pixel}
+                            width={science.width}
+                            height={science.height}
+                          />
+                        )}
+                      </div>
+                    )}
                     <div className="detail-group">
                       <h3>Acquisition</h3>
                       <dl>
@@ -907,7 +1181,9 @@ export default function Explorer() {
                         </dd>
                         <dt>Display stretch</dt>
                         <dd>
-                          {manifest ? manifest.stretch || "Not supplied" : "—"}
+                          {science.numeric
+                            ? display.stretch
+                            : manifest?.stretch || "—"}
                         </dd>
                       </dl>
                     </div>

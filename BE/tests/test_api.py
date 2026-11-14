@@ -219,3 +219,48 @@ def test_duplicate_inflight_jobs_reuse_work_and_cancel(tmp_path):
             assert finished(client, retry)["status"] == "partial"
         finally:
             release.set()
+
+
+def test_live_refresh_revalidates_and_reuses_only_unchanged_products(tmp_path):
+    import shutil
+    from dataclasses import replace
+    from app.archive import Observation
+    from app.pipeline import Pipeline
+
+    first = Observation("visitD6","https://irsa.ipac.caltech.edu/first",60800,"D6","DR1")
+
+    class RecordingArchive:
+        rows = [first]
+        downloads = 0
+
+        def search(self, query, deadline):
+            assert query.live
+            return self.rows, []
+
+        def fetch(self, obs, query, path, deadline):
+            self.downloads += 1
+            shutil.copyfile(Path(__file__).parent/"fixtures"/"wise-d6.fits", path)
+            return obs.uri
+
+    from pathlib import Path
+    settings_ = settings(tmp_path)
+    archive = RecordingArchive()
+    with TestClient(create_app(settings_, Pipeline(settings_,archive))) as client:
+        q = {"ra_deg":133.795129,"dec_deg":-7.245147,"live":True}
+        def search():
+            return finished(client,client.post("/api/jobs",json=q).json()["job_id"])["manifest"]
+        original = search()
+        assert len(original["frames"]) == 1 and archive.downloads == 1
+        identical = search()
+        assert identical["cached"] and archive.downloads == 1
+        frame = identical["frames"][0]
+        pixels = client.get(frame["url"].rsplit("/",1)[0]+"/"+frame["pixels"])
+        assert pixels.status_code == 200 and len(pixels.content) == 49*49*4
+        replacement = replace(first,uri=first.uri+"-reprocessed")
+        archive.rows = [replacement,replace(first,identity="repeatD6",mjd=60801,uri=first.uri+"-new")]
+        snapshot = client.post("/api/archive/snapshot",json=q).json()
+        assert snapshot["complete"] and archive.downloads == 1
+        current = search()
+        assert not current["cached"] and archive.downloads == 3
+        assert [f["observation_id"] for f in current["frames"]] == ["visitD6","repeatD6"]
+        assert current["processing"]["archive_products"] == snapshot["products"]

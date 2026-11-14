@@ -36,6 +36,7 @@
     }
   ],
   "warnings": [
+    "Motion check: unverified. The predicted shift is 1.35 pixels. Three background stars gave a registration scatter of 0.22 pixels RMS. Neither epoch yielded an isolated target centroid in the two-cutout check.",
     "Inspecting 24 exposures sampled across available dates and detectors D2/D6.",
     "22 candidate exposure(s) omitted; see the manifest for reasons.",
     "Detector D2/D6 candidate search; not all 102 spectral channels.",

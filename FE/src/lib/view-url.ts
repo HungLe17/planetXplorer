@@ -34,12 +34,22 @@ export function parseQuery(
     ...(end ? { end_utc: end + "T23:59:59Z" } : {}),
   };
 }
-export function queryUrl(query: Query) {
+export function angularWidth(input: string): number {
+  const value = Number(input);
+  if (!Number.isFinite(value) || value < 60 || value > 1800)
+    throw Error("Field of view must be between 60 and 1800 arcseconds.");
+  return value;
+}
+export function queryUrl(query: Query, view?: unknown, frame?: string) {
   const url = new URL("/explore", window.location.origin);
   url.searchParams.set("ra", String(query.ra_deg));
   url.searchParams.set("dec", String(query.dec_deg));
+  if (query.fov_arcsec && query.fov_arcsec !== 300)
+    url.searchParams.set("fov", String(query.fov_arcsec));
   if (query.start_utc)
     url.searchParams.set("start", query.start_utc.slice(0, 10));
   if (query.end_utc) url.searchParams.set("end", query.end_utc.slice(0, 10));
+  if (view) url.searchParams.set("view", JSON.stringify(view));
+  if (frame) url.searchParams.set("frame", frame);
   return url.href;
 }

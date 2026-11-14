@@ -1,14 +1,20 @@
 import asyncio
 import json
+import ssl
+import time
+from typing import Literal
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+import httpx
+import truststore
 
-from .archive import Archive
+from .archive import Archive, ArchiveError
 from .config import ROOT, Settings
+from . import desi, surveys
 from .jobs import CapacityError, Jobs
 from .pipeline import Pipeline
 from .schemas import Job, Query, Submitted
@@ -22,6 +28,7 @@ def create_app(settings: Settings | None = None, pipeline=None):
         archive = Archive(settings) if pipeline is None else None
         manager = Jobs(settings, pipeline or Pipeline(settings, archive))
         app.state.jobs = manager
+        app.state.archive = archive or getattr(pipeline, "archive", None)
         try:
             yield
         finally:
@@ -85,12 +92,30 @@ def create_app(settings: Settings | None = None, pipeline=None):
             path,
             media_type="application/json"
             if asset_id == "manifest.json"
-            else "image/png",
+            else "application/octet-stream" if asset_id.endswith(".bin") else "image/png",
             headers={
                 "Cache-Control": "private, max-age=300",
                 "X-Content-Type-Options": "nosniff",
             },
         )
+
+    @app.post("/api/archive/snapshot")
+    def snapshot(query: Query, request: Request):
+        archive = request.app.state.archive
+        if archive is None:
+            raise HTTPException(503, "Archive metadata service unavailable")
+        try:
+            observations, warnings = archive.search(
+                query.model_copy(update={"live": True}),
+                time.monotonic() + settings.metadata_seconds,
+            )
+        except ArchiveError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        return {
+            "products": {obs.identity: obs.uri for obs in observations},
+            "warnings": warnings,
+            "complete": not any(w.startswith("Partial metadata:") for w in warnings),
+        }
 
     @app.get("/api/presets")
     def presets():
@@ -107,6 +132,24 @@ def create_app(settings: Settings | None = None, pipeline=None):
                     "outcome"
                 ]
         return {"presets": data}
+
+    @app.post("/api/surveys/{survey}")
+    async def survey_field(survey: Literal["neowise", "euclid", "desi"], query: Query):
+        # Context products span their full releases. Dates apply only to the blink sequence.
+        def lookup():
+            if survey == "desi":
+                return {"galaxies": desi.galaxies(settings.desi_dir, query.ra_deg, query.dec_deg),
+                        "source_url": desi.LSS}
+            with httpx.Client(verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+                              timeout=httpx.Timeout(55, connect=8)) as client:
+                fetch = surveys.neowise if survey == "neowise" else surveys.euclid
+                return fetch(client, query.ra_deg, query.dec_deg)
+        try:
+            return await asyncio.to_thread(lookup)
+        except FileNotFoundError as exc:
+            raise HTTPException(503, "DESI catalog index is unavailable") from exc
+        except (ValueError, OSError, httpx.HTTPError) as exc:
+            raise HTTPException(502, f"{survey.upper()} lookup unavailable") from exc
 
     @app.get("/api/health")
     def health(request: Request):
