@@ -127,14 +127,20 @@ or the Barnard proper-motion preset.
 
 | Endpoint | Contract |
 |---|---|
-| `POST /api/jobs` | `{ra_deg, dec_deg, start_utc?, end_utc?}` → HTTP 202 `{job_id}`. Dates must include timezone and be ordered. |
-| `GET /api/jobs/{job_id}` | `queued`, `running`, `complete`, `partial`, `failed`, `cancelling`, or `cancelled`; stage, error/warnings, final manifest, and expiry. |
+| `POST /api/jobs` | `{ra_deg, dec_deg, start_utc?, end_utc?, fov_arcsec?, live?}` → HTTP 202 `{job_id}`. Set `live: true` to check the archive. Dates must include timezone and be ordered. |
+| `GET /api/jobs/{job_id}` | Returns status, stage, timings and the latest manifest. A running live job includes a manifest as soon as a frame is usable. Continue polling through completion to receive remaining frames, final stretches and warnings. |
 | `POST /api/jobs/{job_id}/cancel` | Cancel queued work or request cancellation of a running search. |
-| `GET /api/assets/{job_id}/{asset_id}` | Allowlisted generated PNG or `manifest.json`; no arbitrary paths or URL proxying. |
+| `GET /api/assets/{job_id}/{asset_id}` | Published preview PNGs and numeric pixel arrays, plus the completed job's diagnostics. Use each frame's current `url` for its preview and its `pixels` filename for calibrated data. |
 | `GET /api/presets` | Five target coordinates, coordinate provenance/epoch, and prepared-sequence availability. |
 | `GET /api/health` | Local service/queue state. It does not claim IRSA is reachable. |
 
-Limits: RA `[0,360)`, Dec `[-90,90]`, fixed 5-arcminute field, at most 100 metadata rows, 24 sampled candidate exposures, 12 output frames, 64 MB per cutout, 1 GB disposable cache, and a 120-second processing budget. Individual network operations use bounded timeouts and one retry for transient errors. Processing time is archive-dependent. Busy/full storage returns 429 with Retry-After; unknown/expired jobs and assets return 404; invalid requests return 422. Cache/job files expire after two hours. Settings are in `app/config.py`; cache location can be set with `PLANETX_CACHE_DIR`.
+Live searches default to a 300-arcsecond field and sample up to 24 candidate exposures. Each published frame stays identifiable by its observation ID as earlier dates are inserted into the timeline. Client code should keep the selected observation ID across polls. Read `timings` on the job for elapsed wall time and individual operation durations in milliseconds. Cutout downloads overlap, so their durations should not be added to estimate total waiting time. After completion, the same timing events are available at `/api/assets/{job_id}/timings.json` for the lifetime of the job.
+
+The service accepts RA in `[0,360)`, Dec in `[-90,90]`, and fields from 60 to 1800 arcseconds. The default cutout limit is 64 MB, with 1 GB of disposable cache. Busy or full storage returns HTTP 429 with Retry-After. Unknown or expired jobs and assets return 404, and invalid requests return 422. Job files expire after two hours. See `app/config.py` for limits and `PLANETX_CACHE_DIR` for the cache location.
+
+On a repeat live search, the backend can publish individually cached exposures before IRSA responds. The cache is scoped to coordinates, field of view, archive configuration, processing version and quality mask. The requested dates filter which cached exposures are shown. A running manifest with `processing.refreshing_cache` means its frames are available while their current archive revisions are being checked. A final manifest with `processing.cache_fallback` means the archive check failed and saved observations are being returned. A full catalog response can withdraw an observation or replace its revision. Match by `observation_id` and read the current asset URLs on each update.
+
+On a cold search, one provisional cutout can download while the catalog queries continue. Use `first_candidate`, `cutout_first_byte`, `metadata_search`, `first_frame` and `total` in the job timings to trace that overlap. A first-byte event measures the first nonempty response-body chunk delivered to the client. Retry events include their failure reason. Browser Performance entries named `planetx:<job-id>:first-canvas-draw` measure the separate wait until the viewer draws the image.
 
 Searches deduplicate identical queued/running queries. Metadata has a 30-second budget shared between TAP and SIA, with 15-second network timeouts, and live processing has a 120-second budget including time reserved for rendering partial results. The frontend polls for progress and allows cancellation via `POST /api/jobs/{job_id}/cancel`. Cancellation stops queued work; active network requests finish within their timeout. Restart the backend after code changes (or use Uvicorn `--reload` during development).
 

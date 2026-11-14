@@ -6,6 +6,74 @@ test.beforeEach(async ({ page }) => {
     r.fulfill({ json: { presets: [] } }),
   );
 });
+test("renders and inspects Barnard-like flagged bands and exports their display values", async ({ page }) => {
+  const bands = [
+    { id: "red", wave: 2.31, archived: NaN, flags: 69206022, status: 131 },
+    { id: "green", wave: 4.72, archived: 50, flags: 69206018, status: 2 },
+    { id: "blue", wave: 2.27, archived: NaN, flags: 69206022, status: 131 },
+  ];
+  const frames = bands.map((b, i) => ({
+    id: b.id, observation_id: b.id, observed_at: `2026-01-0${i + 1}T00:00:00Z`,
+    detector: "D3", channel: "D3 " + b.wave + " µm", wavelength_um: b.wave,
+    url: "/api/assets/flags/" + b.id + ".png", pixels: b.id + ".bin", quality: b.id + "-quality.bin",
+  }));
+  await page.route("**/api/jobs", (r) => r.fulfill({ json: { job_id: "flags" } }));
+  await page.route("**/api/jobs/flags", (r) => r.fulfill({ json: {
+    status: "complete", manifest: { frames, processing: { output_shape: [3, 3] } },
+  } }));
+  await page.route("**/api/assets/flags/*.bin", (r) => {
+    const name = new URL(r.request().url()).pathname.split("/").pop()!;
+    const b = bands.find((v) => name.startsWith(v.id))!;
+    const body = Buffer.alloc(9 * (name.endsWith("-quality.bin") ? 9 : 4));
+    for (let i = 0; i < 9; i++) {
+      const source = i === 4 ? b.archived : i === 0 ? 100 : 0;
+      if (body.length === 36) body.writeFloatLE(i === 4 ? NaN : source, i * 4);
+      else {
+        body.writeFloatLE(source, i * 4);
+        body.writeUInt32LE(i === 4 ? b.flags : 0, 36 + i * 4);
+        body[72 + i] = i === 4 ? b.status : 1;
+      }
+    }
+    return r.fulfill({ contentType: "application/octet-stream", body });
+  });
+  await page.goto("/explore?ra=269.4462685&dec=4.7682045");
+  await expect(page.getByLabel("Selected pixel")).toContainText("Overflow · shown at maximum");
+  await page.getByLabel("Display mode").selectOption("rgb");
+  for (const [i, color] of ["Red", "Green", "Blue"].entries())
+    await page.getByLabel(color + " wavelength and exposure").selectOption(bands[i].id);
+  await page.getByLabel("Intensity stretch").selectOption("linear");
+  const inspector = page.getByLabel("Selected pixel");
+  await expect(inspector.getByText("Overflow · shown at maximum")).toHaveCount(2);
+  await expect(inspector).toContainText("50.000 MJy/sr");
+  await expect(inspector).toContainText("OVERFLOW, SUR_ERROR, SOURCE, BLOOM");
+  await expect(inspector.locator("circle")).toHaveCount(0);
+  await expect(page.getByLabel("Mark flagged pixels (1)")).toBeChecked();
+
+  const canvas = page.locator("canvas");
+  const expected = [255, 128, 255, 255];
+  await expect.poll(() => canvas.evaluate((c: HTMLCanvasElement) => {
+    return [...c.getContext("2d")!.getImageData(Math.floor(c.width / 2), Math.floor(c.height / 2), 1, 1).data];
+  })).toEqual(expected);
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByRole("button", { name: "PNG", exact: true }).click(),
+  ]);
+  const stream = await download.createReadStream();
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream!) chunks.push(Buffer.from(chunk));
+  const pixel = await page.evaluate(async (encoded) => {
+    const image = new Image();
+    image.src = "data:image/png;base64," + encoded;
+    await image.decode();
+    const out = document.createElement("canvas");
+    out.width = image.width;
+    out.height = image.height;
+    const ctx = out.getContext("2d")!;
+    ctx.drawImage(image, 0, 0);
+    return [...ctx.getImageData(Math.floor(out.width / 2), Math.floor(out.height / 2), 1, 1).data];
+  }, Buffer.concat(chunks).toString("base64"));
+  expect(pixel).toEqual(expected);
+});
 test("validates coordinates and handles an unavailable backend", async ({
   page,
 }) => {
@@ -29,6 +97,161 @@ test("validates coordinates and handles an unavailable backend", async ({
   await page.getByRole("button", { name: "Search observations" }).click();
   await expect(page.locator(".error[role=alert]")).toContainText("unavailable");
 });
+test("draws a live cutout before a slow asset and preserves selection on earlier arrivals", async ({
+  page,
+}) => {
+  const field = (id: string, day: string) => ({
+    id,
+    observation_id: id,
+    observed_at: `2026-01-${day}T00:00:00Z`,
+    detector: "D2",
+    channel: `D2 ${day} µm`,
+    url: `/api/assets/progressive/${id}-preview.png`,
+    pixels: id + ".bin",
+  });
+  const late = field("late", "20"),
+    early = field("early", "05"),
+    slow = field("slow", "28");
+  let includeEarly = false,
+    complete = false;
+  let releaseSlow!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseSlow = resolve;
+  });
+  const requests = new Map<string, number>();
+  await page.route("**/api/jobs", (r) =>
+    r.fulfill({ json: { job_id: "progressive" } }),
+  );
+  await page.route("**/api/jobs/progressive", (r) => {
+    const frames = includeEarly ? [slow, late, early] : [slow, late];
+    return r.fulfill({
+      json: {
+        status: complete ? "complete" : "running",
+        stage: "fetch:3/4",
+        manifest: {
+          frames: complete
+            ? frames.map((f) => ({ ...f, url: f.url.replace("-preview", "") }))
+            : frames,
+          processing: { output_shape: [2, 2] },
+        },
+      },
+    });
+  });
+  await page.route("**/api/assets/progressive/*.bin", async (r) => {
+    const url = r.request().url();
+    requests.set(url, (requests.get(url) ?? 0) + 1);
+    if (url.endsWith("slow.bin")) await gate;
+    await r.fulfill({
+      contentType: "application/octet-stream",
+      body: Buffer.from(new Float32Array([1, 2, 3, 4]).buffer),
+    });
+  });
+  try {
+    await page.goto("/explore?ra=20&dec=2");
+    const details = page.getByLabel("Frame details", { exact: true });
+    await expect(details).toContainText("late");
+    await expect(
+      page.getByRole("button", { name: "PNG", exact: true }),
+    ).toBeEnabled();
+    await expect(page.locator("canvas")).toHaveAttribute(
+      "aria-label",
+      /Observation 1 of 1/,
+    );
+    expect(
+      await page.evaluate(
+        () =>
+          performance.getEntriesByName("planetx:progressive:first-canvas-draw")
+            .length,
+      ),
+    ).toBe(1);
+    includeEarly = true;
+    await expect(page.locator("canvas")).toHaveAttribute(
+      "aria-label",
+      /Observation 2 of 2/,
+    );
+    await expect(details).toContainText("late");
+    await expect(
+      page.getByRole("button", { name: "Play", exact: true }),
+    ).toBeEnabled();
+    await page
+      .getByRole("button", { name: "Previous frame", exact: true })
+      .click();
+    await expect(details).toContainText("early");
+    releaseSlow();
+    complete = true;
+    await expect(page.locator("canvas")).toHaveAttribute(
+      "aria-label",
+      /Observation 1 of 3/,
+    );
+    await expect(
+      page.getByRole("button", { name: "Search observations" }),
+    ).toBeEnabled();
+    await expect(details).toContainText("early");
+    expect([...requests.values()]).toEqual([1, 1, 1]);
+  } finally {
+    releaseSlow();
+  }
+});
+
+test("shows cached pixels during refresh and replaces a revised exposure in place", async ({
+  page,
+}) => {
+  let phase: "cached" | "verified" | "revised" = "cached";
+  const loaded: string[] = [];
+  await page.route("**/api/jobs", (route) =>
+    route.fulfill({ json: { job_id: "warm" } }),
+  );
+  await page.route("**/api/jobs/warm", (route) => {
+    const revision = phase === "revised" ? "r2" : "r1";
+    return route.fulfill({
+      json: {
+        status: phase === "revised" ? "complete" : "running",
+        stage: phase === "cached" ? "query" : "fetch:1/2",
+        manifest: {
+          frames: [
+            {
+              id: revision + ".png",
+              pixels: revision + ".bin",
+              url: "/api/assets/warm/" + revision + ".png",
+              observation_id: "same-exposure",
+              observed_at: "2025-07-03T00:00:00Z",
+              detector: "D2",
+              release: revision,
+            },
+          ],
+          processing: {
+            output_shape: [2, 2],
+            refreshing_cache: phase === "cached",
+          },
+        },
+      },
+    });
+  });
+  await page.route("**/api/assets/warm/*.bin", (route) => {
+    loaded.push(new URL(route.request().url()).pathname.split("/").pop()!);
+    return route.fulfill({
+      body: Buffer.from(new Float32Array([1, 2, 3, 4]).buffer),
+    });
+  });
+  await page.goto("/explore?ra=20&dec=2");
+  const status = page.getByText(/Showing cached observations while checking/);
+  await expect(status).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "PNG", exact: true }),
+  ).toBeEnabled();
+  phase = "verified";
+  await expect(status).toHaveCount(0);
+  await expect(page.getByText(/Checked 1 of 2 cutouts/)).toBeVisible();
+  phase = "revised";
+  const inspector = page.getByLabel("Frame details", { exact: true });
+  await expect(inspector).toContainText("r2");
+  await expect(inspector).toContainText("same-exposure");
+  await expect(
+    page.getByRole("button", { name: "Observations 1" }),
+  ).toBeVisible();
+  expect(loaded).toEqual(["r1.bin", "r2.bin"]);
+});
+
 test("loads frames in timestamp order, steps, and restores a shared field", async ({
   page,
 }) => {

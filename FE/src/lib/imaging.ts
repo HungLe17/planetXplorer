@@ -30,18 +30,33 @@ export const defaults = {
   speed: 1,
   coords: false,
   legend: false,
+  inspectFlagged: false,
+  markFlagged: true,
 };
-export type Plane = { frame: Frame; values: Float32Array };
+export type PixelQuality = {
+  archived: Float32Array;
+  flags: Uint32Array;
+  status: Uint8Array;
+};
+export type Plane = {
+  frame: Frame;
+  values: Float32Array;
+  quality?: PixelQuality;
+};
 export type Product = {
   frame: Frame;
   planes: Float32Array[];
+  /** Original bands are available for direct exposures and static RGB only. */
+  sourcePlanes?: Plane[];
   inputs: Frame[];
   reference: Frame[];
 };
 export type PreviewScale = { bounds: number[]; stretch: string; units: string };
 export type RenderedFrame = Frame & {
+  canvas?: HTMLCanvasElement;
   sourceDates?: string[];
   previewScale?: PreviewScale;
+  warningPixels?: Uint32Array;
 };
 /** Older manifests can lack the physical calibration of their baked PNG stretch. */
 export function previewScale(manifest: Manifest): PreviewScale {
@@ -93,6 +108,14 @@ function reduce(arrays: Float32Array[], mean: boolean) {
 
 export function products(data: Plane[], s: Display): Product[] {
   if (!data.length) return [];
+  if (s.mode === "single" && !s.difference && !Object.keys(s.operands).length)
+    return data.map((p) => ({
+      frame: p.frame,
+      planes: [p.values],
+      sourcePlanes: [p],
+      inputs: [p.frame],
+      reference: [],
+    }));
   if (s.mode === "rgb") {
     const chosen = s.rgb.map((id) =>
       data.find((p) => p.frame.observation_id === id),
@@ -107,6 +130,7 @@ export function products(data: Plane[], s: Display): Product[] {
       {
         frame: inputs[0],
         planes: chosen.map((p) => p!.values),
+        sourcePlanes: chosen.map((p) => p!),
         inputs,
         reference: [],
       },
@@ -186,6 +210,10 @@ export function products(data: Plane[], s: Display): Product[] {
     result.push({
       frame: epoch.frame,
       planes: [values],
+      sourcePlanes:
+        !combined && !s.difference && operands[0][1] === 1
+          ? [epoch]
+          : undefined,
       inputs: [...inputs],
       reference: [...reference],
     });
@@ -193,16 +221,163 @@ export function products(data: Plane[], s: Display): Product[] {
   return result;
 }
 
+// The backend classifies each native detector pixel before alignment. Bit 7
+// records missing uncertainty independently of how brightness may be displayed.
+const pixelState = {
+  outside: 0,
+  measured: 1,
+  warning: 2,
+  overflow: 3,
+  inspectOnly: 4,
+  unavailable: 5,
+} as const;
+const flagNames: Record<number, string> = {
+  0: "TRANSIENT",
+  1: "OVERFLOW",
+  2: "SUR_ERROR",
+  6: "NONFUNC",
+  7: "DICHROIC",
+  9: "MISSING_DATA",
+  10: "HOT",
+  11: "COLD",
+  12: "FULLSAMPLE",
+  14: "PHANMISS",
+  15: "NONLINEAR",
+  17: "PERSIST",
+  19: "OUTLIER",
+  20: "CROSSTALK",
+  21: "SOURCE",
+  22: "GHOST",
+  23: "GHOST_FPA",
+  24: "GHOST_EXT",
+  25: "STREAK",
+  26: "BLOOM",
+  27: "SNOWBALL",
+  28: "HALO",
+  29: "SATELLITE_HALO",
+};
+
+function displaySample(
+  scienceValue: number,
+  quality: PixelQuality | undefined,
+  i: number,
+  inspectFlagged: boolean,
+): number | "overflow" {
+  if (!quality) return scienceValue;
+  switch (quality.status[i] & 0x7f) {
+    case pixelState.measured:
+      return Number.isFinite(scienceValue) ? scienceValue : quality.archived[i];
+    case pixelState.warning:
+      return quality.archived[i];
+    case pixelState.overflow:
+      return "overflow";
+    case pixelState.inspectOnly:
+      return inspectFlagged ? quality.archived[i] : NaN;
+    default:
+      return NaN;
+  }
+}
+
+export function bandWarning(
+  quality: PixelQuality,
+  i: number,
+  inspectFlagged: boolean,
+) {
+  const state = quality.status[i] & 0x7f;
+  return (
+    state === pixelState.warning ||
+    state === pixelState.overflow ||
+    (state === pixelState.inspectOnly && inspectFlagged)
+  );
+}
+
+export function pixelVisible(p: Product, i: number, inspectFlagged: boolean) {
+  for (let band = 0; band < p.planes.length; band++) {
+    const sample = displaySample(
+      p.planes[band][i],
+      p.sourcePlanes?.[band]?.quality,
+      i,
+      inspectFlagged,
+    );
+    if (sample !== "overflow" && !Number.isFinite(sample)) return false;
+  }
+  return true;
+}
+
+export function inspectBand(plane: Plane, i: number, inspectFlagged: boolean) {
+  const q = plane.quality;
+  if (!q)
+    return {
+      archived: NaN,
+      flags: [] as string[],
+      treatment: Number.isFinite(plane.values[i])
+        ? "Aligned measurement · archive flags unavailable"
+        : "No data · archive flags unavailable",
+      uncertaintyUnavailable: false,
+      warning: false,
+    };
+  const flags = [];
+  const bits = q.flags[i];
+  for (let bit = 0; bit < 32; bit++) {
+    if ((bits >>> bit) & 1)
+      flags.push(
+        plane.frame.flag_names?.[bit] ?? flagNames[bit] ?? `Bit ${bit}`,
+      );
+  }
+  const state = q.status[i] & 0x7f;
+  let treatment: string;
+  switch (state) {
+    case pixelState.measured:
+      treatment = "Measured brightness";
+      break;
+    case pixelState.warning:
+      treatment = "Measured brightness · flagged";
+      break;
+    case pixelState.overflow:
+      treatment = "Overflow · shown at maximum";
+      break;
+    case pixelState.inspectOnly:
+      treatment = inspectFlagged
+        ? "Flagged measurement · inspection only"
+        : "Masked · enable Inspect flagged pixels";
+      break;
+    case pixelState.outside:
+      treatment = "Outside exposure";
+      break;
+    default:
+      treatment = "No usable measurement";
+  }
+  return {
+    archived: q.archived[i],
+    flags,
+    treatment,
+    uncertaintyUnavailable: !!(q.status[i] & 0x80),
+    warning: bandWarning(q, i, inspectFlagged),
+  };
+}
+
 export function displayBounds(images: Product[], s: Display) {
   let min = Infinity,
     max = -Infinity;
-  for (const p of images)
-    for (const a of p.planes)
-      for (const v of a)
-        if (Number.isFinite(v)) {
+  for (const p of images) {
+    const qualityRgb =
+      p.planes.length === 3 && p.sourcePlanes?.some((band) => band.quality);
+    for (let i = 0; i < p.planes[0].length; i++) {
+      if (qualityRgb && !pixelVisible(p, i, s.inspectFlagged)) continue;
+      for (let band = 0; band < p.planes.length; band++) {
+        const v = displaySample(
+          p.planes[band][i],
+          p.sourcePlanes?.[band]?.quality,
+          i,
+          s.inspectFlagged,
+        );
+        if (v !== "overflow" && Number.isFinite(v)) {
           min = Math.min(min, v);
           max = Math.max(max, v);
         }
+      }
+    }
+  }
   return [
     s.low === "" ? (Number.isFinite(min) ? min : 0) : Number(s.low),
     s.high === "" ? (Number.isFinite(max) ? max : 1) : Number(s.high),
@@ -261,9 +436,17 @@ export function renderProduct(
   c.height = height;
   const ctx = c.getContext("2d")!,
     im = ctx.createImageData(width, height);
-  fillImageData(im.data, p.planes, bounds, s.stretch, colors);
+  fillImageData(
+    im.data,
+    p.planes,
+    bounds,
+    s.stretch,
+    colors,
+    p.sourcePlanes,
+    s.inspectFlagged,
+  );
   ctx.putImageData(im, 0, 0);
-  return c.toDataURL();
+  return c;
 }
 
 export function fillImageData(
@@ -272,15 +455,28 @@ export function fillImageData(
   bounds: number[],
   stretch: string,
   colors: number[][],
+  sourcePlanes?: Plane[],
+  inspectFlagged = false,
 ) {
   for (let i = 0; i < planes[0].length; i++) {
-    if (!planes.every((a) => Number.isFinite(a[i]))) continue;
-    const rgb =
-      planes.length === 3
-        ? planes.map((a) => intensityByte(a[i], bounds, stretch))
-        : colors[intensityByte(planes[0][i], bounds, stretch)];
-    out.set(rgb, 4 * i);
-    out[4 * i + 3] = 255;
+    const offset = 4 * i;
+    out[offset + 3] = 255;
+    for (let band = 0; band < planes.length; band++) {
+      const v = displaySample(
+        planes[band][i],
+        sourcePlanes?.[band]?.quality,
+        i,
+        inspectFlagged,
+      );
+      if (v !== "overflow" && !Number.isFinite(v)) {
+        out.fill(0, offset, offset + 4);
+        break;
+      }
+      const intensity =
+        v === "overflow" ? 255 : intensityByte(v, bounds, stretch);
+      if (planes.length === 1) out.set(colors[intensity], offset);
+      else out[offset + band] = intensity;
+    }
   }
 }
 

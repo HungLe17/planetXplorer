@@ -15,6 +15,7 @@ export type Frame = {
   wavelength_um?: number;
   bandwidth_um?: number;
   pixels?: string;
+  quality?: string;
   channel?: string;
   processing_version?: string;
   exposure_flags?: Record<string, string | number>;
@@ -31,6 +32,8 @@ export type Manifest = {
   processing?: {
     output_shape?: number[];
     archive_complete?: boolean;
+    refreshing_cache?: boolean;
+    cache_fallback?: boolean;
     archive_products?: Record<string, string>;
     stretch?: { vmin?: number; vmax?: number; units?: string };
   };

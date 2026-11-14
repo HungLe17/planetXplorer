@@ -1218,3 +1218,8 @@ tr.active td {
   border: 1px solid #617469; border-radius: 8px; box-shadow: 0 4px 16px #0008; }
 .settings-scroll > .science-controls { padding: 12px 18px; }
 .preview-note { margin: 0 18px 8px; color: #a7b2ab; font-size: 11px; }
+.pixel-inspector { margin: 14px 0 0; font-size: 11px; }
+.pixel-inspector figcaption { color: var(--ink); }
+.pixel-band { display: grid; gap: 3px; margin: 8px 0; overflow-wrap: anywhere; }
+.pixel-flags { color: #afc2b4; }
+.pixel-warning, .quality-key { color: #ebbe74; }

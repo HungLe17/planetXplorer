@@ -1,56 +1,77 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo } from "react";
+import { useAssets } from "./use-assets";
 import type { Manifest } from "./types";
 import {
   products,
+  bandWarning,
+  pixelVisible,
   displayBounds,
   palette,
   renderProduct,
   previewScale,
   type Display,
   type Plane,
+  type PixelQuality,
   type RenderedFrame,
 } from "./imaging";
 const empty: NonNullable<Manifest["frames"]> = [];
 export function useImages(manifest: Manifest | null, s: Display) {
-  const [loaded, setLoaded] = useState<{
-    manifest: Manifest;
-    data: Plane[];
-  } | null>(null);
-  const [failure, setFailure] = useState("");
   const source = manifest?.frames ?? empty;
   const numeric = source.length > 0 && source.every((f) => f.pixels);
   const [height, width] = manifest?.processing?.output_shape ?? [0, 0];
-  useEffect(() => {
-    setFailure("");
-    setLoaded(null);
-    if (!manifest || !numeric) return;
-    const abort = new AbortController();
-    Promise.all(
-      source.map(async (frame) => {
-        const r = await fetch(new URL(frame.pixels!, frame.url), {
-          signal: AbortSignal.any([abort.signal, AbortSignal.timeout(30000)]),
-        });
-        if (!r.ok) throw Error("Brightness data could not be loaded.");
-        const buffer = await r.arrayBuffer();
-        if (!width || !height || buffer.byteLength !== width * height * 4)
-          throw Error("Brightness data has an unexpected size.");
-        return { frame, values: new Float32Array(buffer) };
-      }),
-    )
-      .then((data) => {
-        if (!abort.signal.aborted) setLoaded({ manifest, data });
-      })
-      .catch((e) => {
-        if (!abort.signal.aborted) setFailure(String(e.message));
-      });
-    return () => abort.abort();
-  }, [manifest, numeric, source, width, height]);
-  const result = useMemo(
+  const urls = useMemo(
+    () => (numeric ? source.map((f) => new URL(f.pixels!, f.url).href) : []),
+    [source, numeric],
+  );
+  const load = useCallback(
+    async (url: string, signal: AbortSignal) => {
+      const r = await fetch(url, { signal });
+      if (!r.ok) throw Error("Brightness data could not be loaded.");
+      const buffer = await r.arrayBuffer();
+      if (!width || !height || buffer.byteLength !== width * height * 4)
+        throw Error("Brightness data has an unexpected size.");
+      return new Float32Array(buffer);
+    },
+    [width, height],
+  );
+  const { assets, version } = useAssets(urls, load);
+  const qualityUrls = useMemo(
+    () => source.map((f) => numeric && f.quality ? new URL(f.quality, f.url).href : ""),
+    [source, numeric],
+  );
+  const qualityRequests = useMemo(() => qualityUrls.filter(Boolean), [qualityUrls]);
+  const loadQuality = useCallback(
+    async (url: string, signal: AbortSignal): Promise<PixelQuality> => {
+      const response = await fetch(url, { signal });
+      if (!response.ok) throw Error("Pixel quality data could not be loaded.");
+      const buffer = await response.arrayBuffer();
+      const count = width * height;
+      if (!count || buffer.byteLength !== count * 9)
+        throw Error("Pixel quality data has an unexpected size.");
+      return {
+        archived: new Float32Array(buffer, 0, count),
+        flags: new Uint32Array(buffer, count * 4, count),
+        status: new Uint8Array(buffer, count * 8, count),
+      };
+    },
+    [width, height],
+  );
+  const { assets: qualityAssets, version: qualityVersion } = useAssets(qualityRequests, loadQuality);
+  const data = useMemo(
     () =>
-      loaded?.manifest === manifest && loaded ? products(loaded.data, s) : [],
+      urls.flatMap((url, i): Plane[] => {
+        const values = assets.get(url)?.value;
+        const quality = qualityAssets.get(qualityUrls[i])?.value;
+        return values && (!qualityUrls[i] || quality) ? [{ frame: source[i], values, quality }] : [];
+      }),
+    [urls, assets, version, source, qualityUrls, qualityAssets, qualityVersion],
+  );
+  const failure = urls.map((url) => assets.get(url)?.error).find(Boolean)
+    || qualityRequests.map((url) => qualityAssets.get(url)?.error).find(Boolean);
+  const result = useMemo(
+    () => products(data, s),
     [
-      loaded,
-      manifest,
+      data,
       s.mode,
       s.rgb,
       s.operands,
@@ -61,8 +82,18 @@ export function useImages(manifest: Manifest | null, s: Display) {
   );
   const bounds = useMemo(
     () => displayBounds(result, s),
-    [result, s.low, s.high],
+    [result, s.low, s.high, s.inspectFlagged],
   );
+  const warningPixels = useMemo(() => result.map((p) => {
+    const bands = p.sourcePlanes;
+    if (!bands?.some((band) => band.quality)) return undefined;
+    const pixels: number[] = [];
+    for (let i = 0; i < width * height; i++) {
+      if (bands.some((band) => band.quality && bandWarning(band.quality, i, s.inspectFlagged))
+        && pixelVisible(p, i, s.inspectFlagged)) pixels.push(i);
+    }
+    return Uint32Array.from(pixels);
+  }), [result, width, height, s.inspectFlagged]);
   const colors = useMemo(() => palette(s.stops), [s.stops]);
   const previews = useMemo<RenderedFrame[]>(() => {
     if (!manifest || numeric) return empty;
@@ -75,14 +106,15 @@ export function useImages(manifest: Manifest | null, s: Display) {
       numeric && !validBounds
         ? empty
         : numeric
-          ? result.map((p) => ({
+          ? result.map((p, i) => ({
               ...p.frame,
+              warningPixels: warningPixels[i],
               sourceDates: [
                 ...new Set(
                   [...p.inputs, ...p.reference].map((f) => f.observed_at),
                 ),
               ].sort(),
-              url: renderProduct(p, width, height, s, bounds, colors),
+              canvas: renderProduct(p, width, height, s, bounds, colors),
             }))
           : previews,
     [
@@ -92,6 +124,8 @@ export function useImages(manifest: Manifest | null, s: Display) {
       width,
       height,
       s.stretch,
+      s.inspectFlagged,
+      warningPixels,
       bounds,
       colors,
       previews,
@@ -102,10 +136,28 @@ export function useImages(manifest: Manifest | null, s: Display) {
     (numeric && !validBounds
       ? "Minimum brightness must be at or below maximum brightness."
       : "") ||
-    (numeric && loaded?.manifest === manifest && !result.length
+    (numeric && data.length < urls.length && !result.length
+      ? "Loading calibrated brightness data…"
+      : "") ||
+    (numeric && data.length === urls.length && !result.length
       ? s.mode === "rgb"
         ? "Select three distinct wavelengths and their exposures for a static RGB image."
         : "No complete combination for this band selection and time window."
       : "");
-  return { frames, result, numeric, bounds, colors, message, width, height };
+  const settled =
+    !numeric ||
+    (urls.every((url) => assets.get(url)?.value || assets.get(url)?.error)
+      && qualityRequests.every((url) => qualityAssets.get(url)?.value || qualityAssets.get(url)?.error));
+  return {
+    frames,
+    result,
+    numeric,
+    bounds,
+    colors,
+    message,
+    width,
+    height,
+    failure,
+    settled,
+  };
 }

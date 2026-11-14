@@ -202,10 +202,131 @@ def test_numeric_frames_match_masked_data_and_requested_fov(tmp_path):
             shutil.copyfile(FIXTURE, path)
             return SOURCE
 
-    m = Pipeline(Settings(), LocalArchive()).run(query,tmp_path,"live",lambda stage: None)
+    m = Pipeline(Settings(cache_dir=tmp_path / "cache"), LocalArchive()).run(query,tmp_path,"live",lambda stage: None)
     grid, shape = target_grid(query)
     assert shape == (20,20)
     array = np.fromfile(tmp_path/m.frames[0].pixels,dtype="<f4").reshape(shape)
     expected = np.flipud(align(decode(FIXTURE,OBS,query,SOURCE),grid,shape))
     np.testing.assert_allclose(array,expected,rtol=1e-6,equal_nan=True)
     assert m.frames[0].exposure_flags["L2DQAFLG"] == "Pass"
+
+
+def test_live_publication_precedes_slow_cutout_and_keeps_sorted_assets(tmp_path):
+    import shutil
+    from threading import Event
+    from app.config import Settings
+    from app.pipeline import Pipeline
+
+    later = replace(OBS, identity="later", mjd=OBS.mjd + 2, detector="D5")
+    release_earlier = Event()
+    snapshots = []
+    timings = []
+
+    class DelayedArchive:
+        def search(self, *_):
+            return [OBS, later], []
+
+        def fetch(self, obs, query, path, deadline):
+            if obs == OBS:
+                assert release_earlier.wait(10), "First frame was blocked by the slow cutout"
+            shutil.copyfile(FIXTURE, path)
+            return SOURCE
+
+    def publish(manifest):
+        for frame in manifest.frames:
+            assert Image.open(tmp_path / Path(frame.url).name).size == (49, 49)
+            assert (tmp_path / frame.pixels).stat().st_size == 49 * 49 * 4
+        snapshots.append(manifest)
+        release_earlier.set()
+
+    m = Pipeline(Settings(cache_dir=tmp_path / "cache"), DelayedArchive()).run(
+        QUERY.model_copy(update={"live": True}), tmp_path, "progressive", lambda stage: None,
+        publish=publish, timing=lambda *event: timings.append(event),
+    )
+    assert [[f.observation_id for f in s.frames] for s in snapshots] == [
+        ["later"], [OBS.identity, "later"]
+    ]
+    first = snapshots[0].frames[0]
+    assert m.frames[1].id == first.id and m.frames[1].pixels == first.pixels
+    assert first.url.endswith("-preview.png") and m.frames[1].url.endswith(first.id)
+    assert all((tmp_path / f.id).exists() for f in m.frames)
+    assert "No wavelength channel has two usable exposures for a time comparison." in m.warnings
+    assert not any("playback is unavailable" in warning for warning in m.warnings)
+    for key in ("metadata_search", "cutout_download", "fits_decode", "align", "write_assets", "finalize"):
+        assert any(stage == key and seconds >= 0 and status == "ok" for stage, seconds, _, status in timings)
+
+
+def test_live_candidate_yields_image_before_catalog_and_is_replaced(tmp_path):
+    import shutil
+    from threading import Event
+    from app.archive import Archive
+    from app.config import Settings
+    from app.pipeline import Pipeline
+
+    published = Event()
+    original = replace(OBS, release="QR3")
+    revision = replace(OBS, uri=OBS.uri + "-revised")
+    snapshots, downloads = [], []
+
+    class SlowCatalog(Archive):
+        def __init__(self):
+            pass
+
+        def search(self, query, deadline, *, on_candidate, timing):
+            on_candidate(original)
+            assert published.wait(5), "The early frame was blocked by the remaining lookup"
+            return [revision], []
+
+        def fetch(self, obs, query, path, deadline, **kwargs):
+            downloads.append(obs)
+            shutil.copyfile(FIXTURE, path)
+            return obs.uri
+
+    def publish(manifest):
+        snapshots.append(manifest)
+        if manifest.frames:
+            frame = manifest.frames[0]
+            assert (tmp_path / frame.pixels).stat().st_size > 0
+            assert (tmp_path / Path(frame.url).name).is_file()
+            published.set()
+
+    result = Pipeline(Settings(cache_dir=tmp_path / "cache"), SlowCatalog()).run(
+        QUERY.model_copy(update={"live": True}), tmp_path, "cold", lambda _: None, publish=publish,
+    )
+    assert downloads == [original, revision]
+    initial, = snapshots[0].frames
+    final, = result.frames
+    assert initial.release == "QR3" and final.release == "DR1"
+    assert initial.observation_id == final.observation_id
+    assert initial.pixels != final.pixels
+    assert (tmp_path / initial.pixels).is_file()
+
+
+def test_partial_catalog_cannot_downgrade_preferred_cached_exposure(tmp_path):
+    import shutil
+    from app.config import Settings
+    from app.pipeline import Pipeline
+
+    old = replace(OBS, uri=OBS.uri + "-qr3", release="QR3")
+    downloads = []
+
+    class PartialCatalog:
+        def search(self, *_):
+            if downloads:
+                return [old], ["Partial metadata: DR1 temporarily unavailable"]
+            return [OBS], []
+
+        def fetch(self, obs, query, path, deadline):
+            downloads.append(obs)
+            shutil.copyfile(FIXTURE, path)
+            return obs.uri
+
+    pipeline = Pipeline(Settings(cache_dir=tmp_path / "cache"), PartialCatalog())
+    for name in ("cold", "repeat"):
+        directory = tmp_path / name
+        directory.mkdir()
+        result = pipeline.run(QUERY.model_copy(update={"live": True}), directory, name, lambda _: None)
+    assert downloads == [OBS]
+    assert result.cached and not result.processing["archive_complete"]
+    assert result.processing["archive_products"] == {OBS.identity: OBS.uri}
+    assert [f.release for f in result.frames] == ["DR1"]

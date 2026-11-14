@@ -264,3 +264,130 @@ def test_live_refresh_revalidates_and_reuses_only_unchanged_products(tmp_path):
         assert not current["cached"] and archive.downloads == 3
         assert [f["observation_id"] for f in current["frames"]] == ["visitD6","repeatD6"]
         assert current["processing"]["archive_products"] == snapshot["products"]
+
+
+def test_restart_shows_partial_job_cache_while_refresh_checks_archive(tmp_path):
+    import shutil
+    from pathlib import Path
+
+    from app.archive import ArchiveError, Observation
+    from app.pipeline import Pipeline
+
+    visits = [Observation(name, "https://irsa.ipac.caltech.edu/" + name, mjd, "D6", "DR1")
+              for name, mjd in (("usable", 60800), ("missing", 60801))]
+    resume_catalog = threading.Event()
+
+    class ArchiveWithFailure:
+        def __init__(self, refresh):
+            self.refresh = refresh
+            self.downloads = []
+
+        def search(self, query, deadline):
+            if self.refresh:
+                assert resume_catalog.wait(8), "Cache hit waited for archive metadata"
+            return visits, ["Partial metadata: one collection unavailable."]
+
+        def fetch(self, obs, query, path, deadline):
+            self.downloads.append(obs.identity)
+            if not self.refresh and obs.identity == "missing":
+                raise ArchiveError("Transient archive error")
+            shutil.copyfile(Path(__file__).parent / "fixtures" / "wise-d6.fits", path)
+            return obs.uri
+
+    config = settings(tmp_path)
+    query = {"ra_deg": 133.795129, "dec_deg": -7.245147, "live": True}
+    first = ArchiveWithFailure(False)
+    with TestClient(create_app(config, Pipeline(config, first))) as client:
+        result = finished(client, client.post("/api/jobs", json=query).json()["job_id"])
+        assert result["status"] == "partial"
+        assert sorted(first.downloads) == ["missing", "usable"]
+
+    second = ArchiveWithFailure(True)
+    with TestClient(create_app(config, Pipeline(config, second))) as client:
+        job_id = client.post("/api/jobs", json=query).json()["job_id"]
+        try:
+            deadline = time.monotonic() + 7
+            while time.monotonic() < deadline:
+                job = client.get(f"/api/jobs/{job_id}").json()
+                if job.get("manifest") and job["manifest"]["frames"]:
+                    break
+                time.sleep(.01)
+            assert job["status"] == "running"
+            frame, = job["manifest"]["frames"]
+            assert frame["observation_id"] == "usable"
+            assert client.get(frame["url"]).content.startswith(b"\x89PNG")
+            assert len(client.get(f"/api/assets/{job_id}/{frame['pixels']}").content) == 49 * 49 * 4
+            assert not second.downloads
+        finally:
+            resume_catalog.set()
+        final = finished(client, job_id)["manifest"]
+        assert [f["observation_id"] for f in final["frames"]] == ["usable", "missing"]
+        assert second.downloads == ["missing"]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_running_frame_and_timings_survive_late_download(tmp_path, cancel):
+    import shutil
+    from pathlib import Path
+    from app.archive import Observation
+    from app.pipeline import Pipeline
+
+    release = threading.Event()
+
+    class OutOfOrderArchive:
+        def search(self, query, deadline):
+            return [
+                Observation(name, f"https://irsa.ipac.caltech.edu/{name}", mjd, "D6", "DR1")
+                for name, mjd in [("older", 60800), ("newer", 60801)]
+            ], []
+
+        def fetch(self, obs, query, path, deadline):
+            if obs.identity == "older":
+                assert release.wait(8)
+            shutil.copyfile(Path(__file__).parent / "fixtures" / "wise-d6.fits", path)
+            return obs.uri
+
+    config = settings(tmp_path)
+    with TestClient(create_app(config, Pipeline(config, OutOfOrderArchive()))) as client:
+        query = {"ra_deg": 133.795129, "dec_deg": -7.245147, "live": True}
+        job_id = client.post("/api/jobs", json=query).json()["job_id"]
+        endpoint = f"/api/jobs/{job_id}"
+        assets = f"/api/assets/{job_id}/"
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                current = client.get(endpoint).json()
+                if current.get("manifest"):
+                    break
+                time.sleep(.02)
+            assert current["status"] == "running"
+            frame, = current["manifest"]["frames"]
+            assert frame["observation_id"] == "newer"
+            preview = client.get(frame["url"]).content
+            assert preview.startswith(b"\x89PNG")
+            pixels = client.get(assets + frame["pixels"]).content
+            assert len(pixels) == 49 * 49 * 4
+            assert client.get(assets + "raw-0.fits").status_code == 404
+            assert client.get(assets + "manifest.json").status_code == 404
+            assert any(t["stage"] == "first_frame" for t in current["timings"])
+            if cancel:
+                assert client.post(endpoint + "/cancel").json()["status"] == "cancelling"
+        finally:
+            release.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            final = client.get(endpoint).json()
+            if final["status"] not in ("running", "cancelling"):
+                break
+            time.sleep(.02)
+        records = final["manifest"]["frames"]
+        assert final["status"] == ("cancelled" if cancel else "complete")
+        assert [f["observation_id"] for f in records] == (["newer"] if cancel else ["older", "newer"])
+        assert frame["id"] == records[-1]["id"]
+        assert client.get(frame["url"]).content == preview
+        assert client.get(assets + frame["pixels"]).content == pixels
+        timings = client.get(assets + "timings.json").json()["timings"]
+        assert timings == final["timings"]
+        assert timings[-1]["stage"] == "total"
+        assert [t["stage"] for t in timings].count("first_frame") == 1
+        assert any(t["stage"] == "cutout_download" and t["observation_id"] == "newer" for t in timings)

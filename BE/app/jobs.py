@@ -3,6 +3,7 @@ import json
 import logging
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,7 +12,7 @@ from uuid import uuid4
 from .archive import ASSET_PREFIX, ORIGIN, RELEASES
 from .config import Settings
 from .pipeline import PIPELINE_VERSION, Pipeline, atomic_json
-from .schemas import Job, Manifest, Query
+from .schemas import Job, JobTiming, Manifest, Query
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,8 @@ def result_status(manifest: Manifest) -> str:
         item.get("reason") != "Outside selected spectral group or frame limit"
         for item in manifest.omissions
     )
-    return "partial" if failures or len(manifest.frames) == 1 else "complete"
+    partial = failures or len(manifest.frames) == 1 or manifest.processing.get("cache_fallback")
+    return "partial" if partial else "complete"
 
 
 class Jobs:
@@ -40,6 +42,8 @@ class Jobs:
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="spherex")
         self.lock = threading.RLock()
         self.records: dict[str, Job] = {}
+        self.published_assets: dict[str, set[str]] = {}
+        self.started: dict[str, float] = {}
         self.cache: dict[str, str] = {}
         self.cancel_events: dict[str, threading.Event] = {}
         self.futures = {}
@@ -61,6 +65,8 @@ class Jobs:
         ]
         for key in expired:
             self.records.pop(key, None)
+            self.published_assets.pop(key, None)
+            self.started.pop(key, None)
             self.cancel_events.pop(key, None)
             self.futures.pop(key, None)
         for directory in self.root.iterdir():
@@ -87,7 +93,7 @@ class Jobs:
             cached = self.cache.get(key)
             if cached and self.records[cached].status in ("running", "queued"):
                 return cached
-            if not query.live and cached and self.records[cached].manifest:
+            if not query.live and cached and self.records[cached].status in ("complete", "partial"):
                 self.records[cached].manifest.cached = True
                 atomic_json(
                     self.root / cached / "manifest.json",
@@ -109,11 +115,15 @@ class Jobs:
                         size += path.stat().st_size
                 except FileNotFoundError:
                     pass  # Another worker can finish/delete a temporary download during this scan.
-            if size + self.settings.max_download_bytes > self.settings.max_cache_bytes:
+            excess = size + self.settings.max_download_bytes - self.settings.max_cache_bytes
+            if excess > 0 and isinstance(self.pipeline, Pipeline):
+                excess -= self.pipeline.exposure_cache.prune(excess)
+            if excess > 0:
                 raise CapacityError(
                     "Temporary storage is full; retry after cached jobs expire"
                 )
             job_id = uuid4().hex
+            self.started[job_id] = time.monotonic()
             now = datetime.now(UTC)
             self.records[job_id] = Job(
                 job_id=job_id,
@@ -126,15 +136,18 @@ class Jobs:
             directory.mkdir()
             demo = None if query.live else self._demo(query, directory, job_id)
             if demo:
-                self.records[job_id].manifest = demo
-                self.records[job_id].status = result_status(demo)
-                self.records[job_id].stage = "render"
+                job = self.records[job_id]
+                self._timing(job, "demo_load")
+                self._publish(job, demo)
+                job.status = result_status(demo)
+                job.stage = "render"
+                self._finish_timing(job)
                 self.cache[key] = job_id
                 return job_id
             self.cancel_events[job_id] = threading.Event()
             self.cache[key] = job_id
             self.futures[job_id] = self.executor.submit(
-                self._run, job_id, query, directory, key, cached
+                self._run, job_id, query, directory, key
             )
             return job_id
 
@@ -151,7 +164,7 @@ class Jobs:
                 if (
                     manifest.query != query
                     or not manifest.frames
-                    or manifest.processing.get("version") != PIPELINE_VERSION
+                    or manifest.processing.get("version") not in {"1.0.0", PIPELINE_VERSION}
                 ):
                     continue
                 allowed = {f"frame-{i:02}.png" for i in range(12)}
@@ -163,9 +176,17 @@ class Jobs:
                 if any(f.pixels and (f.pixels != Path(f.id).with_suffix(".bin").name
                        or not (folder / f.pixels).is_file()) for f in manifest.frames):
                     continue
+                if any(f.quality and (
+                    not f.pixels or manifest.processing.get("version") != PIPELINE_VERSION
+                    or f.quality != f"{Path(f.id).stem}-quality.bin"
+                    or not (folder / f.quality).is_file()
+                ) for f in manifest.frames):
+                    continue
                 for frame in manifest.frames:
                     if frame.pixels:
                         shutil.copyfile(folder / frame.pixels, directory / frame.pixels)
+                    if frame.quality:
+                        shutil.copyfile(folder / frame.quality, directory / frame.quality)
                     shutil.copyfile(folder / frame.id, directory / frame.id)
                     frame.url = f"/api/assets/{job_id}/{frame.id}"
                 manifest.cached = True
@@ -199,75 +220,104 @@ class Jobs:
                     "cancelled" if self.futures[job_id].cancel() else "cancelling"
                 )
                 job.stage = job.status
+                if job.status == "cancelled":
+                    self._finish_timing(job)
                 self.cache = {k: v for k, v in self.cache.items() if v != job_id}
             return job.model_copy(deep=True) if job else None
 
-    def _reuse(self, previous_id, products, directory, job_id):
-        # cleanup() may expire the previous job. Hold the same lock during copying.
-        with self.lock:
-            old = self.records.get(previous_id)
-            prior = old.manifest if old else None
-            if (not prior or prior.omissions or not prior.processing.get("archive_complete")
-                    or prior.processing.get("archive_products") != products):
-                return None
-            manifest = prior.model_copy(deep=True)
-            for frame in manifest.frames:
-                assets = [frame.id, frame.pixels] if frame.pixels else [frame.id]
-                for name in assets:
-                    shutil.copyfile(self.root / previous_id / name, directory / name)
-                frame.url = f"/api/assets/{job_id}/{frame.id}"
-            manifest.cached = True
-            manifest.retrieved_at = datetime.now(UTC).isoformat()
-            return manifest
+    # Call under self.lock so polling always sees a consistent manifest and clock.
+    def _timing(self, job, stage, duration=None, observation_id=None, outcome="ok"):
+        elapsed = time.monotonic() - self.started[job.job_id]
+        event = JobTiming(
+            stage=stage,
+            elapsed_ms=round(elapsed * 1000, 1),
+            duration_ms=round((elapsed if duration is None else duration) * 1000, 1),
+            observation_id=observation_id,
+            outcome=outcome,
+        )
+        job.timings.append(event)
+        logger.info("job=%s timing=%s", job.job_id, event.model_dump_json(exclude_none=True))
 
-    def _run(self, job_id: str, query: Query, directory: Path, key: str, previous_id):
+    def _publish(self, job, manifest):
+        if manifest.frames and (not job.manifest or not job.manifest.frames):
+            self._timing(job, "first_frame")
+        job.manifest = manifest.model_copy(deep=True)
+        # A browser can still be fetching a snapshot when a newer revision replaces it.
+        assets = self.published_assets.setdefault(job.job_id, set())
+        for frame in manifest.frames:
+            assets.add(frame.url.rsplit("/", 1)[-1])
+            if frame.pixels:
+                assets.add(frame.pixels)
+            if frame.quality:
+                assets.add(frame.quality)
+
+    def _finish_timing(self, job):
+        self._timing(job, "total", outcome=job.status)
+        try:
+            atomic_json(
+                self.root / job.job_id / "timings.json",
+                job.model_dump(include={"job_id", "status", "timings"}, exclude_none=True),
+            )
+        except OSError:
+            logger.exception("Could not persist timings for job %s", job.job_id)
+
+    def _run(self, job_id: str, query: Query, directory: Path, key: str):
+        job = self.records[job_id]
+        cancelled = self.cancel_events[job_id]
+
         def report(stage):
             with self.lock:
-                if self.cancel_events[job_id].is_set():
+                if cancelled.is_set():
                     raise JobCancelled("Search cancelled")
-                self.records[job_id].stage = stage
+                job.stage = stage
             logger.info("job=%s stage=%s", job_id, stage)
 
+        def publish(manifest):
+            with self.lock:
+                if cancelled.is_set():
+                    raise JobCancelled("Search cancelled")
+                self._publish(job, manifest)
+
+        def timing(stage, duration, observation_id=None, outcome="ok"):
+            with self.lock:
+                self._timing(job, stage, duration, observation_id, outcome)
+
         with self.lock:
-            self.records[job_id].status = "running"
+            if not cancelled.is_set():
+                job.status = "running"
+            self._timing(job, "queue")
+        result = None
+        error = None
         try:
-            if query.live and previous_id and isinstance(self.pipeline, Pipeline):
-                def reuse(products):
-                    return self._reuse(previous_id, products, directory, job_id)
-                result = self.pipeline.run(query, directory, job_id, report, reuse=reuse)
+            if cancelled.is_set():
+                raise JobCancelled("Search cancelled")
+            if isinstance(self.pipeline, Pipeline):
+                result = self.pipeline.run(
+                    query, directory, job_id, report, publish=publish, timing=timing
+                )
             else:
                 result = self.pipeline.run(query, directory, job_id, report)
-            with self.lock:
-                if self.cancel_events[job_id].is_set():
-                    raise JobCancelled("Search cancelled")
-                job = self.records[job_id]
-                job.manifest = result
-                job.warnings = []
-                job.status = result_status(result)
-                self.cache[key] = job_id
         except JobCancelled:
-            with self.lock:
-                self.records[job_id].status = "cancelled"
-                self.records[job_id].stage = "cancelled"
+            cancelled.set()
         except Exception as exc:
             logger.exception("Job %s failed", job_id)
-            with self.lock:
-                self.records[job_id].status = "failed"
-                self.records[job_id].error = (
-                    str(exc)[:300]
-                    if isinstance(exc, (ValueError, RuntimeError))
-                    else "Observation processing failed; retry or use a different field."
-                )
-        finally:
-            with self.lock:
-                if (
-                    self.records[job_id].status in ("failed", "cancelled")
-                    and self.cache.get(key) == job_id
-                ):
-                    self.cache.pop(key, None)
-                self.records[job_id].expires_at = (
-                    datetime.now(UTC) + timedelta(seconds=self.settings.ttl_seconds)
-                ).isoformat()
+            error = (
+                str(exc)[:300] if isinstance(exc, (ValueError, RuntimeError))
+                else "Observation processing failed; retry or use a different field."
+            )
+        with self.lock:
+            if cancelled.is_set():
+                job.status = job.stage = "cancelled"
+            elif result is None:
+                job.status = "failed"
+                job.error = error
+            else:
+                self._publish(job, result)
+                job.status = result_status(result)
+            if job.status in ("failed", "cancelled") and self.cache.get(key) == job_id:
+                self.cache.pop(key)
+            job.expires_at = (datetime.now(UTC) + timedelta(seconds=self.settings.ttl_seconds)).isoformat()
+            self._finish_timing(job)
 
     def get(self, job_id: str) -> Job | None:
         with self.lock:
@@ -277,11 +327,15 @@ class Jobs:
 
     def asset(self, job_id: str, asset_id: str) -> Path | None:
         with self.lock:
+            self.cleanup()
             job = self.records.get(job_id)
-            if not job or job.status not in ("complete", "partial") or not job.manifest:
+            if not job:
                 return None
-            allowed = {f.id for f in job.manifest.frames} | {"manifest.json"}
-            allowed.update(f.pixels for f in job.manifest.frames if f.pixels)
+            allowed = self.published_assets.get(job_id, set()).copy()
+            if job.status in ("complete", "partial", "cancelled", "failed"):
+                allowed.add("timings.json")
+            if job.status in ("complete", "partial"):
+                allowed.add("manifest.json")
             if asset_id not in allowed:
                 return None
             path = self.root / job_id / asset_id

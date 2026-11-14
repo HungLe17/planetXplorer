@@ -13,6 +13,9 @@ import {
   skyPixel,
   previewScale,
   fillImageData,
+  inspectBand,
+  bandWarning,
+  pixelVisible,
   exportName,
   grey,
 } from "../src/lib/imaging.ts";
@@ -35,6 +38,14 @@ function exposure(detector, wavelength, date, values) {
 const a = exposure("D2", 1.1, "2026-01-01", [2, NaN]);
 const b = exposure("D2", 1.2, "2026-06-01", [8, 12]);
 const c = exposure("D3", 2.2, "2026-11-10", [3, 4]);
+
+test("the unfiltered timeline includes each ready wavelength in acquisition order", () => {
+  for (const ready of [[b], [a, b], [a, b, c]])
+    assert.deepEqual(
+      products(ready, defaults).map((p) => p.frame),
+      ready.map((p) => p.frame),
+    );
+});
 
 test("detector selection averages wavelengths equally rather than weighting by exposure counts", () => {
   const later = exposure("D2", 1.1, "2026-12-10", [6, 8]);
@@ -190,6 +201,156 @@ test("export filenames retain provenance for static composites and animations", 
   assert.equal(
     name,
     "2026-01-01T00-00-00Z_to_2026-11-10T00-00-00Z_N-up_E-left_RA1_Dec-2_FOV400arcsec_zoom2",
+  );
+});
+
+function qualityExposure(
+  detector,
+  wavelength,
+  archived,
+  flags,
+  status,
+  science = archived.map(() => NaN),
+) {
+  return {
+    ...exposure(detector, wavelength, "2026-01-01", science),
+    quality: {
+      archived: Float32Array.from(archived),
+      flags: Uint32Array.from(flags),
+      status: Uint8Array.from(status),
+    },
+  };
+}
+
+function renderBytes(product, bounds, inspectFlagged = false, stops = grey) {
+  const rgba = new Uint8ClampedArray(product.planes[0].length * 4);
+  fillImageData(
+    rgba,
+    product.planes,
+    bounds,
+    "linear",
+    palette(stops),
+    product.sourcePlanes,
+    inspectFlagged,
+  );
+  return [...rgba];
+}
+
+test("Barnard RGB marks two archived overflow NaNs and preserves the third band's measurement", () => {
+  const source = 1 << 21,
+    bloom = 1 << 26,
+    overflow = 1 << 1,
+    error = 1 << 2;
+  const core = source | bloom | overflow | error;
+  const red = qualityExposure(
+    "D3",
+    2.31,
+    [NaN, 12, 99999],
+    [core, bloom, 0],
+    [131, 2, 1],
+  );
+  const green = qualityExposure(
+    "D6",
+    4.72,
+    [1722.82, 10, NaN],
+    [source | bloom | overflow, 0, 0],
+    [2, 1, 0],
+  );
+  const blue = qualityExposure(
+    "D3",
+    2.27,
+    [NaN, 8, NaN],
+    [core, 0, 0],
+    [131, 1, 0],
+  );
+  const bands = [red, green, blue];
+  const [p] = products(bands, {
+    ...defaults,
+    mode: "rgb",
+    rgb: bands.map((b) => b.frame.observation_id),
+  });
+  assert.deepEqual(
+    renderBytes(p, [0, 2000]),
+    [255, 220, 255, 255, 2, 1, 1, 255, 0, 0, 0, 0],
+  );
+  assert.deepEqual(displayBounds([p], defaults), [8, Math.fround(1722.82)]);
+  assert.deepEqual(inspectBand(red, 0, false), {
+    archived: NaN,
+    flags: ["OVERFLOW", "SUR_ERROR", "SOURCE", "BLOOM"],
+    treatment: "Overflow · shown at maximum",
+    uncertaintyUnavailable: true,
+    warning: true,
+  });
+  assert.equal(inspectBand(green, 0, false).archived, Math.fround(1722.82));
+  assert.equal(pixelVisible(p, 0, false), true);
+  assert.equal(pixelVisible(p, 2, true), false);
+  for (const science of p.planes) assert.ok(Number.isNaN(science[0]));
+});
+
+test("single-band inspection admits flagged finite values while gaps and hard masks stay transparent", () => {
+  const e = qualityExposure(
+    "D6",
+    4,
+    [NaN, 5, 10, NaN, 999, 11, 12, NaN],
+    [2, 1 << 10, 1 << 21, 2 | 512, 2 | 64, 0, 1 << 31, 0],
+    [131, 4, 1, 133, 5, 130, 4, 0],
+    [NaN, NaN, 8, NaN, NaN, NaN, NaN, NaN],
+  );
+  const [p] = products([e], {
+    ...defaults,
+    operands: { [e.frame.channel]: 1 },
+  });
+  assert.deepEqual(displayBounds([p], defaults), [8, 11]);
+  assert.deepEqual(
+    displayBounds([p], { ...defaults, inspectFlagged: true }),
+    [5, 12],
+  );
+  assert.deepEqual(renderBytes(p, [0, 10], false, thermal).slice(0, 4), [
+    ...palette(thermal)[255],
+    255,
+  ]);
+  assert.deepEqual(
+    renderBytes(p, [0, 10], false).filter((_, i) => i % 4 === 3),
+    [255, 0, 255, 0, 0, 255, 0, 0],
+  );
+  assert.deepEqual(
+    renderBytes(p, [0, 10], true).filter((_, i) => i % 4 === 3),
+    [255, 255, 255, 0, 0, 255, 255, 0],
+  );
+  assert.equal(inspectBand(e, 2, false).archived, 10);
+  assert.deepEqual(inspectBand(e, 6, true).flags, ["Bit 31"]);
+  assert.ok(inspectBand(e, 5, false).uncertaintyUnavailable);
+  assert.equal(bandWarning(e.quality, 1, false), false);
+  assert.equal(bandWarning(e.quality, 1, true), true);
+});
+
+test("overflow and inspection-only brightness never contribute to detector averages or differences", () => {
+  const e = qualityExposure(
+    "D6",
+    4,
+    [NaN, 999, 2],
+    [2, 1 << 10, 0],
+    [131, 4, 1],
+    [NaN, NaN, 2],
+  );
+  const anotherBand = exposure("D6", 4.1, "2026-01-02", [2, 3, 4]);
+  const later = exposure("D6", 4, "2026-12-01", [1, 1, 1]);
+  const settings = { ...defaults, inspectFlagged: true, operands: { D6: 1 } };
+  const [average] = products([e, anotherBand], settings);
+  assert.equal(average.sourcePlanes, undefined);
+  assert.deepEqual([...average.planes[0]], [2, 3, 3]);
+  const [difference] = products([e, later], {
+    ...settings,
+    operands: { [e.frame.channel]: 1 },
+    difference: true,
+    windowDays: 1,
+    exclusionDays: 2,
+  });
+  assert.equal(difference.sourcePlanes, undefined);
+  assert.deepEqual([...difference.planes[0]], [NaN, NaN, 1]);
+  assert.deepEqual(
+    renderBytes(difference, [0, 10], true).slice(0, 8),
+    Array(8).fill(0),
   );
 });
 

@@ -110,7 +110,7 @@ export function readDisplay(v: unknown): Display {
     !between(s.zoom, 1, 8) ||
     !between(s.speed, 0.1, 10) ||
     ![s.windowDays, s.exclusionDays].every((n) => between(n, 0, 1e6)) ||
-    ![s.invert, s.coords, s.legend, s.difference].every(
+    ![s.invert, s.coords, s.legend, s.difference, s.markFlagged, s.inspectFlagged].every(
       (x) => typeof x === "boolean",
     ) ||
     ![s.panX, s.panY].every(Number.isFinite) ||

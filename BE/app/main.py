@@ -83,15 +83,13 @@ def create_app(settings: Settings | None = None, pipeline=None):
     def asset(job_id: str, asset_id: str, request: Request):
         if not valid_id(job_id):
             raise HTTPException(404, "Unknown asset")
-        if not request.app.state.jobs.get(job_id):
-            raise HTTPException(404, "Unknown or expired job")
         path = request.app.state.jobs.asset(job_id, asset_id)
         if path is None:
             raise HTTPException(404, "Unknown asset")
         return FileResponse(
             path,
             media_type="application/json"
-            if asset_id == "manifest.json"
+            if asset_id.endswith(".json")
             else "application/octet-stream" if asset_id.endswith(".bin") else "image/png",
             headers={
                 "Cache-Control": "private, max-age=300",

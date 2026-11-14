@@ -15,6 +15,7 @@ import re
 import ssl
 import threading
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from math import isfinite
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -72,6 +73,28 @@ class Observation:
     mjd: float
     detector: str
     release: str
+
+
+Timing = Callable[[str, float, str | None, str], None]
+
+
+def response_chunks(response: httpx.Response, started: float, timing: Timing | None,
+                    stage: str, observation_id: str | None = None) -> Iterator[bytes]:
+    """Record the first nonempty HTTP body chunk before application buffering."""
+    for chunk in response.iter_bytes():
+        if not chunk:
+            continue
+        if timing:
+            timing(stage, time.monotonic() - started, observation_id, "ok")
+            timing = None
+        yield chunk
+
+
+def record_retry(timing, stage, started, exc, observation_id=None):
+    if timing:
+        cause = (f"HTTP {exc.response.status_code}"
+                 if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__)
+        timing(stage, time.monotonic() - started, observation_id, cause)
 
 
 def checked_url(url: str) -> str:
@@ -144,26 +167,54 @@ class Archive:
             return self.discovery_note
 
     def search(
-        self, query: Query, deadline: float
+        self, query: Query, deadline: float, *,
+        on_candidate: Callable[[Observation], None] | None = None, timing: Timing | None = None,
     ) -> tuple[list[Observation], list[str]]:
-        deadline = min(deadline, time.monotonic() + self.settings.metadata_seconds)
-        discovery = self.discovery() if query.live else ""
-        discovery_notes = [discovery] if discovery else []
+        started = time.monotonic()
+        deadline = min(deadline, started + self.settings.metadata_seconds)
+        announced = False
+
+        def offer(batch):
+            nonlocal announced
+            if announced:
+                return
+            candidates = self._select_rows(batch)
+            if candidates:
+                # A collection's latest visit is likely to survive date/detector sampling.
+                candidate = candidates[-1]
+                announced = True
+                if timing:
+                    timing("first_candidate", time.monotonic() - started, candidate.identity, "ok")
+                if on_candidate:
+                    on_candidate(candidate)
+
+        # Collection discovery is informational. Let it run alongside the actual field search.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            discovery = pool.submit(self.discovery) if query.live else None
+            rows, notes = self._search_field(
+                query, deadline, offer if on_candidate or timing else None, timing
+            )
+            if discovery and (note := discovery.result()):
+                notes.insert(1, note)
+        return rows, notes
+
+    def _search_field(self, query, deadline, offer, timing):
         try:
             # SIA indexes the image collections directly; reserve half the budget
             # for TAP if the image-search service is temporarily unavailable.
             rows, notes = self._search_sia(
                 query,
                 min(deadline, time.monotonic() + self.settings.metadata_seconds / 2),
+                offer, timing,
             )
-            return rows, ["Metadata retrieved via IRSA SIA.", *discovery_notes, *notes]
+            return rows, ["Metadata retrieved via IRSA SIA.", *notes]
         except ArchiveError as sia_error:
             if time.monotonic() >= deadline:
                 raise
             try:
-                rows, notes = self._search_tap(query, deadline)
+                rows, notes = self._search_tap(query, deadline, offer, timing)
                 return rows, [
-                    "Metadata retrieved via IRSA TAP after SIA was unavailable.", *discovery_notes,
+                    "Metadata retrieved via IRSA TAP after SIA was unavailable.",
                     *notes,
                 ]
             except ArchiveError as tap_error:
@@ -172,7 +223,7 @@ class Archive:
                 ) from sia_error
 
     def _search_sia(
-        self, query: Query, deadline: float
+        self, query: Query, deadline: float, offer=None, timing: Timing | None = None,
     ) -> tuple[list[Observation], list[str]]:
         # Official collections and on-premises access_url contract:
         # https://caltech-ipac.github.io/spherex-archive-documentation/spherex-data-access/
@@ -188,6 +239,7 @@ class Archive:
                 params["TIME"] = f"{lo} {hi}"
             try:
                 chunks, total = [], 0
+                started = time.monotonic()
                 with self.client.stream(
                     "GET",
                     ORIGIN + "/SIA",
@@ -198,7 +250,7 @@ class Archive:
                     ),
                 ) as response:
                     response.raise_for_status()
-                    for chunk in response.iter_bytes():
+                    for chunk in response_chunks(response, started, timing, "sia_first_byte"):
                         if time.monotonic() >= deadline:
                             raise ArchiveError("IRSA SIA metadata search timed out")
                         total += len(chunk)
@@ -260,10 +312,13 @@ class Archive:
             for future in as_completed(futures):
                 try:
                     batch, truncated = future.result()
-                    rows.extend(batch)
-                    capped |= truncated
                 except ArchiveError:
                     failures.append(futures[future])
+                    continue
+                rows.extend(batch)
+                capped |= truncated
+                if offer:
+                    offer(batch)
         if failures and not rows:
             raise ArchiveError(
                 "IRSA SIA metadata search was incomplete; coverage could not be established"
@@ -272,7 +327,7 @@ class Archive:
             # TAP supports ordered keyset pagination. Fall back to the available
             # SIA records if the supplemental service cannot complete the field.
             try:
-                recent, notes = self._search_tap(query, deadline)
+                recent, notes = self._search_tap(query, deadline, offer, timing)
             except ArchiveError as exc:
                 notes = [f"Partial metadata: {exc}"]
                 recent = []
@@ -283,7 +338,7 @@ class Archive:
         return self._select_rows(rows), notes
 
     def _search_tap(
-        self, query: Query, deadline: float
+        self, query: Query, deadline: float, offer=None, timing: Timing | None = None,
     ) -> tuple[list[Observation], list[str]]:
         detector_names = ",".join(f"'SPHEREx-{d}'" for d in DETECTORS)
         root = ASSET_PREFIX.lstrip("/")
@@ -311,13 +366,15 @@ class Archive:
                 notes.append("Partial metadata: time budget reached during pagination.")
                 break
             try:
-                batch = self._tap_page(prefix + cursor + " ORDER BY p.time_bounds_lower DESC,a.uri DESC", deadline)
+                batch = self._tap_page(prefix + cursor + " ORDER BY p.time_bounds_lower DESC,a.uri DESC", deadline, timing)
             except ArchiveError as exc:
                 if not rows:
                     raise
                 notes.append(f"Partial metadata: {exc}")
                 break
             rows.extend(batch[:limit])
+            if offer:
+                offer(batch[:limit])
             if len(batch) <= limit:
                 break
             last = batch[limit - 1]
@@ -333,9 +390,10 @@ class Archive:
             notes.append(f"Partial metadata: newest {limit * METADATA_PAGES} records inspected; narrow dates to see earlier visits.")
         return self._select_rows(rows), notes
 
-    def _tap_page(self, sql: str, deadline: float) -> list[dict[str, str]]:
+    def _tap_page(self, sql: str, deadline: float, timing: Timing | None = None) -> list[dict[str, str]]:
         text = None
         for attempt in range(2):
+            started = time.monotonic()
             try:
                 with self.client.stream(
                     "GET",
@@ -353,7 +411,7 @@ class Archive:
                 ) as response:
                     response.raise_for_status()
                     chunks, total = [], 0
-                    for chunk in response.iter_bytes():
+                    for chunk in response_chunks(response, started, timing, "tap_first_byte"):
                         if time.monotonic() >= deadline:
                             raise ArchiveError(
                                 "IRSA metadata search timed out. Try again later or narrow the date range."
@@ -369,6 +427,7 @@ class Archive:
             except httpx.HTTPError as exc:
                 if attempt or not retryable(exc) or time.monotonic() >= deadline:
                     raise ArchiveError(archive_failure(exc, "metadata search")) from exc
+                record_retry(timing, "tap_retry", started, exc)
                 time.sleep(min(0.5, max(0, deadline - time.monotonic())))
         reader = csv.DictReader(io.StringIO(text or ""))
         if not {"uri", "time_bounds_lower", "energy_bandpassname"}.issubset(
@@ -423,13 +482,15 @@ class Archive:
                     for obs in (groups[det][-1:] if quota == 1 else evenly_spaced(groups[det], quota))]
         return sorted(selected, key=lambda o: (o.mjd, o.identity))
 
-    def fetch(self, obs: Observation, query: Query, path: Path, deadline: float):
+    def fetch(self, obs: Observation, query: Query, path: Path, deadline: float, *,
+              timing: Timing | None = None):
         url = (
             checked_url(obs.uri)
             + "?"
             + urlencode({"center": f"{query.ra_deg},{query.dec_deg}d", "size": query.fov_arcsec / 3600})
         )
         for attempt in range(2):
+            started = time.monotonic()
             try:
                 current = url
                 for _ in range(4):
@@ -451,7 +512,7 @@ class Archive:
                         r.raise_for_status()
                         total = 0
                         with path.open("wb") as f:
-                            for chunk in r.iter_bytes(65536):
+                            for chunk in response_chunks(r, started, timing, "cutout_first_byte", obs.identity):
                                 if time.monotonic() > deadline:
                                     raise ArchiveError("Processing deadline reached")
                                 total += len(chunk)
@@ -469,5 +530,6 @@ class Archive:
                 path.unlink(missing_ok=True)
                 if attempt or not retryable(exc) or time.monotonic() >= deadline:
                     raise ArchiveError(archive_failure(exc, "cutout download")) from exc
+                record_retry(timing, "cutout_retry", started, exc, obs.identity)
                 time.sleep(min(0.5, max(0, deadline - time.monotonic())))
         raise ArchiveError("Cutout download failed")

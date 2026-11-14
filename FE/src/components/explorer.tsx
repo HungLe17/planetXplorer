@@ -77,7 +77,7 @@ export default function Explorer() {
     [start, setStart] = useState(""),
     [end, setEnd] = useState("");
   const [manifest, setManifest] = useState<Manifest | null>(null),
-    [index, setIndex] = useState(0),
+    [selectedFrame, setSelectedFrame] = useState(""),
     [playing, setPlaying] = useState(false),
     [ready, setReady] = useState(false),
     [busy, setBusy] = useState(false),
@@ -103,6 +103,12 @@ export default function Explorer() {
   const [pixel, setPixel] = useState<[number, number] | null>(null);
   const restoreFrame = useRef("");
   const restorePosition = useRef<Entry["position"] | null>(null);
+  const timing = useRef<{
+    query: Query;
+    job: string;
+    start: number;
+    painted: boolean;
+  } | null>(null);
   const lastSaved = useRef<Backup | null>(null);
   const science = useImages(manifest, display);
   const [dockOpen, setDockOpen] = useState(true);
@@ -112,7 +118,27 @@ export default function Explorer() {
     activeJob = useRef<string | null>(null);
   const [displayedQuery, setDisplayedQuery] = useState<Query | null>(null);
   const frames = science.frames,
+    index = Math.max(
+      0,
+      frames.findIndex((f) => f.observation_id === selectedFrame),
+    ),
     frame = frames[index];
+  const setIndex = useCallback(
+    (value: number | ((current: number) => number)) => {
+      restoreFrame.current = "";
+      setSelectedFrame((selected) => {
+        const old = Math.max(
+          0,
+          frames.findIndex((f) => f.observation_id === selected),
+        );
+        return (
+          frames[typeof value === "number" ? value : value(old)]
+            ?.observation_id ?? ""
+        );
+      });
+    },
+    [frames],
+  );
   const product = science.result[index];
   const configuration: Config = {
     query: displayedQuery,
@@ -150,14 +176,19 @@ export default function Explorer() {
         }
       : null;
   useEffect(() => {
-    if (frames.length && restoreFrame.current) {
-      const found = frames.findIndex(
-        (f) => f.observation_id === restoreFrame.current,
-      );
-      setIndex(Math.max(0, found));
+    if (!frame) return;
+    const wanted = frames.find(
+      (f) => f.observation_id === restoreFrame.current,
+    );
+    if (wanted) {
       restoreFrame.current = "";
-    } else if (index >= frames.length && index !== 0) setIndex(0);
-  }, [frames, index]);
+      setSelectedFrame(wanted.observation_id);
+    } else {
+      if (!busy && science.settled) restoreFrame.current = "";
+      if (frame.observation_id !== selectedFrame)
+        setSelectedFrame(frame.observation_id);
+    }
+  }, [frames, frame, selectedFrame, busy, science.settled]);
   useEffect(() => {
     if (consent === true)
       try {
@@ -200,7 +231,8 @@ export default function Explorer() {
       setError("Device storage is unavailable.");
     }
   }
-  const canPlay = ready && frames.length > 1 && !busy;
+  const canPlay =
+    ready && frames.length > 1 && (!busy || committed === displayedQuery);
   const load = useCallback(
     async (
       query: Query,
@@ -208,9 +240,14 @@ export default function Explorer() {
       wantedPosition: Entry["position"] | null = null,
     ) => {
       controller.current?.abort();
+      if (activeJob.current) void cancelJob(activeJob.current).catch(() => {});
+      activeJob.current = null;
       const abort = new AbortController();
       controller.current = abort;
       const current = ++generation.current;
+      const started = performance.now();
+      let publication = "";
+      timing.current = null;
       setBusy(true);
       setError("");
       setNotice("");
@@ -218,6 +255,7 @@ export default function Explorer() {
       setCommitted(query);
       setStage("Finding observations");
       restorePosition.current = null;
+      restoreFrame.current = "";
       window.history.replaceState({}, "", queryUrl(query));
       try {
         const id = await submit(query, abort.signal),
@@ -227,6 +265,7 @@ export default function Explorer() {
           return;
         }
         activeJob.current = id;
+        timing.current = { query, job: id, start: started, painted: false };
         while (!abort.signal.aborted) {
           if (Date.now() > deadline) {
             void cancelJob(id).catch(() => {});
@@ -235,13 +274,41 @@ export default function Explorer() {
             );
           }
           const job = await poll(id, abort.signal);
-          if (current !== generation.current) return;
+          if (abort.signal.aborted || current !== generation.current) return;
           const progress = job.stage?.match(/^fetch:(\d+)\/(\d+)$/);
           setStage(
             progress
               ? `Checked ${progress[1]} of ${progress[2]} cutouts`
               : stages[job.stage || job.status] || "Processing observations",
           );
+          const finished =
+            job.status === "complete" || job.status === "partial";
+          if (job.manifest && (finished || publication || job.manifest.frames.length)) {
+            const signature = JSON.stringify([
+              job.manifest.processing?.refreshing_cache === true,
+              job.manifest.processing?.archive_complete === true,
+              job.manifest.frames.map((f) => [f.id, f.url]),
+            ]);
+            if (finished || signature !== publication) {
+              const result = validateManifest(job.manifest);
+              if (!publication) {
+                restoreFrame.current = wantedFrame;
+                restorePosition.current = wantedPosition;
+                setPixel(null);
+                setSelectedFrame("");
+                setDisplayedQuery(query);
+                if (result.frames.length)
+                  performance.measure(`planetx:${id}:first-manifest`, {
+                    start: started,
+                  });
+              }
+              publication = signature;
+              setManifest({
+                ...result,
+                warnings: [...(result.warnings || []), ...(job.warnings || [])],
+              });
+            }
+          }
           if (job.status === "cancelled" || job.status === "cancelling") {
             setNotice("Search cancelled.");
             return;
@@ -252,24 +319,16 @@ export default function Explorer() {
                 ? job.error
                 : "The observations could not be processed. Please try another field.",
             );
-          if (job.status === "complete" || job.status === "partial") {
+          if (finished) {
             if (!job.manifest)
               throw new Error("The service returned no observation manifest.");
-            const result = validateManifest(job.manifest);
-            setManifest({
-              ...result,
-              warnings: [...(result.warnings || []), ...(job.warnings || [])],
-            });
-            restoreFrame.current = wantedFrame;
-            restorePosition.current = wantedPosition;
-            setPixel(null);
-            setDisplayedQuery(query);
-            setIndex(0);
-            if (!result.frames.length)
+            if (job.manifest.processing?.cache_fallback)
+              setNotice("Showing saved observations. The archive could not confirm the latest data.");
+            else if (!job.manifest.frames.length)
               setNotice(
                 "No comparable observations were found for this field and date range.",
               );
-            else if (result.frames.length === 1)
+            else if (job.manifest.frames.length === 1)
               setNotice(
                 "One observation is available. At least two comparable observations are needed for playback.",
               );
@@ -285,7 +344,7 @@ export default function Explorer() {
               abort.signal.removeEventListener("abort", done);
               resolve();
             };
-            const timer = setTimeout(done, 2000);
+            const timer = setTimeout(done, 500);
             abort.signal.addEventListener("abort", done, { once: true });
           });
         }
@@ -442,7 +501,7 @@ export default function Explorer() {
       1000 / speed,
     );
     return () => clearInterval(timer);
-  }, [playing, canPlay, speed, frames.length]);
+  }, [playing, canPlay, speed, frames.length, setIndex]);
   useEffect(() => {
     const hide = () => {
       if (document.hidden) setPlaying(false);
@@ -475,13 +534,21 @@ export default function Explorer() {
       document.removeEventListener("visibilitychange", hide);
       window.removeEventListener("keydown", keys);
     };
-  }, [canPlay, frames.length]);
+  }, [canPlay, frames.length, setIndex]);
   const onReady = useCallback((value: boolean) => setReady(value), []);
   const onFailure = useCallback(() => {
-    setReady(false);
     setError(
       "An observation image could not be loaded. Search again to refresh the sequence.",
     );
+  }, []);
+  const onPaint = useCallback((query: Query) => {
+    const run = timing.current;
+    if (run && run.query === query && !run.painted) {
+      run.painted = true;
+      performance.measure(`planetx:${run.job}:first-canvas-draw`, {
+        start: run.start,
+      });
+    }
   }, []);
   function choose(p: Preset) {
     setSelected(p.id);
@@ -941,8 +1008,14 @@ export default function Explorer() {
             {busy && (
               <p className="processing">
                 <LoaderCircle size={14} className="spin" />
-                {stage}.
-                {manifest?.frames.length ? " Previous field shown." : ""}
+                {displayedQuery === committed && manifest?.processing?.refreshing_cache
+                  ? "Showing cached observations while checking the archive for updates."
+                  : `${stage}.`}
+                {manifest?.frames.length
+                  ? displayedQuery === committed
+                    ? ` ${manifest.frames.length} observation${manifest.frames.length === 1 ? "" : "s"} available.`
+                    : " Previous field shown."
+                  : ""}
               </p>
             )}
             {!busy &&
@@ -960,6 +1033,9 @@ export default function Explorer() {
                 <Info size={15} />
                 {error}
               </p>
+            )}
+            {science.failure && frames.length > 0 && (
+              <p role="alert">{science.failure}</p>
             )}
             {notice && (
               <p>
@@ -999,6 +1075,7 @@ export default function Explorer() {
                 index={index}
                 onReady={onReady}
                 onFailure={onFailure}
+                onPaint={onPaint}
                 zoom={zoom}
                 onZoom={setZoom}
                 invert={invert}
@@ -1143,12 +1220,13 @@ export default function Explorer() {
                         {product.reference.map((f) => (
                           <p key={f.id}>Reference · {stamp(f.observed_at)}</p>
                         ))}
-                        {display.mode === "rgb" && (
+                        {(display.mode === "rgb" || product.sourcePlanes?.some((p) => p.quality)) && (
                           <Spectrum
                             product={product}
                             pixel={pixel}
                             width={science.width}
                             height={science.height}
+                            inspectFlagged={display.inspectFlagged}
                           />
                         )}
                       </div>
@@ -1199,7 +1277,7 @@ export default function Explorer() {
                         <dt>Data origin</dt>
                         <dd>
                           {manifest
-                            ? manifest.cached
+                            ? manifest.cached || manifest.processing?.refreshing_cache || manifest.processing?.cache_fallback
                               ? "Cached archive data"
                               : "Live archive query"
                             : "—"}

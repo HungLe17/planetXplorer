@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Maximize2, Minus, Plus } from "lucide-react";
 import { download } from "@/lib/workspace";
 import {
@@ -9,11 +9,35 @@ import {
   type RenderedFrame,
 } from "@/lib/imaging";
 import type { Query } from "@/lib/types";
+import { useAssets } from "@/lib/use-assets";
+type FrameImage = HTMLCanvasElement | HTMLImageElement;
+function loadPreview(url: string, signal: AbortSignal) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    const stop = () => {
+      image.removeAttribute("src");
+      reject(signal.reason);
+    };
+    if (signal.aborted) return stop();
+    signal.addEventListener("abort", stop, { once: true });
+    image.onload = () => {
+      signal.removeEventListener("abort", stop);
+      resolve(image);
+    };
+    image.onerror = () => {
+      signal.removeEventListener("abort", stop);
+      reject(new Error("Image unavailable"));
+    };
+    image.crossOrigin = "anonymous";
+    image.src = url;
+  });
+}
 export default function SkyViewer({
   frames,
   index,
   onReady,
   onFailure,
+  onPaint,
   zoom: magnification,
   onZoom,
   invert,
@@ -41,57 +65,30 @@ export default function SkyViewer({
   index: number;
   onReady: (ready: boolean) => void;
   onFailure: () => void;
+  onPaint: (query: Query) => void;
 }) {
   const canvas = useRef<HTMLCanvasElement>(null),
     box = useRef<HTMLDivElement>(null),
-    images = useRef<HTMLImageElement[]>([]),
     drag = useRef<{ x: number; y: number } | null>(null);
   const origin = useRef({ x: 0, y: 0 });
   const [exportError, setExportError] = useState("");
-  const [loaded, setLoaded] = useState(0);
+  const urls = useMemo(
+    () => frames.filter((f) => !f.canvas).map((f) => f.url),
+    [frames],
+  );
+  const { assets } = useAssets(urls, loadPreview);
+  const images = frames.map((f) => f.canvas ?? assets.get(f.url)?.value);
+  const currentImage = images[index];
+  const currentWarnings = frames[index]?.warningPixels;
+  const loaded = !!currentImage;
+  const failed = urls.some((url) => assets.get(url)?.error);
   useEffect(() => {
-    let alive = true;
-    images.current = [];
-    setLoaded(0);
-    onReady(false);
-    if (!frames.length) return;
-    Promise.all(
-      frames.map(
-        (f) =>
-          new Promise<HTMLImageElement>((resolve, reject) => {
-            const image = new Image();
-            const timer = setTimeout(() => {
-              image.src = "";
-              reject(new Error("Image timeout"));
-            }, 30000);
-            image.onload = () => {
-              clearTimeout(timer);
-              resolve(image);
-            };
-            image.onerror = () => {
-              clearTimeout(timer);
-              reject(new Error("Image unavailable"));
-            };
-            image.crossOrigin = "anonymous";
-            image.src = f.url;
-          }),
-      ),
-    )
-      .then((result) => {
-        if (alive) {
-          images.current = result;
-          setLoaded(result.length);
-          onReady(true);
-        }
-      })
-      .catch(() => {
-        if (alive) onFailure();
-      });
-    return () => {
-      alive = false;
-    };
-  }, [frames, onReady, onFailure]);
-  function geometry(img: HTMLImageElement, width: number, height: number) {
+    onReady(loaded);
+  }, [loaded, onReady]);
+  useEffect(() => {
+    if (failed) onFailure();
+  }, [failed, onFailure]);
+  function geometry(img: FrameImage, width: number, height: number) {
     const fit =
       Math.min(width / img.width, height / img.height) * 0.94 * magnification;
     const w = img.width * fit,
@@ -105,14 +102,30 @@ export default function SkyViewer({
   }
   function paint(
     ctx: CanvasRenderingContext2D,
-    img: HTMLImageElement,
+    img: FrameImage,
     width: number,
     height: number,
+    warningPixels?: Uint32Array,
   ) {
     const g = geometry(img, width, height);
     ctx.imageSmoothingEnabled = false;
     ctx.filter = invert ? "invert(1)" : "none";
     ctx.drawImage(img, g.x, g.y, g.w, g.h);
+    ctx.filter = "none";
+    if (display.markFlagged && warningPixels?.length) {
+      const cellWidth = g.w / img.width, cellHeight = g.h / img.height;
+      ctx.fillStyle = "#ffbd45";
+      ctx.beginPath();
+      for (const i of warningPixels) {
+        ctx.rect(
+          g.x + (i % img.width) * cellWidth,
+          g.y + Math.floor(i / img.width) * cellHeight,
+          cellWidth * 0.28,
+          cellHeight * 0.28,
+        );
+      }
+      ctx.fill();
+    }
   }
   async function exportImage(animated: boolean) {
     if (!query || !box.current) return;
@@ -128,12 +141,15 @@ export default function SkyViewer({
         units: "MJy/sr",
       };
       const rgb = numeric && display.mode === "rgb";
-      const legendHeight = display.legend ? (rgb ? 72 : 48) : 0;
+      const exportFrames = animated ? frames : [frames[index]];
+      const qualityLegend = display.markFlagged && exportFrames.some((f) => f.warningPixels?.length);
+      const scaleHeight = rgb ? 72 : 48;
+      const legendHeight = display.legend ? scaleHeight + (qualityLegend ? 18 : 0) : 0;
       const out = document.createElement("canvas");
       out.width = Math.round(width);
       out.height = height + legendHeight;
       const ctx = out.getContext("2d", { willReadFrequently: true })!;
-      const source = animated ? images.current : [images.current[index]];
+      const source = animated ? images : [currentImage];
       const name = exportName(
         animated ? frames : [frames[index]],
         query,
@@ -141,7 +157,8 @@ export default function SkyViewer({
       );
       const lib = animated ? await import("gifenc") : null,
         gif = lib?.GIFEncoder();
-      for (const img of source) {
+      for (const [i, img] of source.entries()) {
+        if (!img) throw Error("An observation is still loading.");
         ctx.filter = "none";
         ctx.fillStyle = "#000";
         ctx.fillRect(0, 0, out.width, out.height);
@@ -149,7 +166,7 @@ export default function SkyViewer({
         ctx.beginPath();
         ctx.rect(0, 0, width, height);
         ctx.clip();
-        paint(ctx, img, width, height);
+        paint(ctx, img, width, height, exportFrames[i].warningPixels);
         ctx.restore();
         ctx.fillStyle = "white";
         ctx.font = "13px monospace";
@@ -193,8 +210,14 @@ export default function SkyViewer({
               " · " +
               stretch,
             8,
-            height + legendHeight - 8,
+            height + scaleHeight - 8,
           );
+          if (qualityLegend) {
+            ctx.fillStyle = "#ffbd45";
+            ctx.fillRect(9, height + scaleHeight + 3, 7, 7);
+            ctx.fillStyle = "white";
+            ctx.fillText("Flagged pixel", 22, height + scaleHeight + 11);
+          }
         }
         if (lib && gif) {
           const rgba = ctx.getImageData(0, 0, out.width, out.height).data;
@@ -235,15 +258,25 @@ export default function SkyViewer({
       if (!ctx) return;
       ctx.scale(ratio, ratio);
       ctx.clearRect(0, 0, rect.width, rect.height);
-      const img = images.current[index];
-      if (!img) return;
-      paint(ctx, img, rect.width, rect.height);
+      if (!currentImage) return;
+      paint(ctx, currentImage, rect.width, rect.height, currentWarnings);
+      if (query) onPaint(query);
     };
     draw();
     const observer = new ResizeObserver(draw);
     if (box.current) observer.observe(box.current);
     return () => observer.disconnect();
-  }, [index, loaded, display.panX, display.panY, magnification, invert]);
+  }, [
+    currentImage,
+    query,
+    onPaint,
+    display.panX,
+    display.panY,
+    magnification,
+    invert,
+    currentWarnings,
+    display.markFlagged,
+  ]);
   const zoom = (n: number) =>
     onZoom(Math.max(1, Math.min(8, magnification * n)));
   return (
@@ -274,7 +307,7 @@ export default function SkyViewer({
             }
           }}
           onPointerUp={(e) => {
-            const img = images.current[index],
+            const img = currentImage,
               box = e.currentTarget.getBoundingClientRect();
             if (
               img &&
@@ -323,7 +356,7 @@ export default function SkyViewer({
           PNG
         </button>
         <button
-          disabled={!loaded || frames.length < 2}
+          disabled={!images.every(Boolean) || frames.length < 2}
           onClick={() => void exportImage(true)}
         >
           GIF
@@ -344,6 +377,16 @@ export default function SkyViewer({
           />{" "}
           Coordinates
         </label>
+        {currentWarnings && (
+          <label className="quality-key">
+            <input
+              type="checkbox"
+              checked={display.markFlagged}
+              onChange={(e) => update({ markFlagged: e.target.checked })}
+            />{" "}
+            Mark flagged pixels ({currentWarnings.length})
+          </label>
+        )}
         {exportError && <span role="alert">{exportError}</span>}
       </div>
       <div className="sky-bottom">

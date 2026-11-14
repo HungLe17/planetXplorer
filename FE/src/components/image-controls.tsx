@@ -29,6 +29,16 @@ export default function ImageControls({
   return (
     <section className="science-controls">
       <h3>Image processing</h3>
+      {frames.some((f) => f.quality) && (
+        <label>
+          <input
+            type="checkbox"
+            checked={s.inspectFlagged}
+            onChange={(e) => update({ inspectFlagged: e.target.checked })}
+          />{" "}
+          Inspect flagged pixels
+        </label>
+      )}
       <label>
         Display mode
         <select
@@ -126,7 +136,10 @@ export default function ImageControls({
             <output>
               {Object.entries(s.operands)
                 .map(([n, sign]) => (sign === 1 ? "+ " : "− ") + n)
-                .join(" ") || "Automatic · most observations"}
+                .join(" ") ||
+                (s.difference
+                  ? "Automatic · most observations"
+                  : "All wavelengths")}
             </output>
           </details>
           <label>

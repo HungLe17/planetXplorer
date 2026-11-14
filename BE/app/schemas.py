@@ -45,6 +45,7 @@ class Frame(BaseModel):
     units: str = "MJy/sr"
     processing_version: str = ""
     pixels: str | None = None
+    quality: str | None = None
     channel: str = ""
     exposure_flags: dict[str, str | int | float] = Field(default_factory=dict)
     flag_names: dict[int, str] = Field(default_factory=dict)
@@ -63,6 +64,14 @@ class Manifest(BaseModel):
     omissions: list[dict] = Field(default_factory=list)
 
 
+class JobTiming(BaseModel):
+    stage: str
+    elapsed_ms: float
+    duration_ms: float
+    observation_id: str | None = None
+    outcome: str = "ok"
+
+
 class Job(BaseModel):
     job_id: str
     status: Literal[
@@ -72,6 +81,7 @@ class Job(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
     manifest: Manifest | None = None
+    timings: list[JobTiming] = Field(default_factory=list)
     created_at: str
     expires_at: str
 

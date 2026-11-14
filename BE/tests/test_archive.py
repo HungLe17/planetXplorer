@@ -1,4 +1,5 @@
 import time
+import threading
 from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
@@ -205,8 +206,15 @@ def test_sia_search_uses_documented_collections_and_columns():
 
 
 def test_sia_unavailable_falls_back_to_tap():
+    candidates = []
+    timings = []
+    tap_calls = []
+
     def handler(request):
         if request.url.path == "/SIA":
+            return httpx.Response(503)
+        tap_calls.append(request)
+        if len(tap_calls) == 1:
             return httpx.Response(503)
         return httpx.Response(
             200,
@@ -216,9 +224,14 @@ def test_sia_unavailable_falls_back_to_tap():
 
     a = archive_with(handler)
     try:
-        rows, notes = a.search(Query(ra_deg=330, dec_deg=-50), time.monotonic() + 30)
+        rows, notes = a.search(
+            Query(ra_deg=330, dec_deg=-50), time.monotonic() + 30,
+            on_candidate=candidates.append, timing=lambda *event: timings.append(event),
+        )
         assert len(rows) == 1
         assert "TAP" in notes[0]
+        assert candidates == rows
+        assert [e[0] for e in timings] == ["tap_retry", "tap_first_byte", "first_candidate"]
     finally:
         a.close()
 
@@ -265,3 +278,74 @@ def test_discovery_checks_once_and_reports_unconfigured_collection():
         assert len(calls) == 1
     finally:
         archive.close()
+
+
+def test_candidate_arrives_before_slower_preferred_collection_and_discovery():
+    import io
+    from astropy.table import Table
+
+    offered = threading.Event()
+    seen = []
+    timings = []
+
+    def handler(request):
+        if request.url.path != "/SIA":
+            assert offered.wait(5), "discovery must not delay the first cutout"
+            return httpx.Response(200, text="SIA2 Collection\tDescription\n")
+        collection = request.url.params["COLLECTION"]
+        if collection == "spherex_dr1":
+            assert offered.wait(5), "first collection was held behind the slower one"
+        rows = []
+        if collection in ("spherex_dr1", "spherex_qr3"):
+            release = collection.removeprefix("spherex_")
+            rows = [(uri(release, version=v), 60801.5) for v in (9, 10)]
+        table = Table(rows=rows, names=["access_url", "t_min"], dtype=["U300", "f8"])
+        output = io.BytesIO()
+        table.write(output, format="votable")
+        return httpx.Response(200, content=output.getvalue())
+
+    def first_candidate(obs):
+        seen.append(obs)
+        offered.set()
+
+    archive = archive_with(handler)
+    try:
+        result, _ = archive.search(Query(ra_deg=0, dec_deg=0, live=True), time.monotonic()+15,
+                                   on_candidate=first_candidate, timing=lambda *event: timings.append(event))
+    finally:
+        archive.close()
+    assert len(seen) == len(result) == 1
+    assert seen[0].identity == result[0].identity
+    assert seen[0].uri.endswith(uri("qr3", version=10))
+    assert result[0].uri.endswith(uri("dr1", version=10))
+    assert [e[2] for e in timings if e[0] == "first_candidate"] == [seen[0].identity]
+    assert sum(e[0] == "sia_first_byte" for e in timings) == 4
+
+
+def test_cutout_retry_and_first_byte_measure_separate_attempts(tmp_path):
+    calls = []
+    timings = []
+
+    class Body(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"small first chunk"
+            assert timings[-1][0] == "cutout_first_byte"
+            yield b"last chunk"
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, stream=Body())
+
+    archive = archive_with(handler)
+    obs = Observation("visitD2", "https://irsa.ipac.caltech.edu/" + uri(), 60800, "D2", "DR1")
+    try:
+        archive.fetch(obs, Query(ra_deg=0, dec_deg=0), tmp_path / "x.fits",
+                      time.monotonic()+5, timing=lambda *event: timings.append(event))
+    finally:
+        archive.close()
+    assert (tmp_path / "x.fits").read_bytes() == b"small first chunklast chunk"
+    assert [(stage, identity, outcome) for stage, _, identity, outcome in timings] == [
+        ("cutout_retry", obs.identity, "HTTP 503"), ("cutout_first_byte", obs.identity, "ok")
+    ]
