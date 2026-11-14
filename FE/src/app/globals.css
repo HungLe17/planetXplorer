@@ -1176,3 +1176,474 @@ tr.active td {
     padding-top: 5px;
   }
 }
+
+.sequence-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 16px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+  background: #171e1a;
+}
+.sequence-toolbar label,
+.catalog-controls label {
+  font-size: 10px;
+  color: #a5b7ab;
+  white-space: nowrap;
+}
+.sequence-toolbar select {
+  height: 28px;
+  width: min(360px, 70%);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
+}
+.observations-dock:has(.catalog-controls) {
+  height: 240px;
+  max-height: 35dvh;
+}
+.catalog-controls {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 16px;
+  border-top: 1px solid var(--line);
+}
+.catalog-controls select {
+  width: 100px;
+  height: 27px;
+  font-size: 10px;
+}
+.catalog-controls > span {
+  font-size: 10px;
+  color: #8da295;
+  margin-left: auto;
+}
+.catalog-controls .button {
+  height: 27px;
+  font-size: 10px;
+}
+.observation-status {
+  display: block;
+  font-size: 9px;
+  color: #82988a;
+  max-width: 350px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.table-scroll {
+  flex: 1;
+}
+.catalog-controls ~ .table-scroll td {
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+@media (max-width: 700px) {
+  .observations-dock:has(.catalog-controls) {
+    height: 200px;
+    max-height: 28dvh;
+  }
+  .catalog-controls {
+    gap: 6px;
+    padding: 4px 10px;
+    flex-wrap: wrap;
+  }
+  .catalog-controls > span {
+    font-size: 8px;
+  }
+  .catalog-controls label {
+    display: none;
+  }
+  .catalog-controls select {
+    width: 78px;
+  }
+  .sequence-toolbar {
+    padding: 5px 10px;
+    gap: 6px;
+  }
+  .sequence-toolbar label {
+    font-size: 9px;
+  }
+  .sequence-toolbar select {
+    width: 100%;
+    font-size: 9px;
+  }
+  .catalog-controls .button {
+    padding: 0 6px;
+  }
+}
+
+.sky-shell:fullscreen {
+  width: 100vw;
+  height: 100dvh;
+  flex: none;
+  background: var(--sky);
+}
+.sky-bottom {
+  justify-content: space-between;
+  height: 38px;
+  min-height: 38px;
+}
+.gesture-hint {
+  font-size: 9px;
+  color: #7d9284;
+  white-space: nowrap;
+}
+.zoom-buttons {
+  gap: 4px;
+}
+.zoom-buttons button {
+  min-height: 30px;
+  min-width: 28px;
+  justify-content: center;
+  align-items: center;
+  border-radius: 3px;
+}
+.zoom-buttons button:hover:enabled {
+  background: #293a2e;
+}
+.zoom-buttons .text-tool {
+  font-size: 10px;
+  gap: 4px;
+  padding: 0 7px;
+}
+.sky-canvas canvas:focus-visible {
+  outline: 1px solid #779b85;
+  outline-offset: -2px;
+}
+.image-readout {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  max-width: calc(100% - 24px);
+  padding: 5px 8px;
+  background: #080c0bbf;
+  border: 1px solid #263b2d;
+  border-radius: 4px;
+  pointer-events: none;
+  font:
+    10px "IBM Plex Mono",
+    monospace;
+  color: #bdd0c2;
+  line-height: 1.6;
+}
+.image-readout time {
+  color: #a0b9a9;
+}
+.image-error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: #080c0be8;
+  font-size: 12px;
+  color: #b4c8bb;
+}
+.image-error > span {
+  font-size: 10px;
+  color: #81998a;
+}
+.view-modes {
+  display: flex;
+  flex-shrink: 0;
+  border: 1px solid #3c5143;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.view-modes button {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 11px;
+  color: #8ca092;
+}
+.view-modes button[aria-pressed="true"] {
+  background: #314839;
+  color: #d1e4d8;
+}
+.view-modes button:hover {
+  color: #d1e4d8;
+}
+.sequence-toolbar {
+  min-height: 43px;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.sequence-toolbar select {
+  flex: 1;
+  max-width: 460px;
+  width: auto;
+}
+.wavelength-warning {
+  font-size: 10px;
+  line-height: 1.5;
+  color: #c9b88e;
+}
+.browse-summary {
+  font-size: 10px;
+  color: #8ca092;
+}
+.loop-toggle {
+  display: grid;
+  place-items: center;
+  min-width: 28px;
+  min-height: 28px;
+  color: #708879;
+  border-radius: 4px;
+}
+.loop-toggle.active {
+  color: var(--accent);
+  background: #26392d;
+}
+.playback-guidance {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  font-size: 10px;
+  color: #8ba393;
+  min-height: 27px;
+  padding: 4px 12px;
+  flex-wrap: wrap;
+}
+.playback-guidance button {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.dock-header {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  min-height: 37px;
+}
+.dock-header .dock-heading {
+  width: auto;
+  flex: 1;
+  min-width: 0;
+}
+.dock-expand {
+  width: 37px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  color: #91ab9b;
+  border-left: 1px solid var(--line);
+}
+.dock-expand:hover {
+  color: var(--accent);
+  background: #26392d;
+}
+.observations-dock.expanded:has(.catalog-controls) {
+  height: 50dvh;
+  max-height: 55dvh;
+}
+.catalog-controls {
+  flex-wrap: wrap;
+}
+.catalog-controls input.catalog-search {
+  height: 27px;
+  font-size: 10px;
+  flex: 1 1 125px;
+  max-width: 200px;
+  min-width: 90px;
+  width: auto;
+}
+.catalog-controls select {
+  width: auto;
+  max-width: 120px;
+}
+.catalog-export {
+  display: grid;
+  place-items: center;
+  min-height: 27px;
+  min-width: 28px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--accent);
+}
+.catalog-export:hover:enabled {
+  background: #26392d;
+}
+.catalog-controls > .button {
+  white-space: nowrap;
+}
+@media (max-width: 1100px) {
+  .gesture-hint {
+    display: none;
+  }
+  .sky-bottom {
+    justify-content: flex-end;
+  }
+}
+@media (max-width: 700px) {
+  .image-readout {
+    left: 7px;
+    top: 7px;
+    gap: 3px 10px;
+    font-size: 8px;
+    padding: 3px 6px;
+  }
+  .sky-bottom {
+    height: 36px;
+    min-height: 36px;
+  }
+  .zoom-buttons button {
+    height: 30px;
+    min-width: 30px;
+  }
+  .sequence-toolbar {
+    gap: 6px;
+    padding: 5px 10px;
+    min-height: 40px;
+  }
+  .sequence-toolbar select {
+    font-size: 9px;
+    max-width: 100%;
+    min-width: 140px;
+  }
+  .view-modes button {
+    height: 27px;
+    font-size: 10px;
+    padding: 0 9px;
+  }
+  .wavelength-warning {
+    font-size: 9px;
+    flex: 1;
+    min-width: 120px;
+  }
+  .playback {
+    gap: 9px;
+  }
+  .playback-guidance {
+    font-size: 9px;
+    min-height: 26px;
+  }
+  .catalog-controls input.catalog-search {
+    flex-basis: 100px;
+    max-width: none;
+  }
+  .catalog-controls select {
+    max-width: 94px;
+  }
+  .catalog-controls .catalog-search {
+    order: 0;
+  }
+  .catalog-controls > span {
+    flex-basis: 100%;
+    margin-left: 0;
+    order: 1;
+  }
+  .catalog-controls > .button,
+  .catalog-export {
+    order: 2;
+  }
+  .catalog-controls > label {
+    display: none;
+  }
+  .observations-dock:has(.catalog-controls) {
+    max-height: 31dvh;
+    height: 230px;
+  }
+  .content:has(.observations-dock.expanded) > .workspace-grid {
+    display: none;
+  }
+  .observations-dock.expanded:has(.catalog-controls) {
+    height: auto;
+    max-height: none;
+    flex: 1;
+    min-height: 0;
+  }
+  .dock-header {
+    min-height: 34px;
+  }
+  .dock-expand {
+    height: 30px;
+  }
+  .loop-toggle {
+    min-width: 24px;
+  }
+  .catalog-controls {
+    gap: 5px;
+  }
+  .catalog-controls .button {
+    font-size: 9px;
+  }
+  .image-error {
+    font-size: 11px;
+  }
+}
+
+.mobile-field-toggle {
+  display: none;
+}
+.table-empty button {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+@media (max-width: 700px) {
+  .mobile-field-toggle {
+    display: inline-flex;
+    height: 29px;
+    font-size: 10px;
+    padding: 0 9px;
+  }
+  .settings-collapsed .sidebar {
+    display: none;
+  }
+  .observations-dock:has(.catalog-controls) {
+    height: 190px;
+    max-height: 25dvh;
+  }
+  .sky-canvas {
+    min-height: 70px;
+  }
+  .observations-dock.expanded:has(.catalog-controls) {
+    height: auto;
+    max-height: none;
+  }
+  .gesture-hint {
+    display: none;
+  }
+}
+
+@media (max-width: 1100px) {
+  .sky-bottom .gesture-hint {
+    display: none;
+  }
+}
+@media (max-width: 700px) {
+  .transport button:first-child,
+  .transport button:last-child {
+    display: none;
+  }
+  .transport button {
+    width: 38px;
+    height: 40px;
+  }
+  .transport .play {
+    width: 44px;
+    height: 40px;
+  }
+  .playback {
+    padding-top: 6px;
+    padding-bottom: 3px;
+  }
+  .sky-bottom {
+    height: 40px;
+    min-height: 40px;
+  }
+  .zoom-buttons button {
+    min-height: 34px;
+  }
+  .image-readout {
+    font-size: 9px;
+  }
+}

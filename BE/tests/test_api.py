@@ -219,3 +219,63 @@ def test_duplicate_inflight_jobs_reuse_work_and_cancel(tmp_path):
             assert finished(client, retry)["status"] == "partial"
         finally:
             release.set()
+
+
+def test_catalog_preview_assets_and_incremental_load_endpoint(tmp_path):
+    from pathlib import Path
+    import shutil
+    from app.archive import Observation
+    from app.pipeline import Pipeline
+
+    release = threading.Event()
+    query = Query(ra_deg=133.795129, dec_deg=-7.245147)
+    source = "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/test.fits"
+    observations = [
+        Observation(f"record-{i}", source, 60800.7 + i, "D6", "DR1") for i in range(3)
+    ]
+
+    class Recorded:
+        def search(self, *_):
+            return observations, []
+
+        def fetch(self, obs, query, path, deadline):
+            if obs.identity == "record-1":
+                release.wait(4)
+            shutil.copyfile(Path(__file__).parent / "fixtures" / "wise-d6.fits", path)
+            return source
+
+    config = settings(tmp_path, batch_size=2)
+    with TestClient(create_app(config, Pipeline(config, Recorded()))) as client:
+        try:
+            job = client.post("/api/jobs", json=query.model_dump(mode="json")).json()[
+                "job_id"
+            ]
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                data = client.get(f"/api/jobs/{job}").json()
+                if data.get("manifest", {}).get("frames"):
+                    break
+                time.sleep(0.01)
+            assert data["status"] == "running"
+            assert len(data["manifest"]["observations"]) == 3
+            assert client.get(data["manifest"]["frames"][0]["url"]).status_code == 200
+            release.set()
+            assert len(finished(client, job)["manifest"]["frames"]) == 2
+            assert (
+                client.post(
+                    f"/api/jobs/{job}/load", json={"observation_ids": ["unknown"]}
+                ).status_code
+                == 422
+            )
+            assert (
+                client.post(
+                    f"/api/jobs/{job}/load", json={"detector": "D6"}
+                ).status_code
+                == 202
+            )
+            result = finished(client, job)["manifest"]
+            assert len(result["frames"]) == 3 and all(
+                o["status"] == "ready" for o in result["observations"]
+            )
+        finally:
+            release.set()

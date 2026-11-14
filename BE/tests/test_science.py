@@ -132,7 +132,7 @@ def test_full_pipeline_with_recorded_fits_and_a_failed_exposure(tmp_path):
             return [bad, OBS], []
 
         def fetch(self, obs, query, path, deadline):
-            if obs is bad:
+            if obs.identity == bad.identity:
                 path.write_bytes(b"not a FITS file")
             else:
                 shutil.copyfile(FIXTURE, path)
@@ -148,7 +148,7 @@ def test_full_pipeline_with_recorded_fits_and_a_failed_exposure(tmp_path):
     assert Image.open(tmp_path / result.frames[0].id).size == (49, 49)
     assert (
         json.loads((tmp_path / "manifest.json").read_text())["frames"][0]["id"]
-        == "frame-00.png"
+        == "frame-0000.png"
     )
     assert not list(tmp_path.glob("raw-*.fits"))
     assert stages[-2:] == ["align", "render"]
@@ -187,3 +187,49 @@ def test_cutouts_download_concurrently_with_progress(tmp_path):
     assert len(result.frames) == 2
     assert "fetch:2/2" in stages
     assert not list(tmp_path.glob("raw-*.fits"))
+
+
+def test_distinct_wavelength_groups_are_preserved_and_later_batches_extend_them(
+    tmp_path, monkeypatch
+):
+    import shutil
+    import app.pipeline as pipeline_module
+    from app.config import Settings
+    from app.pipeline import Pipeline
+
+    observations = [
+        replace(OBS, identity=f"obs-{i}", mjd=OBS.mjd + i) for i in range(6)
+    ]
+
+    class Recorded:
+        def search(self, *_):
+            return observations, []
+
+        def fetch(self, obs, query, path, deadline):
+            shutil.copyfile(FIXTURE, path)
+            return SOURCE
+
+    original_decode = pipeline_module.decode
+
+    def spectral_fixture(path, obs, query, source):
+        c = original_decode(path, obs, query, source)
+        wavelength = 1.0 if int(obs.identity[-1]) % 2 == 0 else 2.0
+        return replace(
+            c, wavelengths=np.full(5, wavelength), bandwidths=np.full(5, 0.1)
+        )
+
+    monkeypatch.setattr(pipeline_module, "decode", spectral_fixture)
+    pipeline = Pipeline(Settings(batch_size=4), Recorded())
+    result = pipeline.run(QUERY, tmp_path, "groups", lambda _: None)
+    assert len(result.observations) == 6 and len(result.frames) == 4
+    assert len(result.sequences) == 2
+    locked = {g.id: dict(g.stretch) for g in result.sequences}
+    old_frames = {f.id for f in result.frames}
+    result = pipeline.load(
+        result, ["obs-4", "obs-5"], tmp_path, "groups", lambda _: None
+    )
+    assert len(result.frames) == 6 and len(result.sequences) == 2
+    assert old_frames.issubset({f.id for f in result.frames})
+    assert all(g.stretch == locked[g.id] for g in result.sequences)
+    assert all(len(g.frame_ids) == 3 for g in result.sequences)
+    assert all(o.status == "ready" for o in result.observations)

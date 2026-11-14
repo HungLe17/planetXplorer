@@ -146,14 +146,20 @@ class Archive:
                         if time.monotonic() >= deadline:
                             raise ArchiveError("IRSA SIA metadata search timed out")
                         total += len(chunk)
-                        if total > 2_000_000:
+                        if total > 32_000_000:
                             raise ArchiveError(
                                 "IRSA SIA metadata exceeded the response limit"
                             )
                         chunks.append(chunk)
                 payload = b"".join(chunks)
                 root = ET.fromstring(payload)
+                overflow = False
                 for info in root.iter():
+                    if (
+                        info.attrib.get("name") == "QUERY_STATUS"
+                        and info.attrib.get("value") == "OVERFLOW"
+                    ):
+                        overflow = True
                     if (
                         info.tag.rsplit("}", 1)[-1] == "INFO"
                         and info.attrib.get("name") == "QUERY_STATUS"
@@ -168,7 +174,7 @@ class Archive:
                 result = []
                 for row in table:
                     uri = str(row["access_url"])
-                    detector = re.search(r"level2_.+?(D[26])_spx", uri)
+                    detector = re.search(r"level2_.+?(D[1-6])_spx", uri)
                     if not detector:
                         continue
                     mjd = float(row["t_min"])
@@ -183,7 +189,9 @@ class Archive:
                             "energy_bandpassname": "SPHEREx-" + detector[1],
                         }
                     )
-                return result
+                return result, overflow or len(
+                    table
+                ) >= self.settings.metadata_limit + 1
             except (
                 httpx.HTTPError,
                 ValueError,
@@ -194,13 +202,16 @@ class Archive:
                 raise ArchiveError("IRSA SIA metadata service is unavailable") from exc
 
         names = ("spherex_dr1", "spherex_qr3", "spherex_dr1_deep", "spherex_qr3_deep")
-        rows, failures = [], []
+        rows, failures, truncated = [], [], []
         # Do not mistake an unavailable collection for zero sky coverage.
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {pool.submit(collection, name): name for name in names}
             for future in as_completed(futures):
                 try:
-                    rows.extend(future.result())
+                    found, overflow = future.result()
+                    rows.extend(found)
+                    if overflow:
+                        truncated.append(futures[future])
                 except ArchiveError:
                     failures.append(futures[future])
         if failures and not rows:
@@ -209,9 +220,12 @@ class Archive:
             )
         rows.sort(key=lambda row: float(row["time_bounds_lower"]))
         selected, notes = self._select_rows(rows)
-        notes.append(
-            f"SIA queries are capped at {self.settings.metadata_limit + 1} records per collection; narrow the date range for additional observations."
-        )
+        if truncated:
+            notes.append(
+                "Truncated metadata: "
+                + ", ".join(sorted(truncated))
+                + f" reached the {self.settings.metadata_limit + 1}-record service limit. Narrow the date range for remaining records."
+            )
         if failures:
             notes.append(
                 "Partial metadata: SIA collections unavailable: "
@@ -224,7 +238,7 @@ class Archive:
     ) -> tuple[list[Observation], list[str]]:
         filters = [
             f"1=CONTAINS(POINT('ICRS',{query.ra_deg:.10f},{query.dec_deg:.10f}),p.poly)",
-            "p.energy_bandpassname IN ('SPHEREx-D2','SPHEREx-D6')",
+            "p.energy_bandpassname IN ('SPHEREx-D1','SPHEREx-D2','SPHEREx-D3','SPHEREx-D4','SPHEREx-D5','SPHEREx-D6')",
         ]
         if query.start_utc:
             filters.append(f"p.time_bounds_lower >= {Time(query.start_utc).mjd:.10f}")
@@ -261,7 +275,7 @@ class Archive:
                                 "IRSA metadata search timed out. Try again later or narrow the date range."
                             )
                         total += len(chunk)
-                        if total > 2_000_000:
+                        if total > 32_000_000:
                             raise ArchiveError(
                                 "Archive metadata exceeded the response limit"
                             )
@@ -277,16 +291,17 @@ class Archive:
             reader.fieldnames or []
         ):
             raise ArchiveError("IRSA returned an unexpected metadata format")
-        return self._select_rows(list(reader))
+        selected, notes = self._select_rows(list(reader))
+        if len(selected) >= self.settings.metadata_limit:
+            notes.append(
+                "TAP results may be truncated; narrow the date range to retrieve additional observations."
+            )
+        return selected, notes
 
     def _select_rows(self, rows):
         notes = []
-        if len(rows) > self.settings.metadata_limit:
-            notes.append(
-                f"Metadata limited to the earliest {self.settings.metadata_limit} matching exposures; narrow the date range to inspect later observations."
-            )
         unique = {}
-        for row in rows[: self.settings.metadata_limit]:
+        for row in rows:
             uri = checked_url(urljoin("https://irsa.ipac.caltech.edu/", row["uri"]))
             match = re.search(r"/spherex/(dr1|qr3|qr2)/", uri)
             if not match or match[1] == "qr2":
@@ -309,25 +324,18 @@ class Archive:
                 previous.uri,
             ):
                 unique[obs.identity] = obs
-        # Reserve candidates for both detector ranges and cover the full returned time span.
-        selected = []
-        for detector in ("D2", "D6"):
-            group = sorted(
-                (o for o in unique.values() if o.detector == detector),
-                key=lambda o: o.mjd,
-            )
-            selected.extend(evenly_spaced(group, self.settings.max_candidates // 2))
-        if len(unique) > len(selected):
-            notes.append(
-                f"Inspecting {len(selected)} exposures sampled across available dates and detectors D2/D6."
-            )
-        return sorted(selected, key=lambda o: o.mjd), notes
+        return sorted(unique.values(), key=lambda o: (o.mjd, o.identity)), notes
 
     def fetch(self, obs: Observation, query: Query, path: Path, deadline: float):
         url = (
             checked_url(obs.uri)
             + "?"
-            + urlencode({"center": f"{query.ra_deg},{query.dec_deg}d", "size": 5 / 60})
+            + urlencode(
+                {
+                    "center": f"{query.ra_deg},{query.dec_deg}d",
+                    "size": query.fov_arcsec / 3600,
+                }
+            )
         )
         for attempt in range(2):
             try:

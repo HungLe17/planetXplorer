@@ -3,6 +3,7 @@ export type Query = {
   dec_deg: number;
   start_utc?: string;
   end_utc?: string;
+  fov_arcsec?: number;
 };
 export type Frame = {
   id: string;
@@ -14,13 +15,35 @@ export type Frame = {
   bandwidth_um?: number;
   release?: string;
   source_url?: string;
+  sequence_id?: string;
   warnings?: string[];
+};
+export type Observation = {
+  id: string;
+  source_url: string;
+  observed_at: string;
+  detector: string;
+  release: string;
+  status: "pending" | "loading" | "ready" | "failed";
+  reason?: string;
+  frame_id?: string;
+};
+export type Sequence = {
+  id: string;
+  detector: string;
+  wavelength_um: number;
+  processing_version: string;
+  frame_ids: string[];
+  stretch: { vmin?: number; vmax?: number; units?: string };
 };
 export type Manifest = {
   frames: Frame[];
+  observations?: Observation[];
+  sequences?: Sequence[];
   warnings?: string[];
   retrieved_at?: string;
   cached?: boolean;
+  discovery_complete?: boolean;
   processing?: { stretch?: { vmin?: number; vmax?: number; units?: string } };
   grid?: string;
   stretch?: string;

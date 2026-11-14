@@ -17,23 +17,17 @@ class Settings:
     cutout_workers: int = 4
     max_download_bytes: int = 64 * 1024 * 1024
     max_cache_bytes: int = 1024 * 1024 * 1024
-    max_candidates: int = 24
-    max_frames: int = 12
-    metadata_limit: int = 100
+    max_frames: int = 512
+    batch_size: int = 8
+    metadata_limit: int = 2000
     spectral_tolerance: float = (
         0.5  # maximum separation as a fraction of narrower bandwidth
     )
     origins: tuple[str, ...] = ("http://127.0.0.1:3000", "http://localhost:3000")
 
     def __post_init__(self):
-        if not (
-            1 <= self.max_frames <= 12
-            and 2 <= self.max_candidates <= 48
-            and self.max_candidates % 2 == 0
-        ):
-            raise ValueError(
-                "Frame limit must be 1–12; candidate count must be even and 2–48"
-            )
+        if not (1 <= self.max_frames <= 512 and 1 <= self.batch_size <= 8):
+            raise ValueError("Frame memory limit must be 1-512; batch size must be 1-8")
         if (
             min(
                 self.max_jobs,

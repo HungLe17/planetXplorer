@@ -25,10 +25,16 @@ export async function request<T>(
           : `Backend endpoint not found: ${path}. Check NEXT_PUBLIC_API_BASE_URL and redeploy the frontend.`,
       );
     }
+    if (response.status === 429) {
+      const error = await response.json().catch(() => null);
+      throw new Error(
+        typeof error?.detail === "string"
+          ? error.detail
+          : "The processing queue is full. Please try again shortly.",
+      );
+    }
     throw new Error(
-      response.status === 429
-        ? "The processing queue is full. Please try again shortly."
-        : `The archive service returned an error (${response.status}). Try again shortly.`,
+      `The archive service returned an error (${response.status}). Try again shortly.`,
     );
   }
   return response.json();
@@ -40,7 +46,7 @@ export function assetUrl(path: string) {
   return url.href;
 }
 export function validateManifest(input: Manifest): Manifest {
-  if (!input || !Array.isArray(input.frames) || input.frames.length > 12)
+  if (!input || !Array.isArray(input.frames) || input.frames.length > 512)
     throw new Error("The service returned an invalid observation sequence.");
   const frames = input.frames.map((f: Frame) => {
     if (
@@ -76,3 +82,17 @@ export const cancelJob = (id: string) =>
     AbortSignal.timeout(10000),
     {},
   );
+
+export const loadObservations = async (
+  id: string,
+  signal: AbortSignal,
+  observation_ids: string[] = [],
+  detector?: string,
+) => {
+  const data = await request<{ job_id: string }>(
+    "/api/jobs/" + encodeURIComponent(id) + "/load",
+    signal,
+    { observation_ids, ...(detector ? { detector } : {}) },
+  );
+  return data.job_id;
+};

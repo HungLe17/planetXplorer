@@ -151,7 +151,9 @@ class Jobs:
                     or manifest.processing.get("version") != PIPELINE_VERSION
                 ):
                     continue
-                allowed = {f"frame-{i:02}.png" for i in range(12)}
+                allowed = {
+                    f"frame-{i:04}.png" for i in range(self.settings.max_frames)
+                } | {f"frame-{i:02}.png" for i in range(12)}
                 if any(
                     f.id not in allowed or not (folder / f.id).is_file()
                     for f in manifest.frames
@@ -194,18 +196,85 @@ class Jobs:
                 self.cache = {k: v for k, v in self.cache.items() if v != job_id}
             return job.model_copy(deep=True) if job else None
 
-    def _run(self, job_id: str, query: Query, directory: Path, key: str):
-        def report(stage):
-            with self.lock:
-                if self.cancel_events[job_id].is_set():
-                    raise JobCancelled("Search cancelled")
-                self.records[job_id].stage = stage
-            logger.info("job=%s stage=%s", job_id, stage)
+    def load_more(self, job_id: str, ids: list[str], detector: str | None) -> str:
+        with self.lock:
+            self.cleanup()
+            job = self.records.get(job_id)
+            if job is None or job.manifest is None:
+                raise KeyError("Unknown or expired field; search again")
+            if job.status in ("running", "queued", "cancelling"):
+                raise CapacityError("Wait for the current batch or cancel it first")
+            if self.active_count() >= self.settings.max_jobs:
+                raise CapacityError("The processing queue is full")
+            records = {o.id: o for o in job.manifest.observations}
+            if ids and any(i not in records for i in ids):
+                raise ValueError("Observation is not part of this field")
+            pending = ids or [
+                o.id
+                for o in records.values()
+                if o.status == "pending" and (not detector or o.detector == detector)
+            ]
+            pending = [
+                i for i in dict.fromkeys(pending) if records[i].status != "ready"
+            ][: self.settings.batch_size]
+            if not pending:
+                raise ValueError("No unloaded observations match this selection")
+            if len(job.manifest.frames) + len(pending) > self.settings.max_frames:
+                raise CapacityError(
+                    "This field has reached the loaded-image memory limit; narrow the date range"
+                )
+            job.status = "queued"
+            job.stage = "queued"
+            job.error = None
+            self.cancel_events[job_id] = threading.Event()
+            key = hashlib.sha256(
+                job.manifest.query.model_dump_json().encode()
+            ).hexdigest()
+            self.cache[key] = job_id
+            self.futures[job_id] = self.executor.submit(
+                self._run, job_id, job.manifest.query, self.root / job_id, key, pending
+            )
+            return job_id
 
+    def _run(
+        self,
+        job_id: str,
+        query: Query,
+        directory: Path,
+        key: str,
+        ids: list[str] | None = None,
+    ):
+        manager = self
+
+        class Reporter:
+            def __call__(self, stage):
+                with manager.lock:
+                    if manager.cancel_events[job_id].is_set():
+                        raise JobCancelled("Search cancelled")
+                    manager.records[job_id].stage = stage
+                logger.info("job=%s stage=%s", job_id, stage)
+
+            def publish(self, manifest):
+                with manager.lock:
+                    if manager.cancel_events[job_id].is_set():
+                        raise JobCancelled("Search cancelled")
+                    manager.records[job_id].manifest = manifest.model_copy(deep=True)
+
+        report = Reporter()
         with self.lock:
             self.records[job_id].status = "running"
         try:
-            result = self.pipeline.run(query, directory, job_id, report)
+            result = (
+                self.pipeline.load(
+                    self.records[job_id].manifest.model_copy(deep=True),
+                    ids,
+                    directory,
+                    job_id,
+                    report,
+                )
+                if ids is not None
+                else self.pipeline.run(query, directory, job_id, report)
+            )
             with self.lock:
                 if self.cancel_events[job_id].is_set():
                     raise JobCancelled("Search cancelled")
@@ -218,6 +287,10 @@ class Jobs:
             with self.lock:
                 self.records[job_id].status = "cancelled"
                 self.records[job_id].stage = "cancelled"
+                if self.records[job_id].manifest:
+                    for record in self.records[job_id].manifest.observations:
+                        if record.status == "loading":
+                            record.status = "pending"
         except Exception as exc:
             logger.exception("Job %s failed", job_id)
             with self.lock:
@@ -229,6 +302,13 @@ class Jobs:
                 )
         finally:
             with self.lock:
+                if (
+                    self.records[job_id].status in ("failed", "cancelled")
+                    and self.records[job_id].manifest
+                ):
+                    for record in self.records[job_id].manifest.observations:
+                        if record.status == "loading":
+                            record.status = "pending"
                 if (
                     self.records[job_id].status in ("failed", "cancelled")
                     and self.cache.get(key) == job_id
@@ -247,7 +327,7 @@ class Jobs:
     def asset(self, job_id: str, asset_id: str) -> Path | None:
         with self.lock:
             job = self.records.get(job_id)
-            if not job or job.status not in ("complete", "partial") or not job.manifest:
+            if not job or not job.manifest:
                 return None
             allowed = {f.id for f in job.manifest.frames} | {"manifest.json"}
             if asset_id not in allowed:

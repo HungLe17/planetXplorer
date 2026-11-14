@@ -18,11 +18,11 @@ from astropy.wcs import WCS
 from PIL import Image
 from reproject import reproject_interp
 
-from .archive import Archive, ArchiveError, Observation, evenly_spaced
+from .archive import Archive, ArchiveError, Observation
 from .config import Settings
-from .schemas import Frame, Manifest, Query
+from .schemas import Frame, Manifest, Query, ObservationRecord, Sequence
 
-PIPELINE_VERSION = "1.0.0"
+PIPELINE_VERSION = "2.0.0"
 # SOURCE (21) identifies known objects, not defective pixels. Mask all other bits.
 # Official IRSA flag semantics: https://irsa.ipac.caltech.edu/onlinehelp/spherex/spherex/sp.html
 SOURCE_BIT = 1 << 21
@@ -85,13 +85,16 @@ def decode(path: Path, obs: Observation, query: Query, source: str) -> Cutout:
         # A wavelength match at the center alone is not sufficient for field blinking.
         positions = [coord] + [
             coord.spherical_offsets_by(x * u.arcmin, y * u.arcmin)
-            for x, y in [(-1.5, -1.5), (-1.5, 1.5), (1.5, -1.5), (1.5, 1.5)]
+            for x, y in [
+                (-query.fov_arcsec / 200, -query.fov_arcsec / 200),
+                (-query.fov_arcsec / 200, query.fov_arcsec / 200),
+                (query.fov_arcsec / 200, -query.fov_arcsec / 200),
+                (query.fov_arcsec / 200, query.fov_arcsec / 200),
+            ]
         ]
         pixels = [wcs.world_to_pixel(c) for c in positions]
-        if any(not (0 <= x < shape[1] and 0 <= y < shape[0]) for x, y in pixels):
-            raise ValueError(
-                "Exposure does not cover the target and interior field samples"
-            )
+        if not (0 <= pixels[0][0] < shape[1] and 0 <= pixels[0][1] < shape[0]):
+            raise ValueError("Exposure does not cover the target")
         spectral_header = image.header.copy()
         # SIP describes celestial distortion, not the alternate spectral table WCS.
         import re
@@ -103,14 +106,18 @@ def decode(path: Path, obs: Observation, query: Query, source: str) -> Cutout:
         spectral.sip = None
         waves, bands = [], []
         for x, y in pixels:
+            if not (0 <= x < shape[1] and 0 <= y < shape[0]):
+                waves.append(float("nan"))
+                bands.append(float("nan"))
+                continue
             wave, band = spectral.pixel_to_world(x, y)
             waves.append(float(wave.to_value(u.um)))
             bands.append(float(band.to_value(u.um)))
         waves, bands = np.array(waves), np.array(bands)
         if (
-            not np.all(np.isfinite(waves))
-            or not np.all(np.isfinite(bands))
-            or np.any(bands <= 0)
+            not np.isfinite(waves[0])
+            or not np.isfinite(bands[0])
+            or np.any(bands[np.isfinite(bands)] <= 0)
         ):
             raise ValueError("Cutout spectral WCS is invalid")
         return Cutout(
@@ -168,7 +175,7 @@ def choose_group(cutouts: list[Cutout], tolerance: float) -> list[Cutout]:
 
 def target_grid(query: Query) -> tuple[WCS, tuple[int, int]]:
     scale = 6.14 / 3600
-    n = math.ceil((5 / 60) / scale)
+    n = math.ceil((query.fov_arcsec / 3600) / scale)
     w = WCS(naxis=2)
     w.wcs.crpix = [(n + 1) / 2, (n + 1) / 2]
     w.wcs.crval = [query.ra_deg, query.dec_deg]
@@ -196,11 +203,17 @@ def align(cutout: Cutout, grid: WCS, shape: tuple[int, int]) -> np.ndarray:
     return image
 
 
-def render_pngs(arrays: list[np.ndarray], paths: list[Path]) -> dict:
+def render_pngs(
+    arrays: list[np.ndarray], paths: list[Path], bounds: dict | None = None
+) -> dict:
     samples = np.concatenate([a[np.isfinite(a)] for a in arrays])
     if samples.size < 16:
         raise ValueError("No valid aligned pixels to display")
-    low, high = np.percentile(samples, [1, 99.5])
+    low, high = (
+        (bounds["vmin"], bounds["vmax"])
+        if bounds
+        else np.percentile(samples, [1, 99.5])
+    )
     if high <= low:
         high = low + max(abs(low) * 1e-6, 1e-6)
     for array, path in zip(arrays, paths):
@@ -227,138 +240,215 @@ class Pipeline:
     def run(
         self, query: Query, directory: Path, job_id: str, report: Callable[[str], None]
     ) -> Manifest:
-        deadline = time.monotonic() + self.settings.job_seconds
         report("query")
-        observations, notes = self.archive.search(query, deadline)
-        omissions, cutouts = [], []
-        download_deadline = deadline - min(10, self.settings.job_seconds / 4)
-
-        def retrieve(i, obs):
-            path = directory / f"raw-{i}.fits"
-            try:
-                # report checks cancellation before a queued download starts.
-                report("fetch")
-                if time.monotonic() >= download_deadline:
-                    raise ArchiveError("Search time limit reached")
-                source = self.archive.fetch(obs, query, path, download_deadline)
-                return decode(path, obs, query, source)
-            finally:
-                path.unlink(missing_ok=True)
-
-        # IRSA's cutout tutorial supports bounded parallel retrieval. Each file,
-        # FITS object and WCS belongs to one worker; compatibility is checked below.
-        pool = ThreadPoolExecutor(max_workers=self.settings.cutout_workers)
-        futures = {
-            pool.submit(retrieve, i, obs): obs for i, obs in enumerate(observations)
-        }
-        try:
-            for completed, future in enumerate(as_completed(futures), 1):
-                obs = futures[future]
-                report(f"fetch:{completed}/{len(observations)}")
-                try:
-                    cutouts.append(future.result())
-                except (ArchiveError, ValueError, KeyError, OSError) as exc:
-                    omissions.append(
-                        {"observation_id": obs.identity, "reason": str(exc)[:200]}
-                    )
-        finally:
-            pool.shutdown(wait=True, cancel_futures=True)
-        cutouts.sort(key=lambda c: (c.observation.mjd, c.observation.identity))
-        if observations and not cutouts:
-            raise ArchiveError(
-                "No usable cutouts could be decoded. "
-                + (omissions[0]["reason"] if omissions else "")
-            )
-        group = evenly_spaced(
-            choose_group(cutouts, self.settings.spectral_tolerance),
-            self.settings.max_frames,
+        observations, notes = self.archive.search(
+            query, time.monotonic() + self.settings.metadata_seconds
         )
-        selected = {id(c) for c in group}
-        for c in cutouts:
-            if id(c) not in selected:
-                omissions.append(
-                    {
-                        "observation_id": c.observation.identity,
-                        "reason": "Outside selected spectral group or frame limit",
-                    }
+        result = Manifest(
+            query=query,
+            retrieved_at=datetime.now(UTC).isoformat(),
+            warnings=notes,
+            discovery_complete=not any(
+                n.startswith(
+                    ("Partial metadata:", "Truncated metadata:", "TAP results may")
                 )
-        grid, shape = target_grid(query)
-        arrays, accepted = [], []
-        report("align")
-        for c in group:
-            if time.monotonic() > deadline:
-                omissions.append(
-                    {
-                        "observation_id": c.observation.identity,
-                        "reason": "Job deadline reached",
-                    }
-                )
-                continue
-            array = align(c, grid, shape)
-            if np.count_nonzero(np.isfinite(array)) < 16:
-                omissions.append(
-                    {
-                        "observation_id": c.observation.identity,
-                        "reason": "Insufficient valid common-grid coverage",
-                    }
-                )
-            else:
-                arrays.append(array)
-                accepted.append(c)
-        report("render")
-        paths = [directory / f"frame-{i:02}.png" for i in range(len(arrays))]
-        stretch = render_pngs(arrays, paths) if arrays else {}
-        frames = []
-        for i, (c, array) in enumerate(zip(accepted, arrays)):
-            frames.append(
-                Frame(
-                    id=f"frame-{i:02}.png",
-                    url=f"/api/assets/{job_id}/frame-{i:02}.png",
-                    observation_id=c.observation.identity,
-                    observed_at=Time(c.observation.mjd, format="mjd", scale="utc")
+                for n in notes
+            ),
+            observations=[
+                ObservationRecord(
+                    id=o.identity,
+                    source_url=o.uri,
+                    observed_at=Time(o.mjd, format="mjd", scale="utc")
                     .to_datetime(timezone=UTC)
                     .isoformat(),
-                    detector=c.observation.detector,
-                    wavelength_um=float(c.wavelengths[0]),
-                    bandwidth_um=float(c.bandwidths[0]),
-                    release=c.observation.release,
-                    source_url=c.source,
-                    processing_version=c.version,
-                    mask_fraction=float(np.mean(~np.isfinite(array))),
-                    warnings=[
-                        "Display preview; no PSF/background matching or photometric inference."
-                    ],
+                    detector=o.detector,
+                    release=o.release,
                 )
-            )
-        if omissions:
-            notes.append(
-                f"{len(omissions)} candidate exposure(s) omitted; see the manifest for reasons."
-            )
-        if len(frames) < 2:
-            notes.append(
-                "Fewer than two compatible frames; motion playback is unavailable."
-            )
-        notes += [
-            "Detector D2/D6 candidate search; not all 102 spectral channels.",
-            "Spectral response matched at the target and four points in the central 3 arcminutes within half the narrower bandwidth; exploratory comparison, not a full-field spectral equivalence guarantee.",
-            "All archive flags except SOURCE (bit 21) are masked; invalid pixels remain transparent.",
-        ]
-        result = Manifest(
-            frames=frames,
-            warnings=notes,
-            retrieved_at=datetime.now(UTC).isoformat(),
-            query=query,
-            omissions=omissions,
+                for o in observations
+            ],
             processing={
                 "version": PIPELINE_VERSION,
-                "spectral_tolerance": self.settings.spectral_tolerance,
+                "revision": 0,
+                "batch_size": self.settings.batch_size,
                 "flag_policy": "mask all FLAGS except SOURCE (bit 21)",
                 "zodi_subtracted": False,
-                "grid_header": dict(grid.to_header()),
-                "stretch": stretch,
-                "output_shape": list(shape),
                 "psf_matched": False,
             },
         )
-        atomic_json(directory / "manifest.json", result.model_dump(mode="json"))
+        # Start one detector in chronological order; every other record remains loadable.
+        counts = {
+            d: sum(o.detector == d for o in observations)
+            for d in ("D1", "D2", "D3", "D4", "D5", "D6")
+        }
+        detector = max(counts, key=counts.get)
+        ids = [o.identity for o in observations if o.detector == detector][
+            : self.settings.batch_size
+        ]
+        return self.load(result, ids, directory, job_id, report)
+
+    def load(
+        self,
+        result: Manifest,
+        ids: list[str],
+        directory: Path,
+        job_id: str,
+        report: Callable[[str], None],
+    ) -> Manifest:
+        deadline = time.monotonic() + self.settings.job_seconds
+        result.cached = False
+        records = {o.id: o for o in result.observations}
+        batch = [records[i] for i in ids]
+        grid, shape = target_grid(result.query)
+        result.grid = f"ICRS TAN; north up, east left; 6.14 arcsec/pixel; {result.query.fov_arcsec:g} arcsec field"
+        for o in batch:
+            o.status = "loading"
+            o.reason = None
+        result.omissions = [
+            o for o in result.omissions if o["observation_id"] not in ids
+        ]
+
+        def publish():
+            result.frames.sort(key=lambda f: (f.observed_at, f.observation_id))
+            result.processing["revision"] += 1
+            result.processing["counts"] = {
+                state: sum(o.status == state for o in result.observations)
+                for state in ("pending", "loading", "ready", "failed")
+            }
+            atomic_json(directory / "manifest.json", result.model_dump(mode="json"))
+            callback = getattr(report, "publish", None)
+            if callback:
+                callback(result)
+
+        publish()
+
+        def retrieve(i, record):
+            report("fetch")
+            path = directory / f"raw-{i}.fits"
+            try:
+                if time.monotonic() >= deadline - 10:
+                    raise ArchiveError(
+                        "Batch time limit reached; retry this observation"
+                    )
+                obs = Observation(
+                    record.id,
+                    record.source_url,
+                    float(Time(datetime.fromisoformat(record.observed_at)).mjd),
+                    record.detector,
+                    record.release,
+                )
+                source = self.archive.fetch(obs, result.query, path, deadline - 10)
+                return decode(path, obs, result.query, source)
+            finally:
+                path.unlink(missing_ok=True)
+
+        pool = ThreadPoolExecutor(max_workers=self.settings.cutout_workers)
+        futures = {pool.submit(retrieve, i, o): o for i, o in enumerate(batch)}
+        try:
+            for completed, future in enumerate(as_completed(futures), 1):
+                record = futures[future]
+                report(f"fetch:{completed}/{len(batch)}")
+                try:
+                    c = future.result()
+                    report("align")
+                    array = align(c, grid, shape)
+                    if np.count_nonzero(np.isfinite(array)) < 16:
+                        raise ValueError(
+                            "Insufficient valid pixels on the display grid"
+                        )
+
+                    def matches(frame):
+                        if (
+                            frame.detector != c.observation.detector
+                            or frame.processing_version != c.version
+                            or c.version == "unknown"
+                        ):
+                            return False
+                        if len(frame.match_wavelengths) != 5 or any(
+                            v is None
+                            for v in frame.match_wavelengths + frame.match_bandwidths
+                        ):
+                            return False
+                        return bool(
+                            np.all(
+                                np.abs(
+                                    np.array(frame.match_wavelengths) - c.wavelengths
+                                )
+                                <= self.settings.spectral_tolerance
+                                * np.minimum(
+                                    np.array(frame.match_bandwidths), c.bandwidths
+                                )
+                            )
+                        )
+
+                    sequence = next(
+                        (
+                            g
+                            for g in result.sequences
+                            if g.detector == c.observation.detector
+                            and g.processing_version == c.version
+                            and all(
+                                matches(f)
+                                for f in result.frames
+                                if f.sequence_id == g.id
+                            )
+                        ),
+                        None,
+                    )
+                    if sequence is None:
+                        sequence = Sequence(
+                            id=f"sequence-{len(result.sequences):04}",
+                            detector=c.observation.detector,
+                            wavelength_um=float(c.wavelengths[0]),
+                            processing_version=c.version,
+                        )
+                        result.sequences.append(sequence)
+                    frame_id = f"frame-{len(result.frames):04}.png"
+                    report("render")
+                    sequence.stretch = render_pngs(
+                        [array], [directory / frame_id], sequence.stretch or None
+                    )
+                    sequence.frame_ids.append(frame_id)
+                    partial = not np.all(np.isfinite(c.wavelengths))
+                    result.frames.append(
+                        Frame(
+                            id=frame_id,
+                            url=f"/api/assets/{job_id}/{frame_id}",
+                            observation_id=record.id,
+                            observed_at=record.observed_at,
+                            detector=record.detector,
+                            release=record.release,
+                            wavelength_um=float(c.wavelengths[0]),
+                            bandwidth_um=float(c.bandwidths[0]),
+                            source_url=c.source,
+                            processing_version=c.version,
+                            mask_fraction=float(np.mean(~np.isfinite(array))),
+                            sequence_id=sequence.id,
+                            match_wavelengths=[
+                                float(x) if np.isfinite(x) else None
+                                for x in c.wavelengths
+                            ],
+                            match_bandwidths=[
+                                float(x) if np.isfinite(x) else None
+                                for x in c.bandwidths
+                            ],
+                            warnings=["Partial field; inspect individually."]
+                            if partial
+                            else [],
+                        )
+                    )
+                    record.status = "ready"
+                    record.frame_id = frame_id
+                    result.processing["stretch"] = sequence.stretch
+                except (ArchiveError, ValueError, KeyError, OSError) as exc:
+                    record.status = "failed"
+                    record.reason = str(exc)[:200]
+                    result.omissions.append(
+                        {"observation_id": record.id, "reason": record.reason}
+                    )
+                publish()
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+        report("align")
+        report("render")
+        publish()
         return result

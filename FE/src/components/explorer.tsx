@@ -1,5 +1,13 @@
 "use client";
-import { useState, useEffect, useRef, useCallback, FormEvent } from "react";
+import {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  useMemo,
+  useLayoutEffect,
+  FormEvent,
+} from "react";
 import {
   ArrowUpRight,
   Check,
@@ -20,6 +28,11 @@ import {
   Crosshair,
   Layers,
   ChevronDown,
+  Repeat,
+  Download,
+  Maximize2,
+  Minimize2,
+  SlidersHorizontal,
 } from "lucide-react";
 import SkyViewer from "./sky-viewer";
 import { presets, Frame, Manifest, Query, Preset } from "@/lib/types";
@@ -30,6 +43,7 @@ import {
   validateManifest,
   assetUrl,
   cancelJob,
+  loadObservations,
 } from "@/lib/api";
 import { parseQuery, queryUrl } from "@/lib/view-url";
 const empty: Frame[] = [];
@@ -62,7 +76,7 @@ export default function Explorer() {
     [start, setStart] = useState(""),
     [end, setEnd] = useState("");
   const [manifest, setManifest] = useState<Manifest | null>(null),
-    [index, setIndex] = useState(0),
+    [focusedFrame, setFocusedFrame] = useState<string | null>(null),
     [playing, setPlaying] = useState(false),
     [speed, setSpeed] = useState(1),
     [ready, setReady] = useState(false),
@@ -72,7 +86,17 @@ export default function Explorer() {
     [notice, setNotice] = useState(""),
     [copied, setCopied] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(true);
   const [datesOpen, setDatesOpen] = useState(false);
+  const [fov, setFov] = useState("300");
+  const [fieldJobId, setFieldJobId] = useState("");
+  const [sequenceId, setSequenceId] = useState("");
+  const [viewMode, setViewMode] = useState<"browse" | "matched">("browse");
+  const [loop, setLoop] = useState(true);
+  const [statusFilter, setStatusFilter] = useState("");
+  const [recordSearch, setRecordSearch] = useState("");
+  const [dockExpanded, setDockExpanded] = useState(false);
+  const [detectorFilter, setDetectorFilter] = useState("");
   const [tab, setTab] = useState("Settings");
   const [zoom, setZoom] = useState(1);
   const [invert, setInvert] = useState(false);
@@ -82,104 +106,303 @@ export default function Explorer() {
     generation = useRef(0),
     activeJob = useRef<string | null>(null);
   const [displayedQuery, setDisplayedQuery] = useState<Query | null>(null);
-  const frames = manifest?.frames || empty,
-    frame = frames[index];
-  const canPlay = ready && frames.length > 1 && !busy;
-  const load = useCallback(async (query: Query) => {
-    controller.current?.abort();
-    const abort = new AbortController();
-    controller.current = abort;
-    const current = ++generation.current;
-    setBusy(true);
-    setError("");
-    setNotice("");
+  const allFrames = manifest?.frames || empty;
+  const sequences = manifest?.sequences || [];
+  const sequence =
+    sequences.find((s) => s.id === sequenceId) ||
+    [...sequences].sort((a, b) => b.frame_ids.length - a.frame_ids.length)[0];
+  const frames = useMemo(
+    () =>
+      viewMode === "matched" && sequence
+        ? allFrames.filter((f) => f.sequence_id === sequence.id)
+        : allFrames,
+    [allFrames, viewMode, sequence?.id],
+  );
+  const index = Math.max(
+    0,
+    frames.findIndex((f) => f.url === focusedFrame),
+  );
+  const frame = frames[index];
+  const framesRef = useRef(frames),
+    allFramesRef = useRef(allFrames);
+  useLayoutEffect(() => {
+    framesRef.current = frames;
+    allFramesRef.current = allFrames;
+  }, [frames, allFrames]);
+  const setIndex = useCallback(
+    (next: number | ((current: number) => number)) => {
+      setFocusedFrame((previous) => {
+        const list = framesRef.current,
+          current = Math.max(
+            0,
+            list.findIndex((f) => f.url === previous),
+          );
+        const target = typeof next === "function" ? next(current) : next;
+        return (
+          list[Math.max(0, Math.min(list.length - 1, target))]?.url || null
+        );
+      });
+    },
+    [],
+  );
+  useEffect(() => {
+    if (frames.length && !frames.some((f) => f.url === focusedFrame))
+      setFocusedFrame(frames[0].url);
+  }, [frames, focusedFrame]);
+  useEffect(() => {
     setPlaying(false);
-    setCommitted(query);
-    setStage("Finding observations");
-    window.history.replaceState({}, "", queryUrl(query));
-    try {
-      const id = await submit(query, abort.signal),
-        deadline = Date.now() + 150000;
-      if (abort.signal.aborted || current !== generation.current) {
-        void cancelJob(id).catch(() => {});
-        return;
+  }, [viewMode]);
+  useEffect(() => {
+    if (viewMode === "matched") setPlaying(false);
+  }, [sequence?.id]);
+  const frameByObservation = useMemo(
+    () => new Map(allFrames.map((f) => [f.observation_id, f])),
+    [allFrames],
+  );
+  const observations = manifest?.observations;
+  const filteredObservations = useMemo(
+    () =>
+      (observations || []).filter(
+        (o) =>
+          (!detectorFilter || o.detector === detectorFilter) &&
+          (!statusFilter || o.status === statusFilter) &&
+          (!recordSearch ||
+            `${o.id} ${o.observed_at} ${o.release}`
+              .toLowerCase()
+              .includes(recordSearch.toLowerCase())),
+      ),
+    [observations, detectorFilter, statusFilter, recordSearch],
+  );
+  const pendingCount = filteredObservations.filter(
+    (o) => o.status === "pending",
+  ).length;
+  const failedRecords = filteredObservations.filter(
+    (o) => o.status === "failed",
+  );
+  const canPlay = ready && frames.length > 1;
+  const displayRange =
+    sequences.find((s) => s.id === frame?.sequence_id)?.stretch ||
+    manifest?.processing?.stretch;
+  const unmatchedFrames =
+    viewMode === "browse" &&
+    new Set(allFrames.map((f) => f.sequence_id || f.detector)).size > 1;
+  function setMode(mode: "browse" | "matched") {
+    if (mode === viewMode) return;
+    setPlaying(false);
+    setViewMode(mode);
+    if (mode === "matched" && (!sequence || sequence.frame_ids.length < 2))
+      setSequenceId(
+        [...sequences].sort(
+          (a, b) => b.frame_ids.length - a.frame_ids.length,
+        )[0]?.id || "",
+      );
+  }
+  function exportCatalog() {
+    const quote = (v: unknown) => `"${String(v ?? "").replaceAll('"', '""')}"`;
+    const rows = [
+      [
+        "observation_id",
+        "observed_at_utc",
+        "detector",
+        "release",
+        "status",
+        "wavelength_um",
+        "bandwidth_um",
+        "reason",
+        "source_url",
+      ],
+      ...filteredObservations.map((o) => {
+        const f = frameByObservation.get(o.id);
+        return [
+          o.id,
+          o.observed_at,
+          o.detector,
+          o.release,
+          o.status,
+          f?.wavelength_um,
+          f?.bandwidth_um,
+          o.reason,
+          f?.source_url || o.source_url,
+        ];
+      }),
+    ];
+    const url = URL.createObjectURL(
+      new Blob([rows.map((r) => r.map(quote).join(",")).join("\r\n")], {
+        type: "text/csv;charset=utf-8",
+      }),
+    );
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "observations.csv";
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  const load = useCallback(
+    async (
+      query: Query,
+      more?: {
+        jobId: string;
+        ids?: string[];
+        detector?: string;
+        all?: boolean;
+        recordIds?: string[];
+      },
+    ) => {
+      controller.current?.abort();
+      const abort = new AbortController();
+      controller.current = abort;
+      const current = ++generation.current;
+      setBusy(true);
+      setError("");
+      setNotice("");
+      if (!more) setPlaying(false);
+      setCommitted(query);
+      if (!more) {
+        setSequenceId("");
+        setDetectorFilter("");
+        setStatusFilter("");
+        setRecordSearch("");
+        setViewMode("browse");
+        setZoom(1);
       }
-      activeJob.current = id;
-      while (!abort.signal.aborted) {
-        if (Date.now() > deadline) {
+      setStage(more ? "Loading images" : "Finding observations");
+      window.history.replaceState({}, "", queryUrl(query));
+      try {
+        const id = more
+          ? await loadObservations(
+              more.jobId,
+              abort.signal,
+              more.ids || more.recordIds?.slice(0, 8),
+              more.detector,
+            )
+          : await submit(query, abort.signal);
+        let deadline = Date.now() + (more ? 150000 : 180000);
+        if (abort.signal.aborted || current !== generation.current) {
           void cancelJob(id).catch(() => {});
-          throw new Error(
-            "Search timed out. Narrow the date range or try again later.",
-          );
-        }
-        const job = await poll(id, abort.signal);
-        if (current !== generation.current) return;
-        const progress = job.stage?.match(/^fetch:(\d+)\/(\d+)$/);
-        setStage(
-          progress
-            ? `Checked ${progress[1]} of ${progress[2]} cutouts`
-            : stages[job.stage || job.status] || "Processing observations",
-        );
-        if (job.status === "cancelled" || job.status === "cancelling") {
-          setNotice("Search cancelled.");
           return;
         }
-        if (job.status === "failed")
-          throw new Error(
-            typeof job.error === "string"
-              ? job.error
-              : "The observations could not be processed. Please try another field.",
+        activeJob.current = id;
+        setFieldJobId(id);
+        let revision = "",
+          published = false,
+          targetSelected = false;
+        const previousUrls = new Set(allFramesRef.current.map((f) => f.url));
+        while (!abort.signal.aborted) {
+          if (Date.now() > deadline) {
+            void cancelJob(id).catch(() => {});
+            throw new Error(
+              "Search timed out. Narrow the date range or try again later.",
+            );
+          }
+          const job = await poll(id, abort.signal);
+          if (current !== generation.current) return;
+          const progress = job.stage?.match(/^fetch:(\d+)\/(\d+)$/);
+          setStage(
+            progress
+              ? `Checked ${progress[1]} of ${progress[2]} cutouts`
+              : stages[job.stage || job.status] || "Processing observations",
           );
-        if (job.status === "complete" || job.status === "partial") {
-          if (!job.manifest)
-            throw new Error("The service returned no observation manifest.");
-          const result = validateManifest(job.manifest);
-          setManifest({
-            ...result,
-            warnings: [...(result.warnings || []), ...(job.warnings || [])],
+          if (job.status === "cancelled" || job.status === "cancelling") {
+            setNotice("Search cancelled.");
+            return;
+          }
+          if (job.status === "failed")
+            throw new Error(
+              typeof job.error === "string"
+                ? job.error
+                : "The observations could not be processed. Please try another field.",
+            );
+          if (job.manifest) {
+            const nextRevision = JSON.stringify(job.manifest);
+            if (nextRevision !== revision) {
+              revision = nextRevision;
+              const result = validateManifest(job.manifest);
+              setManifest({
+                ...result,
+                warnings: [...(result.warnings || []), ...(job.warnings || [])],
+              });
+              setDisplayedQuery(query);
+              if (
+                !targetSelected &&
+                (more?.ids?.length === 1 || more?.detector)
+              ) {
+                const requested = result.frames.find((f) =>
+                  more.ids?.length === 1
+                    ? f.observation_id === more.ids[0]
+                    : f.detector === more.detector && !previousUrls.has(f.url),
+                );
+                if (requested) {
+                  setSequenceId(requested.sequence_id || "");
+                  setViewMode("browse");
+                  setFocusedFrame(requested.url);
+                  targetSelected = true;
+                }
+              }
+              if (!published && !more) setFocusedFrame(null);
+              published = true;
+            }
+          }
+          if (job.status === "complete" || job.status === "partial") {
+            if (!job.manifest)
+              throw new Error("The service returned no observation manifest.");
+            if (
+              !job.manifest.frames.length &&
+              !job.manifest.observations?.length
+            )
+              setNotice(
+                "No comparable observations were found for this field and date range.",
+              );
+            else if (!job.manifest.frames.length)
+              setNotice(
+                "No image in this batch could be loaded. Inspect the failed rows or load another observation.",
+              );
+            const remaining =
+              job.manifest.observations?.filter(
+                (o) =>
+                  o.status === "pending" &&
+                  (!more?.detector || o.detector === more.detector) &&
+                  (!more?.recordIds || more.recordIds.includes(o.id)),
+              ) || [];
+            if (more?.all && remaining.length) {
+              await loadObservations(
+                id,
+                abort.signal,
+                more.recordIds ? remaining.slice(0, 8).map((o) => o.id) : [],
+                more.detector,
+              );
+              deadline = Date.now() + 150000;
+              continue;
+            }
+            return;
+          }
+          await new Promise<void>((resolve) => {
+            const done = () => {
+              clearTimeout(timer);
+              abort.signal.removeEventListener("abort", done);
+              resolve();
+            };
+            const timer = setTimeout(done, 2000);
+            abort.signal.addEventListener("abort", done, { once: true });
           });
-          setDisplayedQuery(query);
-          setIndex(0);
-          if (!result.frames.length)
-            setNotice(
-              "No comparable observations were found for this field and date range.",
-            );
-          else if (result.frames.length === 1)
-            setNotice(
-              "One observation is available. At least two comparable observations are needed for playback.",
-            );
-          else if (job.status === "partial")
-            setNotice(
-              "Some observations could not be processed. Available frames are shown.",
-            );
-          return;
         }
-        await new Promise<void>((resolve) => {
-          const done = () => {
-            clearTimeout(timer);
-            abort.signal.removeEventListener("abort", done);
-            resolve();
-          };
-          const timer = setTimeout(done, 2000);
-          abort.signal.addEventListener("abort", done, { once: true });
-        });
+      } catch (e) {
+        if (!abort.signal.aborted && current === generation.current)
+          setError(
+            e instanceof TypeError
+              ? "The observation service is unavailable. Please try again when the service is connected."
+              : e instanceof Error
+                ? e.message
+                : "Unable to retrieve observations.",
+          );
+      } finally {
+        if (current === generation.current) {
+          setBusy(false);
+          activeJob.current = null;
+        }
       }
-    } catch (e) {
-      if (!abort.signal.aborted && current === generation.current)
-        setError(
-          e instanceof TypeError
-            ? "The observation service is unavailable. Please try again when the service is connected."
-            : e instanceof Error
-              ? e.message
-              : "Unable to retrieve observations.",
-        );
-    } finally {
-      if (current === generation.current) {
-        setBusy(false);
-        activeJob.current = null;
-      }
-    }
-  }, []);
+    },
+    [],
+  );
   function cancelSearch() {
     const id = activeJob.current;
     controller.current?.abort();
@@ -196,7 +419,16 @@ export default function Explorer() {
       });
   }
   useEffect(() => {
+    const narrow = window.matchMedia("(max-width: 1023px)");
+    const changed = () => {
+      if (narrow.matches) setInspectorOpen(false);
+    };
+    narrow.addEventListener("change", changed);
+    return () => narrow.removeEventListener("change", changed);
+  }, []);
+  useEffect(() => {
     if (window.innerWidth < 1024) setInspectorOpen(false);
+    if (window.innerWidth < 700) setDockOpen(false);
     const abort = new AbortController();
     const params = new URLSearchParams(window.location.search);
     const hasSharedField = params.has("ra") || params.has("dec");
@@ -225,26 +457,30 @@ export default function Explorer() {
               : p;
           }),
         );
-        // Only open an archive-backed field that the service can supply immediately.
-        // Shared URLs and edits made while presets are loading take precedence.
+        // Open an authentic reference field; shared URLs and draft edits take precedence.
         const initial = data.presets.find(
           (p) =>
             p.cached_manifest_available &&
             Number.isFinite(p.ra_deg) &&
             Number.isFinite(p.dec_deg),
         );
+        const opening =
+          initial ||
+          data.presets.find(
+            (p) => Number.isFinite(p.ra_deg) && Number.isFinite(p.dec_deg),
+          );
         if (
           !hasSharedField &&
-          initial &&
+          opening &&
           generation.current === 0 &&
           !document.querySelector<HTMLInputElement>('input[name="ra"]')
             ?.value &&
           !document.querySelector<HTMLInputElement>('input[name="dec"]')?.value
         ) {
-          setSelected(initial.id);
-          setRa(String(initial.ra_deg));
-          setDec(String(initial.dec_deg));
-          void load({ ra_deg: initial.ra_deg, dec_deg: initial.dec_deg });
+          setSelected(opening.id);
+          setRa(String(opening.ra_deg));
+          setDec(String(opening.dec_deg));
+          void load({ ra_deg: opening.ra_deg, dec_deg: opening.dec_deg });
         }
       })
       .catch(() => {});
@@ -253,13 +489,15 @@ export default function Explorer() {
         d = params.get("dec") || "",
         s = params.get("start") || "",
         e = params.get("end") || "";
+      const field = params.get("fov") || "300";
+      setFov(field);
       setRa(r);
       setDec(d);
       setStart(s);
       setEnd(e);
       if (s || e) setDatesOpen(true);
       try {
-        const query = parseQuery(r, d, s, e);
+        const query = parseQuery(r, d, s, e, field);
         // Strict Mode cleans up its first mount before this task runs.
         queueMicrotask(() => {
           if (!abort.signal.aborted) void load(query);
@@ -275,12 +513,15 @@ export default function Explorer() {
   }, [load]);
   useEffect(() => {
     if (!playing || !canPlay) return;
-    const timer = setInterval(
-      () => setIndex((i) => (i + 1) % frames.length),
-      1000 / speed,
-    );
-    return () => clearInterval(timer);
-  }, [playing, canPlay, speed, frames.length]);
+    const timer = setTimeout(() => {
+      if (!loop && index === frames.length - 1) {
+        setPlaying(false);
+        return;
+      }
+      setIndex((i) => (i + 1) % frames.length);
+    }, 1000 / speed);
+    return () => clearTimeout(timer);
+  }, [playing, canPlay, speed, frames.length, index, loop, setIndex]);
   useEffect(() => {
     const hide = () => {
       if (document.hidden) setPlaying(false);
@@ -292,11 +533,12 @@ export default function Explorer() {
       }
       if ((e.target as HTMLElement).closest("input,select,textarea,button,a"))
         return;
-      if (!canPlay) return;
       if (e.code === "Space") {
+        if (!canPlay && !playing) return;
         e.preventDefault();
         setPlaying((p) => !p);
       }
+      if (!frames.length) return;
       if (e.key === "ArrowRight") {
         e.preventDefault();
         setPlaying(false);
@@ -313,13 +555,11 @@ export default function Explorer() {
       document.removeEventListener("visibilitychange", hide);
       window.removeEventListener("keydown", keys);
     };
-  }, [canPlay, frames.length]);
+  }, [canPlay, frames.length, playing]);
   const onReady = useCallback((value: boolean) => setReady(value), []);
   const onFailure = useCallback(() => {
     setReady(false);
-    setError(
-      "An observation image could not be loaded. Search again to refresh the sequence.",
-    );
+    setPlaying(false);
   }, []);
   function choose(p: Preset) {
     setSelected(p.id);
@@ -336,7 +576,7 @@ export default function Explorer() {
     e.preventDefault();
     if (busy) return;
     try {
-      void load(parseQuery(ra, dec, start, end));
+      void load(parseQuery(ra, dec, start, end, fov));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -357,7 +597,7 @@ export default function Explorer() {
     setIndex((i) => Math.max(0, Math.min(frames.length - 1, i + n)));
   }
   return (
-    <div className="app-layout">
+    <div className={"app-layout" + (settingsOpen ? "" : " settings-collapsed")}>
       <a className="skip-link" href="#workspace">
         Skip to workspace
       </a>
@@ -371,6 +611,16 @@ export default function Explorer() {
           </span>
         </a>
         <div className="header-actions">
+          <button
+            className="button mobile-field-toggle"
+            aria-label="Toggle field settings"
+            aria-expanded={settingsOpen}
+            onClick={() => setSettingsOpen((v) => !v)}
+          >
+            <SlidersHorizontal size={14} />
+            Field
+          </button>
+
           <button
             className="button share"
             onClick={share}
@@ -449,11 +699,18 @@ export default function Explorer() {
                 </div>
                 <div
                   className="fixed-field"
-                  title="The current service uses a fixed 5 arcminute cutout."
+                  title="Angular field retrieved from the archive; independent of zoom."
                 >
                   <label htmlFor="fov">Field of view</label>
                   <div>
-                    <input id="fov" value="300" disabled />
+                    <input
+                      id="fov"
+                      type="number"
+                      min="30"
+                      max="1800"
+                      value={fov}
+                      onChange={(e) => setFov(e.target.value)}
+                    />
                     <span>arcsec</span>
                   </div>
                 </div>
@@ -532,6 +789,7 @@ export default function Explorer() {
                         setZoom(1);
                         setInvert(false);
                         setSpeed(1);
+                        setFov("300");
                         setError("");
                         setNotice("");
                       }}
@@ -570,9 +828,9 @@ export default function Explorer() {
                 <input
                   id="zoom"
                   type="range"
-                  min="1"
-                  max="8"
-                  step="0.25"
+                  min="0.02"
+                  max="32"
+                  step="0.01"
                   value={zoom}
                   onChange={(e) => setZoom(Number(e.target.value))}
                   disabled={!ready}
@@ -593,20 +851,14 @@ export default function Explorer() {
                     Min pixel value
                     <input
                       disabled
-                      value={
-                        manifest?.processing?.stretch?.vmin?.toPrecision(4) ??
-                        "—"
-                      }
+                      value={displayRange?.vmin?.toPrecision(4) ?? "—"}
                     />
                   </label>
                   <label>
                     Max pixel value
                     <input
                       disabled
-                      value={
-                        manifest?.processing?.stretch?.vmax?.toPrecision(4) ??
-                        "—"
-                      }
+                      value={displayRange?.vmax?.toPrecision(4) ?? "—"}
                     />
                   </label>
                 </div>
@@ -689,7 +941,8 @@ export default function Explorer() {
           <div className="feedback" aria-live="polite">
             {committed &&
               !busy &&
-              (Number(ra) !== committed.ra_deg ||
+              (Number(fov) !== (committed.fov_arcsec || 300) ||
+                Number(ra) !== committed.ra_deg ||
                 Number(dec) !== committed.dec_deg ||
                 start !== (committed.start_utc?.slice(0, 10) || "") ||
                 end !== (committed.end_utc?.slice(0, 10) || "")) && (
@@ -755,7 +1008,77 @@ export default function Explorer() {
                   </button>
                 </div>
               </div>
+              {allFrames.length > 0 && (
+                <div className="sequence-toolbar">
+                  <div
+                    className="view-modes"
+                    role="group"
+                    aria-label="Playback mode"
+                  >
+                    <button
+                      aria-pressed={viewMode === "browse"}
+                      onClick={() => setMode("browse")}
+                      title="Browse loaded observations in acquisition order"
+                    >
+                      Browse
+                    </button>
+                    <button
+                      aria-pressed={viewMode === "matched"}
+                      onClick={() => setMode("matched")}
+                      title="Play observations with compatible wavelength and calibration"
+                    >
+                      Matched
+                    </button>
+                  </div>
+                  {viewMode === "matched" && sequences.length > 0 ? (
+                    <>
+                      <label className="sr-only" htmlFor="sequence">
+                        Wavelength sequence
+                      </label>
+                      <select
+                        id="sequence"
+                        value={sequence?.id || ""}
+                        onChange={(e) => {
+                          setSequenceId(e.target.value);
+                          setFocusedFrame(null);
+                          setPlaying(false);
+                        }}
+                      >
+                        {[...sequences]
+                          .filter((g) => g.frame_ids.length)
+                          .sort(
+                            (a, b) => b.frame_ids.length - a.frame_ids.length,
+                          )
+                          .map((g) => (
+                            <option key={g.id} value={g.id}>
+                              {g.detector} / {g.wavelength_um.toFixed(3)}{" "}
+                              microns / {g.frame_ids.length} frame
+                              {g.frame_ids.length === 1 ? "" : "s"}
+                            </option>
+                          ))}
+                      </select>
+                    </>
+                  ) : (
+                    <span
+                      className={
+                        unmatchedFrames
+                          ? "wavelength-warning"
+                          : "browse-summary"
+                      }
+                    >
+                      {unmatchedFrames
+                        ? "Unmatched observations; brightness is not directly comparable."
+                        : `${allFrames.length} loaded image${allFrames.length === 1 ? "" : "s"}`}
+                    </span>
+                  )}
+                </div>
+              )}
               <SkyViewer
+                key={
+                  displayedQuery
+                    ? `${displayedQuery.ra_deg}/${displayedQuery.dec_deg}/${displayedQuery.fov_arcsec || 300}`
+                    : "empty"
+                }
                 frames={frames}
                 index={index}
                 onReady={onReady}
@@ -764,12 +1087,13 @@ export default function Explorer() {
                 onZoom={setZoom}
                 invert={invert}
                 grid={manifest?.grid}
+                unmatchedFrames={unmatchedFrames}
               />
               <div className="playback">
                 <div className="transport">
                   <button
                     aria-label="First frame"
-                    disabled={!canPlay}
+                    disabled={frames.length < 2}
                     onClick={() => {
                       setPlaying(false);
                       setIndex(0);
@@ -779,7 +1103,7 @@ export default function Explorer() {
                   </button>
                   <button
                     aria-label="Previous frame"
-                    disabled={!canPlay}
+                    disabled={frames.length < 2}
                     onClick={() => step(-1)}
                   >
                     <ChevronLeft size={17} />
@@ -787,21 +1111,33 @@ export default function Explorer() {
                   <button
                     className="play"
                     aria-label={playing ? "Pause" : "Play"}
-                    disabled={!canPlay}
-                    onClick={() => setPlaying((p) => !p)}
+                    title={
+                      canPlay
+                        ? viewMode === "browse"
+                          ? "Browse loaded images"
+                          : "Play matched observations"
+                        : "At least two ready images are needed"
+                    }
+                    disabled={!canPlay && !playing}
+                    onClick={() => {
+                      if (frame) setFocusedFrame(frame.url);
+                      if (viewMode === "matched" && sequence)
+                        setSequenceId(sequence.id);
+                      setPlaying((p) => !p);
+                    }}
                   >
                     {playing ? <Pause size={16} /> : <Play size={16} />}
                   </button>
                   <button
                     aria-label="Next frame"
-                    disabled={!canPlay}
+                    disabled={frames.length < 2}
                     onClick={() => step(1)}
                   >
                     <ChevronRight size={17} />
                   </button>
                   <button
                     aria-label="Last frame"
-                    disabled={!canPlay}
+                    disabled={frames.length < 2}
                     onClick={() => {
                       setPlaying(false);
                       setIndex(frames.length - 1);
@@ -828,6 +1164,15 @@ export default function Explorer() {
                     <option value={4}>250 ms</option>
                   </select>
                 </div>
+                <button
+                  className={"loop-toggle " + (loop ? "active" : "")}
+                  aria-label="Loop playback"
+                  aria-pressed={loop}
+                  title="Loop playback"
+                  onClick={() => setLoop((v) => !v)}
+                >
+                  <Repeat size={14} />
+                </button>
                 <span className="frame-counter">
                   {frames.length ? String(index + 1).padStart(2, "0") : "—"}{" "}
                   <span>
@@ -845,7 +1190,7 @@ export default function Explorer() {
                   min={0}
                   max={Math.max(1, frames.length - 1)}
                   value={index}
-                  disabled={!canPlay}
+                  disabled={frames.length < 2}
                   onChange={(e) => {
                     setPlaying(false);
                     setIndex(Number(e.target.value));
@@ -862,6 +1207,24 @@ export default function Explorer() {
                   </span>
                 </div>
               </div>
+              {frames.length === 1 && (
+                <div className="playback-guidance">
+                  {viewMode === "matched" ? (
+                    <>
+                      <span>One matched frame loaded.</span>
+                      {allFrames.length > 1 && (
+                        <button onClick={() => setMode("browse")}>
+                          Browse all {allFrames.length} images
+                        </button>
+                      )}
+                    </>
+                  ) : (
+                    <span>
+                      One image loaded. Load more observations to play.
+                    </span>
+                  )}
+                </div>
+              )}
             </section>
             {inspectorOpen && (
               <aside className="inspector" aria-label="Frame details">
@@ -956,60 +1319,303 @@ export default function Explorer() {
             )}
           </div>
           <section
-            className={"observations-dock " + (!dockOpen ? "collapsed" : "")}
+            className={
+              "observations-dock " +
+              (!dockOpen ? "collapsed" : "") +
+              (dockExpanded ? " expanded" : "")
+            }
             aria-label="Observations"
           >
-            <button
-              className="dock-heading"
-              onClick={() => setDockOpen(!dockOpen)}
-              aria-expanded={dockOpen}
-            >
-              <Layers size={14} />
-              <strong>Observations</strong>
-              <span className="count-badge">{frames.length}</span>
-              <ChevronDown size={14} />
-            </button>
-            {dockOpen && (
-              <div className="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Frame</th>
-                      <th>Acquired · UTC</th>
-                      <th>Detector</th>
-                      <th>Release</th>
-                      <th>Observation ID</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {frames.map((f, i) => (
-                      <tr key={f.id} className={i === index ? "active" : ""}>
-                        <td>
-                          <button
-                            aria-label={`Select frame ${i + 1}`}
-                            onClick={() => {
-                              setPlaying(false);
-                              setIndex(i);
-                            }}
-                          >
-                            {String(i + 1).padStart(2, "0")}
-                            <ChevronRight size={12} />
-                          </button>
-                        </td>
-                        <td>{stamp(f.observed_at).replace(" UTC", "")}</td>
-                        <td>{f.detector || "—"}</td>
-                        <td>{f.release || "—"}</td>
-                        <td className="mono">{f.observation_id}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                {!frames.length && (
-                  <div className="table-empty">
-                    <span>No observations</span>
-                  </div>
+            <div className="dock-header">
+              <button
+                className="dock-heading"
+                onClick={() => {
+                  setDockOpen(!dockOpen);
+                  if (dockExpanded) setDockExpanded(false);
+                }}
+                aria-expanded={dockOpen}
+              >
+                <Layers size={14} />
+                <strong>Observations</strong>
+                <span className="count-badge">
+                  {observations?.length ?? allFrames.length}
+                </span>
+                <ChevronDown size={14} />
+              </button>
+              <button
+                className="dock-expand"
+                aria-label={
+                  dockExpanded ? "Restore image view" : "Expand observations"
+                }
+                title={
+                  dockExpanded ? "Restore image view" : "Expand observations"
+                }
+                onClick={() => {
+                  setDockExpanded((v) => !v);
+                  setDockOpen(true);
+                }}
+              >
+                {dockExpanded ? (
+                  <Minimize2 size={14} />
+                ) : (
+                  <Maximize2 size={14} />
                 )}
-              </div>
+              </button>
+            </div>
+            {dockOpen && (
+              <>
+                {observations && (
+                  <>
+                    <div className="catalog-controls">
+                      <label htmlFor="detector-filter">Detector</label>
+                      <select
+                        id="detector-filter"
+                        value={detectorFilter}
+                        onChange={(e) => setDetectorFilter(e.target.value)}
+                      >
+                        <option value="">All six</option>
+                        {["D1", "D2", "D3", "D4", "D5", "D6"].map((d) => (
+                          <option key={d} value={d}>
+                            {d} (
+                            {observations?.filter((o) => o.detector === d)
+                              .length ?? 0}
+                            )
+                          </option>
+                        ))}
+                      </select>
+                      <label className="sr-only" htmlFor="status-filter">
+                        Observation status
+                      </label>
+                      <select
+                        id="status-filter"
+                        value={statusFilter}
+                        onChange={(e) => setStatusFilter(e.target.value)}
+                      >
+                        <option value="">All statuses</option>
+                        <option value="ready">Loaded</option>
+                        <option value="pending">Not loaded</option>
+                        <option value="loading">Loading</option>
+                        <option value="failed">Failed</option>
+                      </select>
+                      <input
+                        className="catalog-search"
+                        aria-label="Find observation"
+                        placeholder="Find observation…"
+                        value={recordSearch}
+                        onChange={(e) => setRecordSearch(e.target.value)}
+                      />
+                      <span>
+                        {
+                          filteredObservations.filter(
+                            (o) => o.status === "ready",
+                          ).length
+                        }{" "}
+                        loaded /{" "}
+                        {filteredObservations.filter(
+                          (o) => o.status === "failed",
+                        ).length || 0}{" "}
+                        failed /{" "}
+                        {filteredObservations.filter(
+                          (o) =>
+                            o.status === "pending" || o.status === "loading",
+                        ).length || 0}{" "}
+                        not loaded
+                      </span>
+                      <button
+                        className="button"
+                        disabled={busy || !pendingCount || !committed}
+                        onClick={() => {
+                          if (committed)
+                            void load(committed, {
+                              jobId: fieldJobId,
+                              detector: detectorFilter || undefined,
+                              ids: filteredObservations
+                                .filter((o) => o.status === "pending")
+                                .slice(0, 8)
+                                .map((o) => o.id),
+                            });
+                        }}
+                      >
+                        {pendingCount
+                          ? `Load next ${Math.min(8, pendingCount)}`
+                          : "No pending images"}
+                      </button>
+                      <button
+                        className="button"
+                        disabled={busy || !pendingCount || !committed}
+                        onClick={() => {
+                          if (committed)
+                            void load(committed, {
+                              jobId: fieldJobId,
+                              detector: detectorFilter || undefined,
+                              all: true,
+                              recordIds: filteredObservations
+                                .filter((o) => o.status === "pending")
+                                .map((o) => o.id),
+                            });
+                        }}
+                      >
+                        Load all{detectorFilter ? ` ${detectorFilter}` : ""}
+                      </button>
+                      {busy && (
+                        <button
+                          className="button"
+                          aria-label="Stop loading"
+                          onClick={cancelSearch}
+                        >
+                          Stop
+                        </button>
+                      )}
+                      {failedRecords.length > 0 && (
+                        <button
+                          className="button"
+                          disabled={busy || !committed}
+                          onClick={() => {
+                            if (committed)
+                              void load(committed, {
+                                jobId: fieldJobId,
+                                ids: failedRecords.slice(0, 8).map((o) => o.id),
+                              });
+                          }}
+                        >
+                          Retry {Math.min(8, failedRecords.length)} failed
+                        </button>
+                      )}
+                      <button
+                        className="catalog-export"
+                        aria-label="Export observation catalog"
+                        title="Export filtered catalog as CSV"
+                        disabled={!filteredObservations.length}
+                        onClick={exportCatalog}
+                      >
+                        <Download size={15} />
+                      </button>
+                      {manifest?.discovery_complete === false && (
+                        <span>Partial archive results; refine dates.</span>
+                      )}
+                    </div>
+                  </>
+                )}
+                <div className="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Frame</th>
+                        <th>Acquired · UTC</th>
+                        <th>Detector</th>
+                        <th>Release</th>
+                        <th>Observation ID</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {observations
+                        ? filteredObservations.map((o) => {
+                            const f = frameByObservation.get(o.id);
+                            return (
+                              <tr
+                                key={o.id}
+                                className={
+                                  frame?.observation_id === o.id ? "active" : ""
+                                }
+                              >
+                                <td>
+                                  <button
+                                    disabled={busy && !f}
+                                    title={
+                                      o.reason ||
+                                      (f
+                                        ? "Inspect observation"
+                                        : "Load this observation")
+                                    }
+                                    onClick={() => {
+                                      setDockExpanded(false);
+                                      if (f) {
+                                        setSequenceId(f.sequence_id || "");
+                                        setViewMode("browse");
+                                        setFocusedFrame(f.url);
+                                        setPlaying(false);
+                                      } else if (committed)
+                                        void load(committed, {
+                                          jobId: fieldJobId,
+                                          ids: [o.id],
+                                        });
+                                    }}
+                                  >
+                                    {f
+                                      ? "View"
+                                      : o.status === "failed"
+                                        ? "Retry"
+                                        : o.status === "loading"
+                                          ? "Loading"
+                                          : "Load"}
+                                  </button>
+                                </td>
+                                <td>
+                                  {stamp(o.observed_at).replace(" UTC", "")}
+                                </td>
+                                <td>{o.detector}</td>
+                                <td>{o.release}</td>
+                                <td>
+                                  <span
+                                    className="observation-status"
+                                    title={o.reason || ""}
+                                  >
+                                    {o.status}
+                                    {o.reason ? `: ${o.reason}` : ""}
+                                  </span>
+                                  <span className="mono">{o.id}</span>
+                                </td>
+                              </tr>
+                            );
+                          })
+                        : frames.map((f, i) => (
+                            <tr
+                              key={f.id}
+                              className={i === index ? "active" : ""}
+                            >
+                              <td>
+                                <button
+                                  aria-label={`Select frame ${i + 1}`}
+                                  onClick={() => {
+                                    setPlaying(false);
+                                    setIndex(i);
+                                  }}
+                                >
+                                  {String(i + 1).padStart(2, "0")}
+                                  <ChevronRight size={12} />
+                                </button>
+                              </td>
+                              <td>
+                                {stamp(f.observed_at).replace(" UTC", "")}
+                              </td>
+                              <td>{f.detector}</td>
+                              <td>{f.release || "—"}</td>
+                              <td className="mono">{f.observation_id}</td>
+                            </tr>
+                          ))}
+                    </tbody>
+                  </table>
+                  {!!observations?.length && !filteredObservations.length && (
+                    <div className="table-empty">
+                      <span>No matching observations</span>
+                      <button
+                        onClick={() => {
+                          setDetectorFilter("");
+                          setStatusFilter("");
+                          setRecordSearch("");
+                        }}
+                      >
+                        Clear filters
+                      </button>
+                    </div>
+                  )}
+                  {!(observations?.length || allFrames.length) && (
+                    <div className="table-empty">
+                      <span>No observations</span>
+                    </div>
+                  )}
+                </div>
+              </>
             )}
           </section>
         </div>
