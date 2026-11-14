@@ -178,3 +178,44 @@ def test_cached_demo_never_substitutes_another_query(tmp_path):
             "job_id"
         ]
         assert finished(client, other)["error"] == "Live query requested"
+
+
+def test_duplicate_inflight_jobs_reuse_work_and_cancel(tmp_path):
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    class Slow(StubPipeline):
+        def run(self, query, directory, job_id, report):
+            calls.append(query)
+            entered.set()
+            release.wait(5)
+            report("fetch")
+            return super().run(query, directory, job_id, report)
+
+    with TestClient(create_app(settings(tmp_path, max_jobs=1), Slow())) as client:
+        try:
+            body = {"ra_deg": 330, "dec_deg": -50}
+            job_id = client.post("/api/jobs", json=body).json()["job_id"]
+            assert entered.wait(2)
+            assert client.post("/api/jobs", json=body).json()["job_id"] == job_id
+            assert len(calls) == 1
+            assert (
+                client.post(f"/api/jobs/{job_id}/cancel").json()["status"]
+                == "cancelling"
+            )
+            assert client.get("/api/health").json()["active_jobs"] == 1
+            release.set()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                state = client.get(f"/api/jobs/{job_id}").json()["status"]
+                if state == "cancelled":
+                    break
+                time.sleep(0.01)
+            assert state == "cancelled"
+            assert client.get("/api/health").json()["active_jobs"] == 0
+            assert client.post("/api/jobs/not-an-id/cancel").status_code == 404
+            retry = client.post("/api/jobs", json=body).json()["job_id"]
+            assert retry != job_id
+            assert finished(client, retry)["status"] == "partial"
+        finally:
+            release.set()

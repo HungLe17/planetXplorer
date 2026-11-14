@@ -161,3 +161,29 @@ def test_rejects_quality_map_with_a_different_sky_grid(tmp_path):
         h.writeto(path)
     with pytest.raises(ValueError, match="sky grid differs"):
         decode(path, OBS, QUERY, SOURCE)
+
+
+def test_cutouts_download_concurrently_with_progress(tmp_path):
+    import shutil
+    import threading
+    from app.config import Settings
+    from app.pipeline import Pipeline
+
+    barrier = threading.Barrier(2, timeout=3)
+
+    class ParallelArchive:
+        def search(self, *_):
+            return [OBS, replace(OBS, identity="second", mjd=OBS.mjd + 1)], []
+
+        def fetch(self, obs, query, path, deadline):
+            barrier.wait()
+            shutil.copyfile(FIXTURE, path)
+            return SOURCE
+
+    stages = []
+    result = Pipeline(Settings(cutout_workers=2), ParallelArchive()).run(
+        QUERY, tmp_path, "parallel", stages.append
+    )
+    assert len(result.frames) == 2
+    assert "fetch:2/2" in stages
+    assert not list(tmp_path.glob("raw-*.fits"))

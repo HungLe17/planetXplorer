@@ -117,7 +117,7 @@ export default function Explorer() {
         const progress = job.stage?.match(/^fetch:(\d+)\/(\d+)$/);
         setStage(
           progress
-            ? `Retrieved ${progress[1]} of ${progress[2]} cutouts`
+            ? `Checked ${progress[1]} of ${progress[2]} cutouts`
             : stages[job.stage || job.status] || "Processing observations",
         );
         if (job.status === "cancelled" || job.status === "cancelling") {

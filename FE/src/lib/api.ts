@@ -1,7 +1,8 @@
 import { Frame, Job, Manifest, Query } from "./types";
-export const base = (
-  process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000"
-).replace(/\/$/, "");
+import { normalizeApiBase } from "./api-config";
+export const base = normalizeApiBase(
+  process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000",
+);
 export async function request<T>(
   path: string,
   signal: AbortSignal,
@@ -15,14 +16,21 @@ export async function request<T>(
     },
     ...(body ? { method: "POST", body: JSON.stringify(body) } : {}),
   });
-  if (!response.ok)
+  if (!response.ok) {
+    if (response.status === 404) {
+      const pollingJob = !body && /^\/api\/jobs\/[^/]+$/.test(path);
+      throw new Error(
+        pollingJob
+          ? "This search is no longer available. The backend may have restarted or the job expired. Search again."
+          : `Backend endpoint not found: ${path}. Check NEXT_PUBLIC_API_BASE_URL and redeploy the frontend.`,
+      );
+    }
     throw new Error(
       response.status === 429
         ? "The processing queue is full. Please try again shortly."
-        : response.status === 404
-          ? "This request has expired. Search again to retrieve observations."
-          : `The archive service returned an error (${response.status}). Try again shortly.`,
+        : `The archive service returned an error (${response.status}). Try again shortly.`,
     );
+  }
   return response.json();
 }
 export function assetUrl(path: string) {

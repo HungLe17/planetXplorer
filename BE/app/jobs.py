@@ -48,7 +48,9 @@ class Jobs:
     def cleanup(self):
         now = datetime.now(UTC)
         active = {
-            k for k, v in self.records.items() if v.status in ("running", "queued", "cancelling")
+            k
+            for k, v in self.records.items()
+            if v.status in ("running", "queued", "cancelling")
         }
         expired = [
             k
@@ -90,7 +92,10 @@ class Jobs:
                 )
                 return cached
             if (
-                sum(v.status in ("queued", "running") for v in self.records.values())
+                sum(
+                    v.status in ("queued", "running", "cancelling")
+                    for v in self.records.values()
+                )
                 >= self.settings.max_jobs
             ):
                 raise CapacityError("The processing queue is full")
@@ -125,7 +130,9 @@ class Jobs:
                 return job_id
             self.cancel_events[job_id] = threading.Event()
             self.cache[key] = job_id
-            self.futures[job_id] = self.executor.submit(self._run, job_id, query, directory, key)
+            self.futures[job_id] = self.executor.submit(
+                self._run, job_id, query, directory, key
+            )
             return job_id
 
     def _demo(self, query: Query, directory: Path, job_id: str) -> Manifest | None:
@@ -170,14 +177,19 @@ class Jobs:
 
     def active_count(self) -> int:
         with self.lock:
-            return sum(v.status in ("queued", "running") for v in self.records.values())
+            return sum(
+                v.status in ("queued", "running", "cancelling")
+                for v in self.records.values()
+            )
 
     def cancel(self, job_id: str) -> Job | None:
         with self.lock:
             job = self.records.get(job_id)
             if job and job.status in ("queued", "running", "cancelling"):
                 self.cancel_events[job_id].set()
-                job.status = "cancelled" if self.futures[job_id].cancel() else "cancelling"
+                job.status = (
+                    "cancelled" if self.futures[job_id].cancel() else "cancelling"
+                )
                 job.stage = job.status
                 self.cache = {k: v for k, v in self.cache.items() if v != job_id}
             return job.model_copy(deep=True) if job else None
@@ -217,7 +229,10 @@ class Jobs:
                 )
         finally:
             with self.lock:
-                if self.records[job_id].status in ("failed", "cancelled") and self.cache.get(key) == job_id:
+                if (
+                    self.records[job_id].status in ("failed", "cancelled")
+                    and self.cache.get(key) == job_id
+                ):
                     self.cache.pop(key, None)
                 self.records[job_id].expires_at = (
                     datetime.now(UTC) + timedelta(seconds=self.settings.ttl_seconds)

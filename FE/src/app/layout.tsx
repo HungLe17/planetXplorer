@@ -5,7 +5,7 @@ import "@fontsource/ibm-plex-sans/600.css";
 import "@fontsource/ibm-plex-mono/400.css";
 import "./globals.css";
 export const metadata: Metadata = {
-  title: "Planet X",
+  title: "planetXplorer",
   description:
     "Inspect the infrared sky through time. A public SPHEREx observation explorer.",
 };

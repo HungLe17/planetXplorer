@@ -231,14 +231,16 @@ class Pipeline:
         report("query")
         observations, notes = self.archive.search(query, deadline)
         omissions, cutouts = [], []
+        download_deadline = deadline - min(10, self.settings.job_seconds / 4)
+
         def retrieve(i, obs):
             path = directory / f"raw-{i}.fits"
             try:
                 # report checks cancellation before a queued download starts.
                 report("fetch")
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= download_deadline:
                     raise ArchiveError("Search time limit reached")
-                source = self.archive.fetch(obs, query, path, deadline)
+                source = self.archive.fetch(obs, query, path, download_deadline)
                 return decode(path, obs, query, source)
             finally:
                 path.unlink(missing_ok=True)
@@ -246,7 +248,9 @@ class Pipeline:
         # IRSA's cutout tutorial supports bounded parallel retrieval. Each file,
         # FITS object and WCS belongs to one worker; compatibility is checked below.
         pool = ThreadPoolExecutor(max_workers=self.settings.cutout_workers)
-        futures = {pool.submit(retrieve, i, obs): obs for i, obs in enumerate(observations)}
+        futures = {
+            pool.submit(retrieve, i, obs): obs for i, obs in enumerate(observations)
+        }
         try:
             for completed, future in enumerate(as_completed(futures), 1):
                 obs = futures[future]
@@ -254,7 +258,9 @@ class Pipeline:
                 try:
                     cutouts.append(future.result())
                 except (ArchiveError, ValueError, KeyError, OSError) as exc:
-                    omissions.append({"observation_id": obs.identity, "reason": str(exc)[:200]})
+                    omissions.append(
+                        {"observation_id": obs.identity, "reason": str(exc)[:200]}
+                    )
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
         cutouts.sort(key=lambda c: (c.observation.mjd, c.observation.identity))

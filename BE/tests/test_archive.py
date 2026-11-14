@@ -32,7 +32,7 @@ def test_query_utc_bounds_deduplicates_and_prefers_dr1():
 
     a = archive_with(handler)
     try:
-        rows, notes = a.search(
+        rows, notes = a._search_tap(
             Query(
                 ra_deg=133,
                 dec_deg=-7,
@@ -54,13 +54,15 @@ def test_empty_metadata_is_success_and_malformed_metadata_is_rejected():
         a = archive_with(lambda _: httpx.Response(200, text=text))
         try:
             if text.startswith("uri"):
-                assert a.search(Query(ra_deg=0, dec_deg=0), time.monotonic() + 30) == (
+                assert a._search_tap(
+                    Query(ra_deg=0, dec_deg=0), time.monotonic() + 30
+                ) == (
                     [],
                     [],
                 )
             else:
                 with pytest.raises(ArchiveError):
-                    a.search(Query(ra_deg=0, dec_deg=0), time.monotonic() + 30)
+                    a._search_tap(Query(ra_deg=0, dec_deg=0), time.monotonic() + 30)
         finally:
             a.close()
 
@@ -132,7 +134,7 @@ def test_download_limit_and_http_failure_are_bounded(tmp_path):
     a = archive_with(unavailable)
     try:
         with pytest.raises(ArchiveError):
-            a.search(Query(ra_deg=0, dec_deg=0), time.monotonic() + 30)
+            a._search_tap(Query(ra_deg=0, dec_deg=0), time.monotonic() + 30)
         assert len(seen) == 2
     finally:
         a.close()
@@ -140,3 +142,82 @@ def test_download_limit_and_http_failure_are_bounded(tmp_path):
 
 def test_time_sampling_covers_both_ends():
     assert evenly_spaced(list(range(100)), 3) == [0, 50, 99]
+
+
+def test_metadata_timeout_budget_and_error_are_explicit():
+    budgets = []
+
+    def handler(request):
+        budgets.append(request.extensions["timeout"]["read"])
+        raise httpx.ReadTimeout("IRSA stalled", request=request)
+
+    a = archive_with(handler)
+    try:
+        started = time.monotonic()
+        with pytest.raises(ArchiveError, match="metadata search timed out"):
+            a._search_tap(Query(ra_deg=330, dec_deg=-50), started + 120)
+        assert len(budgets) == 2 and max(budgets) <= 15
+    finally:
+        a.close()
+
+
+def test_metadata_deadline_also_bounds_a_slow_stream():
+    class Trickle(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"uri,time_bounds_lower,energy_bandpassname\n"
+            time.sleep(0.03)
+            yield b"\n"
+
+    a = archive_with(lambda _: httpx.Response(200, stream=Trickle()))
+    try:
+        with pytest.raises(ArchiveError, match="metadata search timed out"):
+            a._search_tap(Query(ra_deg=330, dec_deg=-50), time.monotonic() + 0.01)
+    finally:
+        a.close()
+
+
+def test_sia_search_uses_documented_collections_and_columns():
+    import io
+    from astropy.table import Table
+
+    def handler(request):
+        if request.url.path == "/TAP/sync":
+            pytest.fail("A successful SIA search must not wait on TAP")
+        assert request.url.path == "/SIA"
+        assert request.url.params["POS"] == "CIRCLE 330.0 -50.0 0"
+        data = (
+            []
+            if request.url.params["COLLECTION"] != "spherex_dr1"
+            else [("https://irsa.ipac.caltech.edu/" + uri(), 60801.5)]
+        )
+        table = Table(rows=data, names=["access_url", "t_min"], dtype=["U300", "f8"])
+        output = io.BytesIO()
+        table.write(output, format="votable")
+        return httpx.Response(200, content=output.getvalue())
+
+    a = archive_with(handler)
+    try:
+        rows, notes = a.search(Query(ra_deg=330, dec_deg=-50), time.monotonic() + 30)
+        assert len(rows) == 1 and rows[0].detector == "D2" and rows[0].release == "DR1"
+        assert "SIA" in notes[0]
+    finally:
+        a.close()
+
+
+def test_sia_unavailable_falls_back_to_tap():
+    def handler(request):
+        if request.url.path == "/SIA":
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            text="uri,time_bounds_lower,energy_bandpassname\n"
+            + f"{uri()},60801.5,SPHEREx-D2\n",
+        )
+
+    a = archive_with(handler)
+    try:
+        rows, notes = a.search(Query(ra_deg=330, dec_deg=-50), time.monotonic() + 30)
+        assert len(rows) == 1
+        assert "TAP" in notes[0]
+    finally:
+        a.close()

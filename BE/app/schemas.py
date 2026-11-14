@@ -59,7 +59,9 @@ class Manifest(BaseModel):
 
 class Job(BaseModel):
     job_id: str
-    status: Literal["queued", "running", "complete", "partial", "failed", "cancelling", "cancelled"] = "queued"
+    status: Literal[
+        "queued", "running", "complete", "partial", "failed", "cancelling", "cancelled"
+    ] = "queued"
     stage: str = "queued"
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None

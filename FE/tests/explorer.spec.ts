@@ -334,3 +334,100 @@ test("opens an available archive field on startup and honors shared coordinates"
     { ra_deg: 12, dec_deg: -4 },
   ]);
 });
+
+test("search progress is cancellable and preserves the previous field", async ({
+  page,
+}) => {
+  let submission = 0,
+    cancellations = 0;
+  await page.route("**/api/jobs", (r) =>
+    r.fulfill({
+      status: 202,
+      json: { job_id: ++submission === 1 ? "loaded" : "slow" },
+    }),
+  );
+  await page.route("**/api/jobs/loaded", (r) =>
+    r.fulfill({
+      json: {
+        status: "complete",
+        manifest: {
+          frames: [
+            {
+              id: "original",
+              url: "/api/assets/loaded/frame.png",
+              observation_id: "test-only-original",
+              observed_at: "2026-01-01T00:00:00Z",
+              detector: "D2",
+            },
+          ],
+        },
+      },
+    }),
+  );
+  await page.route("**/api/assets/**", (r) =>
+    r.fulfill({ contentType: "image/png", body: Buffer.from(png, "base64") }),
+  );
+  await page.route("**/api/jobs/slow", (r) =>
+    r.fulfill({ json: { status: "running", stage: "fetch:4/24" } }),
+  );
+  await page.route("**/api/jobs/slow/cancel", (r) => {
+    cancellations++;
+    return r.fulfill({ json: { status: "cancelling" } });
+  });
+  await page.goto("/explore?ra=1&dec=2");
+  await expect(
+    page.getByRole("button", { name: "Zoom in", exact: true }),
+  ).toBeEnabled();
+  await page.getByRole("textbox", { name: "Right ascension" }).fill("330");
+  await page.getByRole("textbox", { name: "Declination" }).fill("-50");
+  await page
+    .getByRole("button", { name: "Search observations", exact: true })
+    .click();
+  await expect(
+    page.getByText("Checked 4 of 24 cutouts.", { exact: false }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Searching", exact: true }),
+  ).toBeDisabled();
+  await expect(page.locator("canvas")).toHaveAttribute(
+    "aria-label",
+    /Observation 1 of 1/,
+  );
+  await expect(page.locator(".field-readout")).toHaveText("1.000000, 2.000000");
+  await page
+    .getByRole("button", { name: "Cancel search", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Search observations", exact: true }),
+  ).toBeEnabled();
+  await expect.poll(() => cancellations).toBe(1);
+  await expect(
+    page.getByText("Showing the previous field.", { exact: false }),
+  ).toBeVisible();
+});
+
+test("a missing submit endpoint is not reported as an expired job", async ({
+  page,
+}) => {
+  await page.route("**/api/jobs", (r) =>
+    r.fulfill({ status: 404, json: { detail: "Not Found" } }),
+  );
+  await page.goto("/explore?ra=331.09664385226796&dec=-7.2451472222");
+  await expect(page.locator(".error[role=alert]")).toContainText(
+    "Backend endpoint not found: /api/jobs",
+  );
+  await expect(page.locator(".error[role=alert]")).not.toContainText("expired");
+});
+
+test("a missing job reports a possible restart or expiry", async ({ page }) => {
+  await page.route("**/api/jobs", (r) =>
+    r.fulfill({ status: 202, json: { job_id: "lost-job" } }),
+  );
+  await page.route("**/api/jobs/lost-job", (r) =>
+    r.fulfill({ status: 404, json: { detail: "Unknown job" } }),
+  );
+  await page.goto("/explore?ra=1&dec=2");
+  await expect(page.locator(".error[role=alert]")).toContainText(
+    "backend may have restarted",
+  );
+});

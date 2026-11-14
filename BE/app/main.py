@@ -61,7 +61,11 @@ def create_app(settings: Settings | None = None, pipeline=None):
             raise HTTPException(404, "Unknown or expired job; submit the query again")
         return result
 
-    @app.post("/api/jobs/{job_id}/cancel", response_model=Job, response_model_exclude_none=True)
+    @app.post(
+        "/api/jobs/{job_id}/cancel",
+        response_model=Job,
+        response_model_exclude_none=True,
+    )
     def cancel_job(job_id: str, request: Request):
         result = request.app.state.jobs.cancel(job_id) if valid_id(job_id) else None
         if result is None:
