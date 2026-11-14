@@ -38,6 +38,7 @@ export default function SkyViewer({
   invert,
   grid,
   unmatchedFrames = false,
+  emptyState,
 }: {
   frames: Frame[];
   index: number;
@@ -48,6 +49,7 @@ export default function SkyViewer({
   invert: boolean;
   grid?: string;
   unmatchedFrames?: boolean;
+  emptyState?: { title: string; message: string };
 }) {
   const canvas = useRef<HTMLCanvasElement>(null),
     box = useRef<HTMLDivElement>(null),
@@ -412,8 +414,10 @@ export default function SkyViewer({
         )}
         {!frames.length && (
           <div className="sky-empty">
-            <h2>No observation loaded</h2>
-            <p>Enter coordinates to load observations.</p>
+            <h2>{emptyState?.title || "No observation loaded"}</h2>
+            <p>
+              {emptyState?.message || "Enter coordinates to load observations."}
+            </p>
           </div>
         )}
         {current && !loaded && entry?.status !== "error" && (

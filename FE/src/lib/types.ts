@@ -4,6 +4,7 @@ export type Query = {
   start_utc?: string;
   end_utc?: string;
   fov_arcsec?: number;
+  min_interval_days?: number;
 };
 export type Frame = {
   id: string;
@@ -28,6 +29,7 @@ export type Observation = {
   status: "pending" | "loading" | "ready" | "failed";
   reason?: string;
   frame_id?: string;
+  time_sample?: boolean;
 };
 export type Sequence = {
   id: string;
@@ -45,7 +47,12 @@ export type Manifest = {
   retrieved_at?: string;
   cached?: boolean;
   discovery_complete?: boolean;
-  processing?: { stretch?: { vmin?: number; vmax?: number; units?: string } };
+  processing?: {
+    stretch?: { vmin?: number; vmax?: number; units?: string };
+    min_interval_days?: number;
+    initial_detector?: string;
+    initial_observation_ids?: string[];
+  };
   grid?: string;
   stretch?: string;
 };

@@ -9,6 +9,7 @@ class Query(BaseModel):
     ra_deg: float = Field(ge=0, lt=360)
     dec_deg: float = Field(ge=-90, le=90)
     fov_arcsec: float = Field(default=300, ge=30, le=1800)
+    min_interval_days: float = Field(default=60, ge=0, le=3650)
     start_utc: datetime | None = None
     end_utc: datetime | None = None
 
@@ -76,6 +77,7 @@ class ObservationRecord(BaseModel):
     status: Literal["pending", "loading", "ready", "failed"] = "pending"
     reason: str | None = None
     frame_id: str | None = None
+    time_sample: bool = True
 
 
 class Sequence(BaseModel):

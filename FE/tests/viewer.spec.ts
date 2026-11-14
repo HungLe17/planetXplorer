@@ -71,7 +71,9 @@ test("browse plays single-frame wavelength groups; matched mode explains why it 
 }) => {
   await setup(page);
   await expect(
-    page.getByText("Unmatched observations; brightness is not directly comparable."),
+    page.getByText(
+      "Unmatched observations; brightness is not directly comparable.",
+    ),
   ).toBeVisible();
   await page.locator("#speed").selectOption("4");
   await page.getByRole("button", { name: "Play", exact: true }).click();
@@ -83,7 +85,9 @@ test("browse plays single-frame wavelength groups; matched mode explains why it 
   await expect(
     page.getByRole("button", { name: "Play", exact: true }),
   ).toBeDisabled();
-  await expect(page.getByText("One matched frame loaded.")).toBeVisible();
+  await expect(
+    page.getByText("One checked frame in this matched group."),
+  ).toBeVisible();
   await page
     .getByRole("button", { name: "Browse all 3 images", exact: true })
     .click();

@@ -18,11 +18,11 @@ from astropy.wcs import WCS
 from PIL import Image
 from reproject import reproject_interp
 
-from .archive import Archive, ArchiveError, Observation
+from .archive import Archive, ArchiveError, Observation, evenly_spaced
 from .config import Settings
 from .schemas import Frame, Manifest, Query, ObservationRecord, Sequence, SpectralSample
 
-PIPELINE_VERSION = "2.1.0"
+PIPELINE_VERSION = "2.2.0"
 # SOURCE (21) identifies known objects, not defective pixels. Mask all other bits.
 # Official IRSA flag semantics: https://irsa.ipac.caltech.edu/onlinehelp/spherex/spherex/sp.html
 SOURCE_BIT = 1 << 21
@@ -273,6 +273,24 @@ def atomic_json(path: Path, value: dict):
     temp.replace(path)
 
 
+def time_sample(
+    observations: list[Observation], gap_days: float, limit: int | None = None
+) -> list[Observation]:
+    """Keep separate observing dates, including the latest possible endpoint.
+
+    This is temporal sampling, not a claim of spectral compatibility or quality.
+    The complete catalog remains available for explicit downloads.
+    """
+    ordered = sorted(observations, key=lambda o: (o.mjd, o.identity))
+    selected = []
+    for obs in ordered:
+        if not selected or obs.mjd - selected[-1].mjd >= gap_days:
+            selected.append(obs)
+    if len(selected) > 1:
+        selected[-1] = ordered[-1]
+    return evenly_spaced(selected, limit) if limit is not None else selected
+
+
 class Pipeline:
     def __init__(self, settings: Settings, archive: Archive):
         self.settings, self.archive = settings, archive
@@ -284,6 +302,24 @@ class Pipeline:
         observations, notes = self.archive.search(
             query, time.monotonic() + self.settings.metadata_seconds
         )
+        groups = {
+            d: time_sample(
+                [o for o in observations if o.detector == d], query.min_interval_days
+            )
+            for d in ("D1", "D2", "D3", "D4", "D5", "D6")
+        }
+        detector = max(
+            groups,
+            key=lambda d: (
+                len(groups[d]),
+                groups[d][-1].mjd - groups[d][0].mjd if groups[d] else 0,
+            ),
+        )
+        initial = time_sample(
+            groups[detector], query.min_interval_days,
+            min(self.settings.batch_size, self.settings.max_frames),
+        )
+        sampled_ids = {o.identity for group in groups.values() for o in group}
         result = Manifest(
             query=query,
             retrieved_at=datetime.now(UTC).isoformat(),
@@ -303,6 +339,7 @@ class Pipeline:
                     .isoformat(),
                     detector=o.detector,
                     release=o.release,
+                    time_sample=o.identity in sampled_ids,
                 )
                 for o in observations
             ],
@@ -310,21 +347,16 @@ class Pipeline:
                 "version": PIPELINE_VERSION,
                 "revision": 0,
                 "batch_size": self.settings.batch_size,
+                "min_interval_days": query.min_interval_days,
+                "initial_detector": detector,
+                "initial_observation_ids": [o.identity for o in initial],
                 "flag_policy": "mask all FLAGS except SOURCE (bit 21)",
                 "zodi_subtracted": False,
                 "psf_matched": False,
                 "spectral_sampling": "nearest_native_pixel; IMAGE in MJy/sr; 1-sigma from VARIANCE; WCS-WAVE visualization wavelengths; no background subtraction or PSF/aperture correction",
             },
         )
-        # Start one detector in chronological order; every other record remains loadable.
-        counts = {
-            d: sum(o.detector == d for o in observations)
-            for d in ("D1", "D2", "D3", "D4", "D5", "D6")
-        }
-        detector = max(counts, key=counts.get)
-        ids = [o.identity for o in observations if o.detector == detector][
-            : self.settings.batch_size
-        ]
+        ids = [o.identity for o in initial]
         return self.load(result, ids, directory, job_id, report)
 
     def load(

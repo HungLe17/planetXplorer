@@ -123,6 +123,14 @@ Identical active searches reuse the same job. Existing images remain accessible 
 
 The frontend contract is preserved: `manifest.frames` includes image URL, acquisition time, detector, wavelength/bandwidth, release, source URL, observation ID, and warnings. The manifest also records query, WCS, processing version, fixed display stretch, mask fractions, and omitted exposures.
 
+## Month-spaced initial selection
+
+Pipeline version `2.2.0` adds query parameter `min_interval_days` (default `60`, allowed `0` to `3650`). Discovery retains the complete catalog. Within each detector, representative dates respect the requested minimum gap; when multiple dates fit, the final representative is moved to the latest available exposure without reducing that gap. The initial detector is chosen by representative count and date span. At most eight representatives are downloaded, spread across the full available span if there are more than a batch. This replaces loading the earliest adjacent exposures.
+
+Each observation exposes `time_sample`. Processing metadata includes `initial_detector`, `initial_observation_ids`, and `min_interval_days`. The frontend starts with that detector and hides closely spaced records by default, while All exposures and the detector filter expose the rest. Checkboxes control timeline membership; Load checked requests only checked pending/failed IDs, with bounded batches. Explicit `/load` requests can still retrieve closely spaced exposures. Temporal sampling does not merge images or establish spectral compatibility.
+
+Redeploy both applications and run a fresh search. Older prepared bundles are bypassed by the processing-version check. Zero spacing and shorter intervals remain available for rapid motion or variability work. The front end reports actual acquisition-date gaps and span independently of playback delay.
+
 ## Spectral samples
 
 Pipeline version `2.1.0` adds `frame.spectral_sample` to each newly processed image. This contains native pixel indices and sky coordinates, wavelength/bandwidth, surface brightness (`value_mjy_sr`), uncertainty (`sigma_mjy_sr`), flags, method, and any rejection reason. Old prepared bundles are bypassed when their pipeline version differs; rebuild them with the proof script if needed. Redeploy both applications and submit a fresh search to obtain samples.

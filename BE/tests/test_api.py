@@ -262,7 +262,7 @@ def test_catalog_preview_assets_and_incremental_load_endpoint(tmp_path):
     query = Query(ra_deg=133.795129, dec_deg=-7.245147)
     source = "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/test.fits"
     observations = [
-        Observation(f"record-{i}", source, 60800.7 + i, "D6", "DR1") for i in range(3)
+        Observation(f"record-{i}", source, 60800.7 + i * 65, "D6", "DR1") for i in range(3)
     ]
 
     class Recorded:
@@ -270,7 +270,7 @@ def test_catalog_preview_assets_and_incremental_load_endpoint(tmp_path):
             return observations, []
 
         def fetch(self, obs, query, path, deadline):
-            if obs.identity == "record-1":
+            if obs.identity == "record-2":
                 release.wait(4)
             shutil.copyfile(Path(__file__).parent / "fixtures" / "wise-d6.fits", path)
             return source

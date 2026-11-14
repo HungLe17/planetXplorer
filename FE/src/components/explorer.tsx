@@ -47,6 +47,7 @@ import {
   loadObservations,
 } from "@/lib/api";
 import { parseQuery, queryUrl } from "@/lib/view-url";
+import { elapsedTime } from "@/lib/observation-time";
 const empty: Frame[] = [];
 const stamp = (date?: string) =>
   date
@@ -124,10 +125,13 @@ export default function Explorer() {
   const [settingsOpen, setSettingsOpen] = useState(true);
   const [datesOpen, setDatesOpen] = useState(false);
   const [fov, setFov] = useState("300");
-  const draftKey = JSON.stringify([ra, dec, fov, start, end]);
+  const [spacing, setSpacing] = useState("60");
+  const draftKey = JSON.stringify([ra, dec, fov, spacing, start, end]);
   const [fieldJobId, setFieldJobId] = useState("");
   const [sequenceId, setSequenceId] = useState("");
   const [viewMode, setViewMode] = useState<"browse" | "matched">("browse");
+  const [timelineIds, setTimelineIds] = useState<Set<string> | null>(null);
+  const [showAllRecords, setShowAllRecords] = useState(false);
   const [loop, setLoop] = useState(true);
   const [statusFilter, setStatusFilter] = useState("");
   const [recordSearch, setRecordSearch] = useState("");
@@ -143,16 +147,47 @@ export default function Explorer() {
     activeJob = useRef<string | null>(null);
   const [displayedQuery, setDisplayedQuery] = useState<Query | null>(null);
   const allFrames = manifest?.frames || empty;
+  const initialIds = manifest?.processing?.initial_observation_ids;
+  const selectedIds = useMemo(
+    () =>
+      timelineIds ||
+      new Set(initialIds || allFrames.map((f) => f.observation_id)),
+    [timelineIds, initialIds, allFrames],
+  );
+  const selectedFrames = useMemo(
+    () => allFrames.filter((f) => selectedIds.has(f.observation_id)),
+    [allFrames, selectedIds],
+  );
+  const selectionRef = useRef(selectedIds);
+  useLayoutEffect(() => {
+    selectionRef.current = selectedIds;
+  }, [selectedIds]);
   const sequences = manifest?.sequences || [];
+  const sequenceCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const frame of selectedFrames)
+      if (frame.sequence_id)
+        counts.set(frame.sequence_id, (counts.get(frame.sequence_id) || 0) + 1);
+    return counts;
+  }, [selectedFrames]);
+  const sequenceCount = (id: string) => sequenceCounts.get(id) || 0;
+  const rankedSequences = useMemo(
+    () =>
+      [...sequences].sort(
+        (a, b) =>
+          (sequenceCounts.get(b.id) || 0) - (sequenceCounts.get(a.id) || 0) ||
+          b.frame_ids.length - a.frame_ids.length,
+      ),
+    [sequences, sequenceCounts],
+  );
   const sequence =
-    sequences.find((s) => s.id === sequenceId) ||
-    [...sequences].sort((a, b) => b.frame_ids.length - a.frame_ids.length)[0];
+    sequences.find((s) => s.id === sequenceId) || rankedSequences[0];
   const frames = useMemo(
     () =>
       viewMode === "matched" && sequence
-        ? allFrames.filter((f) => f.sequence_id === sequence.id)
-        : allFrames,
-    [allFrames, viewMode, sequence?.id],
+        ? selectedFrames.filter((f) => f.sequence_id === sequence.id)
+        : selectedFrames,
+    [selectedFrames, viewMode, sequence?.id],
   );
   const index = Math.max(
     0,
@@ -207,14 +242,37 @@ export default function Explorer() {
       (observations || []).filter(
         (o) =>
           (!detectorFilter || o.detector === detectorFilter) &&
+          (showAllRecords || o.time_sample !== false) &&
           (!statusFilter || o.status === statusFilter) &&
           (!recordSearch ||
             `${o.id} ${o.observed_at} ${o.release}`
               .toLowerCase()
               .includes(recordSearch.toLowerCase())),
       ),
-    [observations, detectorFilter, statusFilter, recordSearch],
+    [observations, detectorFilter, statusFilter, recordSearch, showAllRecords],
   );
+  const visibleIds = observations
+    ? filteredObservations.map((o) => o.id)
+    : allFrames.map((f) => f.observation_id);
+  const allVisibleChecked =
+    visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
+  const someVisibleChecked = visibleIds.some((id) => selectedIds.has(id));
+  const checkedToLoad = (observations || [])
+    .filter(
+      (o) =>
+        selectedIds.has(o.id) &&
+        (o.status === "pending" || o.status === "failed"),
+    )
+    .map((o) => o.id);
+  function includeObservation(id: string, checked = true) {
+    setPlaying(false);
+    setTimelineIds((previous) => {
+      const next = new Set(previous || selectionRef.current);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }
   const pendingCount = filteredObservations.filter(
     (o) => o.status === "pending",
   ).length;
@@ -227,17 +285,13 @@ export default function Explorer() {
     manifest?.processing?.stretch;
   const unmatchedFrames =
     viewMode === "browse" &&
-    new Set(allFrames.map((f) => f.sequence_id || f.detector)).size > 1;
+    new Set(selectedFrames.map((f) => f.sequence_id || f.detector)).size > 1;
   function setMode(mode: "browse" | "matched") {
     if (mode === viewMode) return;
     setPlaying(false);
     setViewMode(mode);
-    if (mode === "matched" && (!sequence || sequence.frame_ids.length < 2))
-      setSequenceId(
-        [...sequences].sort(
-          (a, b) => b.frame_ids.length - a.frame_ids.length,
-        )[0]?.id || "",
-      );
+    if (mode === "matched" && (!sequence || sequenceCount(sequence.id) < 2))
+      setSequenceId(rankedSequences[0]?.id || "");
   }
   function exportCatalog() {
     const quote = (v: unknown) => `"${String(v ?? "").replaceAll('"', '""')}"`;
@@ -288,6 +342,7 @@ export default function Explorer() {
         detector?: string;
         all?: boolean;
         recordIds?: string[];
+        includeFailed?: boolean;
       },
     ) => {
       controller.current?.abort();
@@ -300,6 +355,13 @@ export default function Explorer() {
       setDismissedDraft("");
       setProgressDismissed(false);
       setPreviousDismissed(false);
+      if (more)
+        setTimelineIds(
+          new Set([
+            ...selectionRef.current,
+            ...(more.ids || more.recordIds || []),
+          ]),
+        );
       if (!more) setPlaying(false);
       setCommitted(query);
       if (!more) {
@@ -321,6 +383,11 @@ export default function Explorer() {
               more.detector,
             )
           : await submit(query, abort.signal);
+        const attempted = new Set(
+          more?.includeFailed
+            ? more.ids || more.recordIds?.slice(0, 8) || []
+            : [],
+        );
         let deadline = Date.now() + (more ? 150000 : 180000);
         if (abort.signal.aborted || current !== generation.current) {
           void cancelJob(id).catch(() => {});
@@ -383,7 +450,12 @@ export default function Explorer() {
                   targetSelected = true;
                 }
               }
-              if (!published && !more) setFocusedFrame(null);
+              if (!published && !more) {
+                setFocusedFrame(null);
+                setTimelineIds(null);
+                setShowAllRecords(false);
+                setDetectorFilter(result.processing?.initial_detector || "");
+              }
               published = true;
             }
           }
@@ -404,17 +476,19 @@ export default function Explorer() {
             const remaining =
               job.manifest.observations?.filter(
                 (o) =>
-                  o.status === "pending" &&
+                  (o.status === "pending" ||
+                    (more?.includeFailed &&
+                      o.status === "failed" &&
+                      !attempted.has(o.id))) &&
                   (!more?.detector || o.detector === more.detector) &&
                   (!more?.recordIds || more.recordIds.includes(o.id)),
               ) || [];
             if (more?.all && remaining.length) {
-              await loadObservations(
-                id,
-                abort.signal,
-                more.recordIds ? remaining.slice(0, 8).map((o) => o.id) : [],
-                more.detector,
-              );
+              const nextIds = more.recordIds
+                ? remaining.slice(0, 8).map((o) => o.id)
+                : [];
+              nextIds.forEach((id) => attempted.add(id));
+              await loadObservations(id, abort.signal, nextIds, more.detector);
               deadline = Date.now() + 150000;
               continue;
             }
@@ -535,14 +609,16 @@ export default function Explorer() {
         s = params.get("start") || "",
         e = params.get("end") || "";
       const field = params.get("fov") || "300";
+      const interval = params.get("spacing") ?? "60";
       setFov(field);
+      setSpacing(interval);
       setRa(r);
       setDec(d);
       setStart(s);
       setEnd(e);
       if (s || e) setDatesOpen(true);
       try {
-        const query = parseQuery(r, d, s, e, field);
+        const query = parseQuery(r, d, s, e, field, interval);
         // Strict Mode cleans up its first mount before this task runs.
         queueMicrotask(() => {
           if (!abort.signal.aborted) void load(query);
@@ -625,7 +701,7 @@ export default function Explorer() {
     e.preventDefault();
     if (busy) return;
     try {
-      void load(parseQuery(ra, dec, start, end, fov));
+      void load(parseQuery(ra, dec, start, end, fov, spacing));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -764,9 +840,23 @@ export default function Explorer() {
                   </div>
                 </div>
                 <div className="dataset-field">
-                  <label htmlFor="dataset">Dataset</label>
-                  <select id="dataset" disabled>
-                    <option>SPHEREx / IRSA</option>
+                  <label htmlFor="observation-spacing">
+                    Observation spacing
+                  </label>
+                  <select
+                    id="observation-spacing"
+                    value={spacing}
+                    onChange={(e) => setSpacing(e.target.value)}
+                  >
+                    {!["0", "30", "60", "90", "180", "365"].includes(
+                      spacing,
+                    ) && <option value={spacing}>{spacing} days</option>}
+                    <option value="60">At least 2 months (60 days)</option>
+                    <option value="90">At least 3 months (90 days)</option>
+                    <option value="180">At least 6 months (180 days)</option>
+                    <option value="365">At least 1 year (365 days)</option>
+                    <option value="30">At least 1 month (30 days)</option>
+                    <option value="0">All exposures</option>
                   </select>
                 </div>
                 <button
@@ -839,6 +929,7 @@ export default function Explorer() {
                         setInvert(false);
                         setSpeed(1);
                         setFov("300");
+                        setSpacing("60");
                         setError("");
                         setNotice("");
                       }}
@@ -1000,6 +1091,7 @@ export default function Explorer() {
               !busy &&
               dismissedDraft !== draftKey &&
               (Number(fov) !== (committed.fov_arcsec || 300) ||
+                Number(spacing) !== (committed.min_interval_days ?? 60) ||
                 Number(ra) !== committed.ra_deg ||
                 Number(dec) !== committed.dec_deg ||
                 start !== (committed.start_utc?.slice(0, 10) || "") ||
@@ -1112,16 +1204,13 @@ export default function Explorer() {
                           setPlaying(false);
                         }}
                       >
-                        {[...sequences]
+                        {rankedSequences
                           .filter((g) => g.frame_ids.length)
-                          .sort(
-                            (a, b) => b.frame_ids.length - a.frame_ids.length,
-                          )
                           .map((g) => (
                             <option key={g.id} value={g.id}>
                               {g.detector} / {g.wavelength_um.toFixed(3)}{" "}
-                              microns / {g.frame_ids.length} frame
-                              {g.frame_ids.length === 1 ? "" : "s"}
+                              microns / {sequenceCount(g.id)} checked /{" "}
+                              {g.frame_ids.length} loaded
                             </option>
                           ))}
                       </select>
@@ -1136,7 +1225,7 @@ export default function Explorer() {
                     >
                       {unmatchedFrames
                         ? "Unmatched observations; brightness is not directly comparable."
-                        : `${allFrames.length} loaded image${allFrames.length === 1 ? "" : "s"}`}
+                        : `${selectedFrames.length} image${selectedFrames.length === 1 ? "" : "s"} in timeline`}
                     </span>
                   )}
                 </div>
@@ -1156,6 +1245,18 @@ export default function Explorer() {
                 invert={invert}
                 grid={manifest?.grid}
                 unmatchedFrames={unmatchedFrames}
+                emptyState={
+                  allFrames.length || observations?.length
+                    ? {
+                        title: selectedIds.size
+                          ? "No checked images loaded"
+                          : "No observations selected",
+                        message: selectedIds.size
+                          ? "Load the checked observations, or choose a matched group containing checked images."
+                          : "Check observations in the list to add them to the timeline.",
+                      }
+                    : undefined
+                }
               />
               <div className="playback">
                 <div className="transport">
@@ -1274,21 +1375,40 @@ export default function Explorer() {
                       : ""}
                   </span>
                 </div>
+                {frames.length > 1 && (
+                  <div
+                    className="timeline-dates"
+                    aria-label="Observation time separation"
+                  >
+                    <span>
+                      Actual span:{" "}
+                      {elapsedTime(
+                        frames[0].observed_at,
+                        frames[frames.length - 1].observed_at,
+                      )}
+                    </span>
+                    <span>
+                      {index > 0
+                        ? `${elapsedTime(frames[index - 1].observed_at, frames[index].observed_at)} since previous`
+                        : "First observation"}
+                    </span>
+                  </div>
+                )}
               </div>
               {frames.length === 1 && (
                 <div className="playback-guidance">
                   {viewMode === "matched" ? (
                     <>
-                      <span>One matched frame loaded.</span>
-                      {allFrames.length > 1 && (
+                      <span>One checked frame in this matched group.</span>
+                      {selectedFrames.length > 1 && (
                         <button onClick={() => setMode("browse")}>
-                          Browse all {allFrames.length} images
+                          Browse all {selectedFrames.length} images
                         </button>
                       )}
                     </>
                   ) : (
                     <span>
-                      One image loaded. Load more observations to play.
+                      One image in timeline. Check or load another to play.
                     </span>
                   )}
                 </div>
@@ -1406,14 +1526,17 @@ export default function Explorer() {
                 <Layers size={14} />
                 <strong>Observations</strong>
                 <span className="count-badge">
-                  {observations?.length ?? allFrames.length} images
+                  {observations
+                    ? filteredObservations.length
+                    : allFrames.length}{" "}
+                  shown
                 </span>
                 {observations && (
                   <span
                     className="pointing-count"
-                    title="Unique observation IDs before the detector suffix. One pointing can contribute multiple detector images."
+                    title={`${pointingCount} distinct pointings. The complete archive catalog remains available; closely spaced exposures are hidden by default.`}
                   >
-                    {pointingCount} pointings
+                    {observations.length} archive matches
                   </span>
                 )}
                 <ChevronDown size={14} />
@@ -1480,6 +1603,14 @@ export default function Explorer() {
                         value={recordSearch}
                         onChange={(e) => setRecordSearch(e.target.value)}
                       />
+                      <label className="exposure-toggle">
+                        <input
+                          type="checkbox"
+                          checked={showAllRecords}
+                          onChange={(e) => setShowAllRecords(e.target.checked)}
+                        />
+                        All exposures
+                      </label>
                       <span>
                         {
                           filteredObservations.filter(
@@ -1572,10 +1703,75 @@ export default function Explorer() {
                     </div>
                   </>
                 )}
+                {observations?.length || allFrames.length ? (
+                  <div className="timeline-selection">
+                    <span>
+                      {selectedFrames.length} images in timeline
+                      {checkedToLoad.length
+                        ? ` / ${checkedToLoad.length} checked to load`
+                        : ""}
+                    </span>
+                    {checkedToLoad.length > 0 && (
+                      <button
+                        className="button"
+                        disabled={busy || !committed}
+                        onClick={() => {
+                          if (committed)
+                            void load(committed, {
+                              jobId: fieldJobId,
+                              all: true,
+                              recordIds: checkedToLoad,
+                              includeFailed: true,
+                            });
+                        }}
+                      >
+                        Load checked ({checkedToLoad.length})
+                      </button>
+                    )}
+                    <button
+                      className="clear-timeline"
+                      disabled={!selectedIds.size}
+                      onClick={() => {
+                        setPlaying(false);
+                        setTimelineIds(new Set());
+                      }}
+                    >
+                      Clear timeline
+                    </button>
+                  </div>
+                ) : null}
                 <div className="table-scroll">
                   <table>
                     <thead>
                       <tr>
+                        <th className="timeline-check-cell">
+                          <input
+                            type="checkbox"
+                            aria-label="Select all visible observations for timeline"
+                            checked={allVisibleChecked}
+                            disabled={!visibleIds.length}
+                            ref={(node) => {
+                              if (node)
+                                node.indeterminate =
+                                  someVisibleChecked && !allVisibleChecked;
+                            }}
+                            onChange={(e) => {
+                              const checked = e.target.checked;
+                              setPlaying(false);
+                              setTimelineIds((previous) => {
+                                const next = new Set(
+                                  previous || selectionRef.current,
+                                );
+                                visibleIds.forEach((id) => {
+                                  if (checked) next.add(id);
+                                  else next.delete(id);
+                                });
+                                return next;
+                              });
+                            }}
+                          />
+                          <span className="sr-only">Timeline</span>
+                        </th>
                         <th>Frame</th>
                         <th>Acquired · UTC</th>
                         <th>Detector</th>
@@ -1594,6 +1790,16 @@ export default function Explorer() {
                                   frame?.observation_id === o.id ? "active" : ""
                                 }
                               >
+                                <td className="timeline-check-cell">
+                                  <input
+                                    type="checkbox"
+                                    aria-label={`Include ${o.id} in timeline`}
+                                    checked={selectedIds.has(o.id)}
+                                    onChange={(e) =>
+                                      includeObservation(o.id, e.target.checked)
+                                    }
+                                  />
+                                </td>
                                 <td>
                                   <button
                                     disabled={busy && !f}
@@ -1606,6 +1812,7 @@ export default function Explorer() {
                                     onClick={() => {
                                       setDockExpanded(false);
                                       if (f) {
+                                        includeObservation(f.observation_id);
                                         setSequenceId(f.sequence_id || "");
                                         setViewMode("browse");
                                         setFocusedFrame(f.url);
@@ -1644,17 +1851,32 @@ export default function Explorer() {
                               </tr>
                             );
                           })
-                        : frames.map((f, i) => (
+                        : allFrames.map((f, i) => (
                             <tr
                               key={f.id}
-                              className={i === index ? "active" : ""}
+                              className={f.url === frame?.url ? "active" : ""}
                             >
+                              <td className="timeline-check-cell">
+                                <input
+                                  type="checkbox"
+                                  aria-label={`Include ${f.observation_id} in timeline`}
+                                  checked={selectedIds.has(f.observation_id)}
+                                  onChange={(e) =>
+                                    includeObservation(
+                                      f.observation_id,
+                                      e.target.checked,
+                                    )
+                                  }
+                                />
+                              </td>
                               <td>
                                 <button
                                   aria-label={`Select frame ${i + 1}`}
                                   onClick={() => {
                                     setPlaying(false);
-                                    setIndex(i);
+                                    includeObservation(f.observation_id);
+                                    setViewMode("browse");
+                                    setFocusedFrame(f.url);
                                   }}
                                 >
                                   {String(i + 1).padStart(2, "0")}

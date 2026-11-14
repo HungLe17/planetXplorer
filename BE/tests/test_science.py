@@ -14,10 +14,11 @@ from app.pipeline import (
     decode,
     render_pngs,
     target_grid,
+    time_sample,
 )
 from app.schemas import Query
 
-QUERY = Query(ra_deg=133.795129, dec_deg=-7.245147)
+QUERY = Query(ra_deg=133.795129, dec_deg=-7.245147, min_interval_days=0)
 SOURCE = "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/test.fits"
 OBS = Observation("2025W19_1B_0116_1D6", SOURCE, 60800.700028, "D6", "DR1")
 FIXTURE = Path(__file__).parent / "fixtures" / "wise-d6.fits"
@@ -277,10 +278,64 @@ def test_distinct_wavelength_groups_are_preserved_and_later_batches_extend_them(
     locked = {g.id: dict(g.stretch) for g in result.sequences}
     old_frames = {f.id for f in result.frames}
     result = pipeline.load(
-        result, ["obs-4", "obs-5"], tmp_path, "groups", lambda _: None
+        result, [o.id for o in result.observations if o.status == "pending"], tmp_path, "groups", lambda _: None
     )
     assert len(result.frames) == 6 and len(result.sequences) == 2
     assert old_frames.issubset({f.id for f in result.frames})
     assert all(g.stretch == locked[g.id] for g in result.sequences)
     assert all(len(g.frame_ids) == 3 for g in result.sequences)
     assert all(o.status == "ready" for o in result.observations)
+
+
+def test_time_sampling_keeps_monthly_gaps_and_latest_endpoint():
+    days = [0, 1, 2, 59, 60, 61, 120, 121, 180, 240, 241]
+    observations = [replace(OBS, identity=str(i), mjd=OBS.mjd + day) for i, day in enumerate(days)]
+    sampled = time_sample(list(reversed(observations)), 60)
+    assert [o.mjd - OBS.mjd for o in sampled] == [0, 60, 120, 180, 241]
+    limited = time_sample(observations, 60, 3)
+    assert len(limited) == 3 and limited[0] == observations[0] and limited[-1] == observations[-1]
+    assert all(b.mjd - a.mjd >= 60 for a, b in zip(limited, limited[1:]))
+    assert len(time_sample(observations[:4], 60)) == 1
+    assert len(time_sample(observations, 0)) == len(observations)
+
+
+def test_default_query_downloads_spaced_epochs_and_preserves_explicit_close_exposures(tmp_path):
+    import shutil
+    from app.config import Settings
+    from app.pipeline import Pipeline
+
+    days = [epoch * 65 + offset for epoch in range(9) for offset in range(5)]
+    observations = [replace(OBS, identity=f"visit-{i}", mjd=OBS.mjd + day) for i, day in enumerate(days)]
+    downloaded = []
+
+    class RecordedArchive:
+        def search(self, *_):
+            return observations, []
+
+        def fetch(self, obs, query, path, deadline):
+            downloaded.append(obs)
+            shutil.copyfile(FIXTURE, path)
+            return SOURCE
+
+    query = Query(ra_deg=QUERY.ra_deg, dec_deg=QUERY.dec_deg)
+    assert query.min_interval_days == 60
+    pipeline = Pipeline(Settings(), RecordedArchive())
+    result = pipeline.run(query, tmp_path, "spaced", lambda _: None)
+    selected = sorted(downloaded, key=lambda o: o.mjd)
+    assert len(selected) == 8
+    assert selected[0] == observations[0] and selected[-1] == observations[-1]
+    assert all(b.mjd - a.mjd >= 60 for a, b in zip(selected, selected[1:]))
+    assert len(result.observations) == 45
+    assert sum(o.time_sample for o in result.observations) == 9
+    assert result.processing["initial_detector"] == "D6"
+    assert result.processing["initial_observation_ids"] == [o.identity for o in selected]
+    close = result.observations[1]
+    assert not close.time_sample and close.status == "pending"
+    result = pipeline.load(result, [close.id], tmp_path, "spaced", lambda _: None)
+    assert close.status == "ready" and len(result.frames) == 9
+
+
+@pytest.mark.parametrize("gap", [-1, 3651, float("inf"), float("nan")])
+def test_invalid_observation_spacing(gap):
+    with pytest.raises(ValueError):
+        Query(ra_deg=1, dec_deg=2, min_interval_days=gap)
