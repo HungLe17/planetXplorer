@@ -237,10 +237,11 @@ export default function SkyViewer({
     ctx.imageSmoothingEnabled = false;
     ctx.filter = invert ? "invert(1)" : "none";
     ctx.drawImage(img, g.x, g.y, g.w, g.h);
-    ctx.filter = "none";
     if (display.markFlagged && warningPixels?.length) {
       const cellWidth = g.w / img.width,
         cellHeight = g.h / img.height;
+      ctx.save();
+      ctx.filter = "none";
       ctx.fillStyle = "#ffbd45";
       ctx.beginPath();
       for (const i of warningPixels) {
@@ -252,6 +253,7 @@ export default function SkyViewer({
         );
       }
       ctx.fill();
+      ctx.restore();
     }
   }
   async function exportImage(animated: boolean) {

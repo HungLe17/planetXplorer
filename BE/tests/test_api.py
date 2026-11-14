@@ -367,6 +367,9 @@ def test_running_frame_and_timings_survive_late_download(tmp_path, cancel):
             assert preview.startswith(b"\x89PNG")
             pixels = client.get(assets + frame["pixels"]).content
             assert len(pixels) == 49 * 49 * 4
+            quality = client.get(assets + frame["quality"])
+            assert quality.headers["content-type"] == "application/octet-stream"
+            assert len(quality.content) == 49 * 49 * 9
             assert client.get(assets + "raw-0.fits").status_code == 404
             assert client.get(assets + "manifest.json").status_code == 404
             assert any(t["stage"] == "first_frame" for t in current["timings"])
@@ -386,6 +389,7 @@ def test_running_frame_and_timings_survive_late_download(tmp_path, cancel):
         assert frame["id"] == records[-1]["id"]
         assert client.get(frame["url"]).content == preview
         assert client.get(assets + frame["pixels"]).content == pixels
+        assert client.get(assets + frame["quality"]).content == quality.content
         timings = client.get(assets + "timings.json").json()["timings"]
         assert timings == final["timings"]
         assert timings[-1]["stage"] == "total"
