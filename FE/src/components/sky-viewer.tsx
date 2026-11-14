@@ -1,6 +1,20 @@
 "use client";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Maximize2, Minus, Plus } from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  Expand,
+  Maximize2,
+  Minimize2,
+  Minus,
+  Plus,
+  RotateCcw,
+} from "lucide-react";
 import { download } from "@/lib/workspace";
 import {
   exportName,
@@ -10,8 +24,16 @@ import {
 } from "@/lib/imaging";
 import type { Query } from "@/lib/types";
 import { useAssets } from "@/lib/use-assets";
+import {
+  zoomAt,
+  MIN_ZOOM,
+  MAX_ZOOM,
+  type Point,
+  type ViewTransform,
+} from "@/lib/view-transform";
+
 type FrameImage = HTMLCanvasElement | HTMLImageElement;
-function loadPreview(url: string, signal: AbortSignal) {
+function loadPreview(url: string, signal: AbortSignal, retry = false) {
   return new Promise<HTMLImageElement>((resolve, reject) => {
     const image = new Image();
     const stop = () => {
@@ -29,7 +51,10 @@ function loadPreview(url: string, signal: AbortSignal) {
       reject(new Error("Image unavailable"));
     };
     image.crossOrigin = "anonymous";
-    image.src = url;
+    const source = new URL(url, window.location.href);
+    if (retry && /^https?:$/.test(source.protocol))
+      source.searchParams.set("retry", String(Date.now()));
+    image.src = source.href;
   });
 }
 export default function SkyViewer({
@@ -39,7 +64,6 @@ export default function SkyViewer({
   onFailure,
   onPaint,
   zoom: magnification,
-  onZoom,
   invert,
   grid,
   display,
@@ -49,9 +73,9 @@ export default function SkyViewer({
   colors,
   onPixel,
   message,
+  unmatchedFrames = false,
 }: {
   zoom: number;
-  onZoom: (zoom: number) => void;
   invert: boolean;
   grid?: string;
   display: Display;
@@ -61,6 +85,7 @@ export default function SkyViewer({
   colors: number[][];
   onPixel: (x: number, y: number) => void;
   message: string;
+  unmatchedFrames?: boolean;
   frames: RenderedFrame[];
   index: number;
   onReady: (ready: boolean) => void;
@@ -69,25 +94,126 @@ export default function SkyViewer({
 }) {
   const canvas = useRef<HTMLCanvasElement>(null),
     box = useRef<HTMLDivElement>(null),
-    drag = useRef<{ x: number; y: number } | null>(null);
-  const origin = useRef({ x: 0, y: 0 });
+    shell = useRef<HTMLDivElement>(null);
+  const pointers = useRef(new Map<number, Point>());
+  const lastPointerType = useRef("");
+  const multiTouch = useRef(false),
+    tap = useRef<{ point: Point; time: number } | null>(null),
+    start = useRef<Point | null>(null);
+  const [fullscreen, setFullscreen] = useState(false),
+    [fullscreenSupported, setFullscreenSupported] = useState(false);
   const [exportError, setExportError] = useState("");
+  const [exporting, setExporting] = useState(false);
+  const exportController = useRef<AbortController | null>(null);
+  useEffect(() => () => exportController.current?.abort(), []);
+  const current = frames[index];
   const urls = useMemo(
-    () => frames.filter((f) => !f.canvas).map((f) => f.url),
-    [frames],
+    () =>
+      frames
+        .slice(Math.max(0, index - 2), index + 3)
+        .filter((f) => !f.canvas)
+        .map((f) => f.url),
+    [frames, index],
   );
-  const { assets } = useAssets(urls, loadPreview);
-  const images = frames.map((f) => f.canvas ?? assets.get(f.url)?.value);
-  const currentImage = images[index];
-  const currentWarnings = frames[index]?.warningPixels;
+  const { assets, retry } = useAssets(urls, loadPreview, 12);
+  const entry =
+    current && !current.canvas ? assets.get(current.url) : undefined;
+  const currentImage = current?.canvas ?? entry?.value;
+  const currentWarnings = current?.warningPixels;
   const loaded = !!currentImage;
-  const failed = urls.some((url) => assets.get(url)?.error);
   useEffect(() => {
     onReady(loaded);
-  }, [loaded, onReady]);
+    if (entry?.error) onFailure();
+  }, [current?.url, entry?.error, loaded, onReady, onFailure]);
+  const transform = useRef<ViewTransform>({
+    scale: magnification,
+    x: display.panX,
+    y: display.panY,
+  });
+  useLayoutEffect(() => {
+    transform.current = {
+      scale: magnification,
+      x: display.panX,
+      y: display.panY,
+    };
+  }, [magnification, display.panX, display.panY]);
+  const fitScale = useCallback(() => {
+    const rect = box.current?.getBoundingClientRect();
+    return currentImage && rect?.width && rect.height
+      ? Math.min(
+          rect.width / currentImage.width,
+          rect.height / currentImage.height,
+        ) * 0.94
+      : 1;
+  }, [currentImage]);
+  const commit = useCallback(
+    (next: ViewTransform) => {
+      const rect = box.current?.getBoundingClientRect();
+      if (currentImage && rect) {
+        const scale = fitScale() * next.scale;
+        const mx = Math.max(0, (currentImage.width * scale - rect.width) / 2);
+        const my = Math.max(0, (currentImage.height * scale - rect.height) / 2);
+        next = {
+          ...next,
+          x: Math.max(-mx, Math.min(mx, next.x)),
+          y: Math.max(-my, Math.min(my, next.y)),
+        };
+      }
+      const previous = transform.current;
+      if (
+        next.scale === previous.scale &&
+        next.x === previous.x &&
+        next.y === previous.y
+      )
+        return;
+      transform.current = next;
+      update({ zoom: next.scale, panX: next.x, panY: next.y });
+    },
+    [currentImage, fitScale, update],
+  );
+  const fit = useCallback(() => commit({ scale: 1, x: 0, y: 0 }), [commit]);
+  const anchor = useCallback((x: number, y: number) => {
+    const r = box.current!.getBoundingClientRect();
+    return { x: x - r.left - r.width / 2, y: y - r.top - r.height / 2 };
+  }, []);
+  const zoom = useCallback(
+    (factor: number, point: Point = { x: 0, y: 0 }) =>
+      commit(
+        zoomAt(transform.current, transform.current.scale * factor, point),
+      ),
+    [commit],
+  );
   useEffect(() => {
-    if (failed) onFailure();
-  }, [failed, onFailure]);
+    const element = box.current;
+    if (!element) return;
+    const wheel = (event: WheelEvent) => {
+      if (!loaded) return;
+      event.preventDefault();
+      const delta =
+        event.deltaY *
+        (event.deltaMode === 1
+          ? 16
+          : event.deltaMode === 2
+            ? element.clientHeight
+            : 1);
+      zoom(
+        Math.exp(
+          -Math.max(-1000, Math.min(1000, delta)) *
+            (event.ctrlKey ? 0.01 : 0.0025),
+        ),
+        anchor(event.clientX, event.clientY),
+      );
+    };
+    element.addEventListener("wheel", wheel, { passive: false });
+    return () => element.removeEventListener("wheel", wheel);
+  }, [loaded, zoom, anchor]);
+  useEffect(() => {
+    setFullscreenSupported(!!shell.current?.requestFullscreen);
+    const changed = () =>
+      setFullscreen(document.fullscreenElement === shell.current);
+    document.addEventListener("fullscreenchange", changed);
+    return () => document.removeEventListener("fullscreenchange", changed);
+  }, []);
   function geometry(img: FrameImage, width: number, height: number) {
     const fit =
       Math.min(width / img.width, height / img.height) * 0.94 * magnification;
@@ -113,7 +239,8 @@ export default function SkyViewer({
     ctx.drawImage(img, g.x, g.y, g.w, g.h);
     ctx.filter = "none";
     if (display.markFlagged && warningPixels?.length) {
-      const cellWidth = g.w / img.width, cellHeight = g.h / img.height;
+      const cellWidth = g.w / img.width,
+        cellHeight = g.h / img.height;
       ctx.fillStyle = "#ffbd45";
       ctx.beginPath();
       for (const i of warningPixels) {
@@ -128,7 +255,10 @@ export default function SkyViewer({
     }
   }
   async function exportImage(animated: boolean) {
-    if (!query || !box.current) return;
+    if (!query || !box.current || !current || exportController.current) return;
+    const controller = new AbortController();
+    exportController.current = controller;
+    setExporting(true);
     setExportError("");
     try {
       const rect = box.current.getBoundingClientRect();
@@ -142,14 +272,17 @@ export default function SkyViewer({
       };
       const rgb = numeric && display.mode === "rgb";
       const exportFrames = animated ? frames : [frames[index]];
-      const qualityLegend = display.markFlagged && exportFrames.some((f) => f.warningPixels?.length);
+      const qualityLegend =
+        display.markFlagged &&
+        exportFrames.some((f) => f.warningPixels?.length);
       const scaleHeight = rgb ? 72 : 48;
-      const legendHeight = display.legend ? scaleHeight + (qualityLegend ? 18 : 0) : 0;
+      const legendHeight = display.legend
+        ? scaleHeight + (qualityLegend ? 18 : 0)
+        : 0;
       const out = document.createElement("canvas");
       out.width = Math.round(width);
       out.height = height + legendHeight;
       const ctx = out.getContext("2d", { willReadFrequently: true })!;
-      const source = animated ? images : [currentImage];
       const name = exportName(
         animated ? frames : [frames[index]],
         query,
@@ -157,8 +290,16 @@ export default function SkyViewer({
       );
       const lib = animated ? await import("gifenc") : null,
         gif = lib?.GIFEncoder();
-      for (const [i, img] of source.entries()) {
-        if (!img) throw Error("An observation is still loading.");
+      for (const frame of exportFrames) {
+        controller.signal.throwIfAborted();
+        const img =
+          frame.canvas ??
+          assets.get(frame.url)?.value ??
+          (await loadPreview(
+            frame.url,
+            AbortSignal.any([controller.signal, AbortSignal.timeout(30000)]),
+          ));
+
         ctx.filter = "none";
         ctx.fillStyle = "#000";
         ctx.fillRect(0, 0, out.width, out.height);
@@ -166,7 +307,7 @@ export default function SkyViewer({
         ctx.beginPath();
         ctx.rect(0, 0, width, height);
         ctx.clip();
-        paint(ctx, img, width, height, exportFrames[i].warningPixels);
+        paint(ctx, img, width, height, frame.warningPixels);
         ctx.restore();
         ctx.fillStyle = "white";
         ctx.font = "13px monospace";
@@ -230,6 +371,7 @@ export default function SkyViewer({
           );
         }
       }
+      controller.signal.throwIfAborted();
       if (gif) {
         gif.finish();
         download(
@@ -242,7 +384,10 @@ export default function SkyViewer({
         download(blob, name + ".png");
       }
     } catch (err) {
-      setExportError((err as Error).message);
+      if (!controller.signal.aborted) setExportError((err as Error).message);
+    } finally {
+      exportController.current = null;
+      if (!controller.signal.aborted) setExporting(false);
     }
   }
   useLayoutEffect(() => {
@@ -252,21 +397,27 @@ export default function SkyViewer({
       if (!c || !b) return;
       const rect = b.getBoundingClientRect(),
         ratio = window.devicePixelRatio || 1;
-      c.width = rect.width * ratio;
-      c.height = rect.height * ratio;
+      const width = Math.round(rect.width * ratio),
+        height = Math.round(rect.height * ratio);
+      if (c.width !== width) c.width = width;
+      if (c.height !== height) c.height = height;
       const ctx = c.getContext("2d");
       if (!ctx) return;
-      ctx.scale(ratio, ratio);
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
       ctx.clearRect(0, 0, rect.width, rect.height);
       if (!currentImage) return;
       paint(ctx, currentImage, rect.width, rect.height, currentWarnings);
       if (query) onPaint(query);
     };
     draw();
-    const observer = new ResizeObserver(draw);
+    const observer = new ResizeObserver(() => {
+      commit(transform.current);
+      draw();
+    });
     if (box.current) observer.observe(box.current);
     return () => observer.disconnect();
   }, [
+    commit,
     currentImage,
     query,
     onPaint,
@@ -277,70 +428,201 @@ export default function SkyViewer({
     currentWarnings,
     display.markFlagged,
   ]);
-  const zoom = (n: number) =>
-    onZoom(Math.max(1, Math.min(8, magnification * n)));
+  function endPointer(
+    event: React.PointerEvent<HTMLCanvasElement>,
+    cancelled = false,
+  ) {
+    const point = pointers.current.get(event.pointerId);
+    pointers.current.delete(event.pointerId);
+    if (event.currentTarget.hasPointerCapture(event.pointerId))
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    if (pointers.current.size) return;
+    if (
+      !cancelled &&
+      !multiTouch.current &&
+      start.current &&
+      currentImage &&
+      Math.hypot(
+        event.clientX - start.current.x,
+        event.clientY - start.current.y,
+      ) < 4
+    ) {
+      const r = event.currentTarget.getBoundingClientRect();
+      const g = geometry(currentImage, r.width, r.height);
+      const x = Math.floor(
+        ((event.clientX - r.left - g.x) * currentImage.width) / g.w,
+      );
+      const y = Math.floor(
+        ((event.clientY - r.top - g.y) * currentImage.height) / g.h,
+      );
+      if (x >= 0 && y >= 0 && x < currentImage.width && y < currentImage.height)
+        onPixel(x, y);
+    }
+    if (
+      !cancelled &&
+      !multiTouch.current &&
+      point &&
+      event.pointerType === "touch" &&
+      start.current &&
+      Math.hypot(point.x - start.current.x, point.y - start.current.y) < 8
+    ) {
+      const now = performance.now();
+      if (
+        tap.current &&
+        now - tap.current.time < 300 &&
+        Math.hypot(
+          point.x - tap.current.point.x,
+          point.y - tap.current.point.y,
+        ) < 24
+      ) {
+        transform.current.scale > 1.01
+          ? fit()
+          : zoom(2, anchor(point.x, point.y));
+        tap.current = null;
+      } else tap.current = { point, time: now };
+    }
+    multiTouch.current = false;
+    start.current = null;
+  }
   return (
-    <div className="sky-shell">
+    <div className="sky-shell" ref={shell}>
       <div
         className={"sky-canvas " + (frames.length ? "has-image" : "")}
         ref={box}
       >
         <canvas
           ref={canvas}
+          tabIndex={0}
+          role="img"
+          aria-description="Select a pixel to inspect. Drag to pan. Pinch or scroll to zoom. Plus and minus zoom; F fits the image; 1 shows native pixels."
           aria-label={
-            frames.length
-              ? `Observation ${index + 1} of ${frames.length}. ${frames[index]?.observed_at}`
+            current
+              ? `Observation ${index + 1} of ${frames.length}. ${current.observed_at}`
               : "No observation loaded"
           }
-          onPointerDown={(e) => {
-            if (!frames.length) return;
-            e.currentTarget.setPointerCapture(e.pointerId);
-            origin.current = { x: e.clientX, y: e.clientY };
-            drag.current = { x: e.clientX, y: e.clientY };
-          }}
-          onPointerMove={(e) => {
-            if (drag.current) {
-              const dx = e.clientX - drag.current.x,
-                dy = e.clientY - drag.current.y;
-              update({ panX: display.panX + dx, panY: display.panY + dy });
-              drag.current = { x: e.clientX, y: e.clientY };
-            }
-          }}
-          onPointerUp={(e) => {
-            const img = currentImage,
-              box = e.currentTarget.getBoundingClientRect();
+          onPointerDown={(event) => {
             if (
-              img &&
-              Math.hypot(
-                e.clientX - origin.current.x,
-                e.clientY - origin.current.y,
-              ) < 4
-            ) {
-              const g = geometry(img, box.width, box.height);
-              const x = Math.floor(
-                  ((e.clientX - box.left - g.x) / g.w) * img.width,
-                ),
-                y = Math.floor(
-                  ((e.clientY - box.top - g.y) / g.h) * img.height,
-                );
-              if (x >= 0 && y >= 0 && x < img.width && y < img.height)
-                onPixel(x, y);
+              !loaded ||
+              (event.pointerType === "mouse" && event.button !== 0)
+            )
+              return;
+            lastPointerType.current = event.pointerType;
+            event.preventDefault();
+            event.currentTarget.focus({ preventScroll: true });
+            try {
+              event.currentTarget.setPointerCapture(event.pointerId);
+            } catch {}
+            pointers.current.set(event.pointerId, {
+              x: event.clientX,
+              y: event.clientY,
+            });
+            if (pointers.current.size === 1)
+              start.current = { x: event.clientX, y: event.clientY };
+            if (pointers.current.size > 1) {
+              multiTouch.current = true;
+              tap.current = null;
             }
-            drag.current = null;
           }}
-          onPointerCancel={() => {
-            drag.current = null;
+          onPointerMove={(event) => {
+            const before = pointers.current.get(event.pointerId);
+            if (!before) return;
+            const old = [...pointers.current.values()];
+            pointers.current.set(event.pointerId, {
+              x: event.clientX,
+              y: event.clientY,
+            });
+            const next = [...pointers.current.values()];
+            if (old.length >= 2) {
+              const distance = (p: Point[]) =>
+                Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+              const midpoint = (p: Point[]) =>
+                anchor((p[0].x + p[1].x) / 2, (p[0].y + p[1].y) / 2);
+              if (distance(old) > 0)
+                commit(
+                  zoomAt(
+                    transform.current,
+                    (transform.current.scale * distance(next)) / distance(old),
+                    midpoint(old),
+                    midpoint(next),
+                  ),
+                );
+            } else
+              commit({
+                ...transform.current,
+                x: transform.current.x + event.clientX - before.x,
+                y: transform.current.y + event.clientY - before.y,
+              });
+          }}
+          onPointerUp={(event) => endPointer(event)}
+          onPointerCancel={(event) => endPointer(event, true)}
+          onLostPointerCapture={(event) =>
+            pointers.current.delete(event.pointerId)
+          }
+          onDoubleClick={(event) => {
+            if (
+              loaded &&
+              event.detail > 0 &&
+              lastPointerType.current !== "touch"
+            )
+              transform.current.scale > 1.01
+                ? fit()
+                : zoom(2, anchor(event.clientX, event.clientY));
+          }}
+          onKeyDown={(event) => {
+            if (!loaded || event.ctrlKey || event.metaKey) return;
+            if (["+", "=", "-", "0", "f", "1"].includes(event.key)) {
+              event.preventDefault();
+              event.stopPropagation();
+              if (event.key === "-") zoom(1 / 1.25);
+              else if (["0", "f"].includes(event.key)) fit();
+              else if (event.key === "1")
+                commit({ scale: 1 / fitScale(), x: 0, y: 0 });
+              else zoom(1.25);
+            }
           }}
         />
+        {current && loaded && (
+          <div className="image-readout">
+            {fullscreen && unmatchedFrames && (
+              <span>Browse / unmatched observations</span>
+            )}
+
+            <span>
+              {current.detector}
+              {current.wavelength_um != null
+                ? ` / ${current.wavelength_um.toFixed(3)} µm`
+                : ""}
+            </span>
+            <time dateTime={current.observed_at}>
+              {new Date(current.observed_at)
+                .toISOString()
+                .replace("T", " ")
+                .replace(/\.\d{3}Z$/, " UTC")}
+            </time>
+          </div>
+        )}
         {!frames.length && (
           <div className="sky-empty">
             <h2>No observation loaded</h2>
             <p>{message || "Enter coordinates to load observations."}</p>
           </div>
         )}
-        {!!frames.length && !loaded && (
+        {current && !loaded && !entry?.error && (
           <div className="sky-empty">
-            <p>Preparing observation images…</p>
+            <p>Loading image…</p>
+          </div>
+        )}
+        {entry?.error && (
+          <div className="image-error" role="alert">
+            <p>This image could not be loaded.</p>
+            <button
+              className="button"
+              onClick={() => current && retry(current.url)}
+            >
+              <RotateCcw size={13} />
+              Retry image
+            </button>
+            <span>You can also step to another frame.</span>
           </div>
         )}
         {!!frames.length && grid?.includes("north up") && (
@@ -352,11 +634,14 @@ export default function SkyViewer({
         )}
       </div>
       <div className="export-tools">
-        <button disabled={!loaded} onClick={() => void exportImage(false)}>
+        <button
+          disabled={!loaded || exporting}
+          onClick={() => void exportImage(false)}
+        >
           PNG
         </button>
         <button
-          disabled={!images.every(Boolean) || frames.length < 2}
+          disabled={!loaded || exporting || frames.length < 2}
           onClick={() => void exportImage(true)}
         >
           GIF
@@ -387,13 +672,18 @@ export default function SkyViewer({
             Mark flagged pixels ({currentWarnings.length})
           </label>
         )}
+        {exporting && <span role="status">Preparing export…</span>}
         {exportError && <span role="alert">{exportError}</span>}
       </div>
       <div className="sky-bottom">
+        <span className="gesture-hint">
+          Drag to pan · Scroll or pinch to zoom
+        </span>
         <div className="zoom-buttons">
           <button
             aria-label="Zoom out"
-            disabled={!loaded || magnification === 1}
+            title="Zoom out (-)"
+            disabled={!loaded || magnification <= MIN_ZOOM}
             onClick={() => zoom(1 / 1.25)}
           >
             <Minus size={14} />
@@ -401,30 +691,65 @@ export default function SkyViewer({
           <input
             aria-label="Display zoom"
             type="range"
-            min="1"
-            max="8"
-            step=".25"
+            min={MIN_ZOOM}
+            max={MAX_ZOOM}
+            step="0.01"
             value={magnification}
-            onChange={(e) => onZoom(Number(e.target.value))}
+            onChange={(event) =>
+              commit(
+                zoomAt(transform.current, Number(event.target.value), {
+                  x: 0,
+                  y: 0,
+                }),
+              )
+            }
             disabled={!loaded}
           />
-          <span>{Math.round(magnification * 100)}%</span>
+          <span aria-label="Viewport zoom">
+            {Math.round(magnification * 100)}%
+          </span>
           <button
             aria-label="Zoom in"
-            disabled={!loaded || magnification === 8}
+            title="Zoom in (+)"
+            disabled={!loaded || magnification >= MAX_ZOOM}
             onClick={() => zoom(1.25)}
           >
             <Plus size={14} />
           </button>
           <button
+            className="text-tool"
             aria-label="Reset viewport"
+            title="Fit image and reset pan (F or 0)"
             disabled={!loaded}
+            onClick={fit}
+          >
+            <Maximize2 size={13} />
+            Fit
+          </button>
+          <button
+            className="text-tool"
+            aria-label="Native pixel scale"
+            title="One image pixel per CSS pixel (1)"
+            disabled={!loaded}
+            onClick={() => commit({ scale: 1 / fitScale(), x: 0, y: 0 })}
+          >
+            1:1
+          </button>
+          <button
+            aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+            title={
+              fullscreenSupported
+                ? "Toggle fullscreen"
+                : "Fullscreen is unavailable in this browser"
+            }
+            disabled={!fullscreenSupported}
             onClick={() => {
-              update({ panX: 0, panY: 0 });
-              onZoom(1);
+              if (document.fullscreenElement === shell.current)
+                void document.exitFullscreen();
+              else void shell.current?.requestFullscreen().catch(() => {});
             }}
           >
-            <Maximize2 size={14} />
+            {fullscreen ? <Minimize2 size={14} /> : <Expand size={14} />}
           </button>
         </div>
       </div>

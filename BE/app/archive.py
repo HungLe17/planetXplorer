@@ -17,7 +17,6 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from math import isfinite
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlsplit
@@ -254,7 +253,7 @@ class Archive:
                         if time.monotonic() >= deadline:
                             raise ArchiveError("IRSA SIA metadata search timed out")
                         total += len(chunk)
-                        if total > 2_000_000:
+                        if total > 32_000_000:
                             raise ArchiveError(
                                 "IRSA SIA metadata exceeded the response limit"
                             )
@@ -417,7 +416,7 @@ class Archive:
                                 "IRSA metadata search timed out. Try again later or narrow the date range."
                             )
                         total += len(chunk)
-                        if total > 2_000_000:
+                        if total > 32_000_000:
                             raise ArchiveError(
                                 "Archive metadata exceeded the response limit"
                             )
@@ -455,7 +454,7 @@ class Archive:
             )
             if obs.detector != identity[1][-2:]:
                 continue
-            if not isfinite(obs.mjd):
+            if not 40000 < obs.mjd < 100000:
                 raise ArchiveError("IRSA observation time has unexpected units")
             previous = unique.get(obs.identity)
             if previous is None or self._version_key(obs) > self._version_key(previous):

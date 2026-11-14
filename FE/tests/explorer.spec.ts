@@ -656,3 +656,199 @@ test("a missing job reports a possible restart or expiry", async ({ page }) => {
     "backend may have restarted",
   );
 });
+
+test("streams the catalog, separates wavelengths, and loads another detector", async ({
+  page,
+}) => {
+  let complete = false;
+  const frame = (id: string, detector: string, sequence_id: string) => ({
+    id,
+    url: `/api/assets/catalog/${id}.png`,
+    observation_id: id,
+    observed_at: "2026-01-01T00:00:00Z",
+    detector,
+    sequence_id,
+  });
+  const records = ["d1a", "d1b", "d2", "d3", "d4", "d5", "d6"].map((id, i) => ({
+    id,
+    source_url: "https://example.test/fixture",
+    observed_at: "2026-01-01T00:00:00Z",
+    detector: i < 2 ? "D1" : `D${i}`,
+    release: "DR1",
+    status: i < 3 ? "ready" : "pending",
+  }));
+  const frames = [
+    frame("d1a", "D1", "s1"),
+    frame("d1b", "D1", "s1"),
+    frame("d2", "D2", "s2"),
+  ];
+  const sequences = [
+    {
+      id: "s1",
+      detector: "D1",
+      wavelength_um: 1,
+      processing_version: "test",
+      frame_ids: ["d1a", "d1b"],
+      stretch: {},
+    },
+    {
+      id: "s2",
+      detector: "D2",
+      wavelength_um: 2,
+      processing_version: "test",
+      frame_ids: ["d2"],
+      stretch: {},
+    },
+  ];
+  await page.route("**/api/jobs", (r) =>
+    r.fulfill({ status: 202, json: { job_id: "catalog" } }),
+  );
+  await page.route("**/api/jobs/catalog", (r) =>
+    r.fulfill({
+      json: {
+        status: complete ? "complete" : "running",
+        stage: "fetch:1/8",
+        manifest: {
+          frames: complete ? frames : frames.slice(0, 1),
+          observations: records,
+          sequences: complete
+            ? sequences
+            : [{ ...sequences[0], frame_ids: ["d1a"] }],
+        },
+      },
+    }),
+  );
+  await page.route("**/api/assets/**", (r) =>
+    r.fulfill({ contentType: "image/png", body: Buffer.from(png, "base64") }),
+  );
+  let requested: unknown;
+  await page.route("**/api/jobs/catalog/load", (r) => {
+    requested = r.request().postDataJSON();
+    records[6].status = "ready";
+    frames.push(frame("d6", "D6", "s6"));
+    sequences.push({
+      id: "s6",
+      detector: "D6",
+      wavelength_um: 5,
+      processing_version: "test",
+      frame_ids: ["d6"],
+      stretch: {},
+    });
+    return r.fulfill({ status: 202, json: { job_id: "catalog" } });
+  });
+  await page.goto("/explore?ra=330&dec=-50");
+  await expect(
+    page.getByRole("button", { name: "Zoom in", exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Searching", exact: true }),
+  ).toBeDisabled();
+  await expect(page.getByLabel("Observations", { exact: true })).toContainText(
+    "d6",
+  );
+  complete = true;
+  await expect(
+    page.getByRole("button", { name: "Play", exact: true }),
+  ).toBeEnabled();
+  await page.getByRole("button", { name: "Matched", exact: true }).click();
+  await page.getByLabel("Wavelength sequence").selectOption("s2");
+  await expect(
+    page.getByRole("button", { name: "Play", exact: true }),
+  ).toBeDisabled();
+  await expect(page.getByLabel("Frame details", { exact: true })).toContainText(
+    "D2",
+  );
+  await page.getByLabel("Detector", { exact: true }).selectOption("D6");
+  await page.getByRole("button", { name: "Load", exact: true }).click();
+  await page.getByRole("button", { name: "Matched", exact: true }).click();
+  await page.getByLabel("Wavelength sequence").selectOption("s6");
+  expect(requested).toEqual({ observation_ids: ["d6"] });
+  await expect(page.getByLabel("Frame details", { exact: true })).toContainText(
+    "D6",
+  );
+  await expect(
+    page.getByRole("button", { name: "Play", exact: true }),
+  ).toBeDisabled();
+  await page.getByLabel("Wavelength sequence").selectOption("s1");
+  await expect(
+    page.getByRole("button", { name: "Play", exact: true }),
+  ).toBeEnabled();
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.screenshot({
+    path: "test-results/catalog-desktop.png",
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByLabel("Frame details", { exact: true })).toHaveCount(
+    0,
+  );
+  await page.screenshot({
+    path: "test-results/catalog-mobile.png",
+    fullPage: true,
+  });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBeTruthy();
+});
+
+test("field size is submitted independently of image magnification", async ({
+  page,
+}) => {
+  let query: unknown;
+  await page.route("**/api/jobs", (r) => {
+    query = r.request().postDataJSON();
+    return r.fulfill({ status: 202, json: { job_id: "fov" } });
+  });
+  await page.route("**/api/jobs/fov", (r) =>
+    r.fulfill({ json: { status: "complete", manifest: { frames: [] } } }),
+  );
+  await page.goto("/");
+  await page.getByRole("textbox", { name: "Right ascension" }).fill("330");
+  await page.getByRole("textbox", { name: "Declination" }).fill("-50");
+  await page.getByRole("spinbutton", { name: "Field of view (arcsec)" }).fill("600");
+  await page
+    .getByRole("button", { name: "Search observations", exact: true })
+    .click();
+  await expect
+    .poll(() => query)
+    .toEqual({ ra_deg: 330, dec_deg: -50, fov_arcsec: 600, live: true });
+  await expect(page).toHaveURL(/fov=600/);
+});
+
+test("load all continues through batches until the selected detector is exhausted", async ({
+  page,
+}) => {
+  const records = Array.from({ length: 3 }, (_, i) => ({
+    id: `record${i}`,
+    source_url: "https://example.test/test-only",
+    observed_at: "2026-01-01T00:00:00Z",
+    detector: "D6",
+    release: "DR1",
+    status: "pending",
+  }));
+  let calls = 0;
+  await page.route("**/api/jobs", (r) =>
+    r.fulfill({ status: 202, json: { job_id: "loadall" } }),
+  );
+  await page.route("**/api/jobs/loadall", (r) =>
+    r.fulfill({
+      json: {
+        status: "complete",
+        manifest: { frames: [], observations: records, sequences: [] },
+      },
+    }),
+  );
+  await page.route("**/api/jobs/loadall/load", (r) => {
+    records[calls++].status = "ready";
+    return r.fulfill({ status: 202, json: { job_id: "loadall" } });
+  });
+  await page.goto("/explore?ra=330&dec=-50");
+  await page.getByLabel("Detector", { exact: true }).selectOption("D6");
+  await page.getByRole("button", { name: "Load all D6", exact: true }).click();
+  await expect.poll(() => calls).toBe(3);
+  await expect(
+    page.getByRole("button", { name: "Load all D6", exact: true }),
+  ).toBeDisabled();
+});

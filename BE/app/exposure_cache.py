@@ -105,7 +105,8 @@ class ExposureCache:
             pixels = np.asarray(array, dtype="<f8")
             metadata = json.dumps(
                 {"frame": frame.model_dump(mode="json"), "shape": pixels.shape,
-                 "waves": wavelengths.tolist(), "bands": bandwidths.tolist()},
+                 "waves": [float(x) if np.isfinite(x) else None for x in wavelengths],
+                 "bands": [float(x) if np.isfinite(x) else None for x in bandwidths]},
                 separators=(",", ":"), allow_nan=False,
             )
             # Keep the measurements and their provenance in one atomic cache record.
@@ -140,7 +141,7 @@ class ExposureCache:
             quality = PixelQuality.from_bytes(sidecar, shape) if len(sidecar) else None
             if frame.quality and quality is None:
                 raise ValueError("Incomplete exposure quality data")
-            waves, bands = np.array(meta["waves"]), np.array(meta["bands"])
+            waves, bands = np.array(meta["waves"], dtype=float), np.array(meta["bands"], dtype=float)
             if array.ndim != 2 or waves.shape != (5,) or bands.shape != (5,):
                 raise ValueError("Inconsistent exposure dimensions")
             return CachedExposure(obs, frame, array, waves, bands, quality)

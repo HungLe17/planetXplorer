@@ -15,9 +15,9 @@ import truststore
 from .archive import Archive, ArchiveError
 from .config import ROOT, Settings
 from . import desi, surveys
-from .jobs import CapacityError, Jobs
+from .jobs import CapacityError, Jobs, prepared_manifest
 from .pipeline import Pipeline
-from .schemas import Job, Query, Submitted
+from .schemas import Job, Query, Submitted, LoadRequest
 
 
 def create_app(settings: Settings | None = None, pipeline=None):
@@ -79,6 +79,23 @@ def create_app(settings: Settings | None = None, pipeline=None):
             raise HTTPException(404, "Unknown or expired job")
         return result
 
+    @app.post("/api/jobs/{job_id}/load", response_model=Submitted, status_code=202)
+    def load_observations(job_id: str, body: LoadRequest, request: Request):
+        if not valid_id(job_id):
+            raise HTTPException(404, "Unknown field")
+        try:
+            return Submitted(
+                job_id=request.app.state.jobs.load_more(
+                    job_id, body.observation_ids, body.detector
+                )
+            )
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except CapacityError as exc:
+            raise HTTPException(429, str(exc), headers={"Retry-After": "10"}) from exc
+
     @app.get("/api/assets/{job_id}/{asset_id}")
     def asset(job_id: str, asset_id: str, request: Request):
         if not valid_id(job_id):
@@ -92,7 +109,7 @@ def create_app(settings: Settings | None = None, pipeline=None):
             if asset_id.endswith(".json")
             else "application/octet-stream" if asset_id.endswith(".bin") else "image/png",
             headers={
-                "Cache-Control": "private, max-age=300",
+                "Cache-Control": "private, no-cache" if asset_id.endswith(".json") else "private, max-age=300",
                 "X-Content-Type-Options": "nosniff",
             },
         )
@@ -119,9 +136,10 @@ def create_app(settings: Settings | None = None, pipeline=None):
     def presets():
         data = json.loads((ROOT / "presets.json").read_text(encoding="utf-8"))
         for preset in data:
-            preset["cached_manifest_available"] = (
-                settings.demo_dir / preset["id"] / "manifest.json"
-            ).is_file()
+            bundle = prepared_manifest(settings.demo_dir / preset["id"])
+            preset["cached_manifest_available"] = bool(bundle and bundle.query == Query(
+                ra_deg=preset["ra_deg"], dec_deg=preset["dec_deg"]
+            ))
             report = settings.cache_dir / "validation" / preset["id"] / "report.json"
             if not report.is_file():
                 report = ROOT / "validation" / f"{preset['id']}.json"

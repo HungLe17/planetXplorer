@@ -36,8 +36,8 @@ export function parseQuery(
 }
 export function angularWidth(input: string): number {
   const value = Number(input);
-  if (!Number.isFinite(value) || value < 60 || value > 1800)
-    throw Error("Field of view must be between 60 and 1800 arcseconds.");
+  if (!Number.isFinite(value) || value < 30 || value > 1800)
+    throw Error("Field of view must be between 30 and 1800 arcseconds.");
   return value;
 }
 export function queryUrl(query: Query, view?: unknown, frame?: string) {

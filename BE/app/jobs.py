@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import re
 import shutil
 import threading
 import time
@@ -11,8 +12,8 @@ from uuid import uuid4
 
 from .archive import ASSET_PREFIX, ORIGIN, RELEASES
 from .config import Settings
-from .pipeline import PIPELINE_VERSION, Pipeline, atomic_json
-from .schemas import Job, JobTiming, Manifest, Query
+from .pipeline import PIPELINE_VERSION, Pipeline, atomic_json, update_counts
+from .schemas import Job, JobTiming, Manifest, ObservationRecord, Query
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,32 @@ def result_status(manifest: Manifest) -> str:
     )
     partial = failures or len(manifest.frames) == 1 or manifest.processing.get("cache_fallback")
     return "partial" if partial else "complete"
+
+
+def prepared_manifest(folder: Path) -> Manifest | None:
+    try:
+        manifest = Manifest.model_validate_json((folder / "manifest.json").read_text(encoding="utf-8"))
+        if not manifest.frames or manifest.processing.get("version") not in {"1.0.0", PIPELINE_VERSION}:
+            return None
+        for frame in manifest.frames:
+            if not re.fullmatch(r"frame-(?:[0-9]{2,4}|[a-f0-9]{24})\.png", frame.id):
+                return None
+            stem = frame.id[:-4]
+            if frame.pixels and frame.pixels != stem + ".bin":
+                return None
+            if frame.quality and (not frame.pixels or frame.quality != stem + "-quality.bin"
+                                  or manifest.processing.get("version") != PIPELINE_VERSION):
+                return None
+            if any(not (folder / name).is_file() for name in (frame.id, frame.pixels, frame.quality) if name):
+                return None
+        return manifest
+    except (ValueError, OSError):
+        return None
+
+
+def cache_key(query: Query):
+    identity = (query.model_dump_json(), PIPELINE_VERSION, ORIGIN, ASSET_PREFIX, RELEASES)
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
 class Jobs:
@@ -85,11 +112,26 @@ class Jobs:
                 shutil.rmtree(directory)
         self.cache = {k: v for k, v in self.cache.items() if v in self.records}
 
+    def _check_storage(self):
+        size = 0
+        for path in self.settings.cache_dir.rglob("*"):
+            try:
+                if path.is_file():
+                    size += path.stat().st_size
+            except FileNotFoundError:
+                pass  # Another worker can finish/delete a temporary download during this scan.
+        excess = size + self.settings.max_download_bytes - self.settings.max_cache_bytes
+        if excess > 0 and isinstance(self.pipeline, Pipeline):
+            excess -= self.pipeline.exposure_cache.prune(excess)
+        if excess > 0:
+            raise CapacityError(
+                "Temporary storage is full; retry after cached jobs expire"
+            )
+
     def submit(self, query: Query) -> str:
         with self.lock:
             self.cleanup()
-            identity = (query.model_dump_json(), PIPELINE_VERSION, ORIGIN, ASSET_PREFIX, RELEASES)
-            key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+            key = cache_key(query)
             cached = self.cache.get(key)
             if cached and self.records[cached].status in ("running", "queued"):
                 return cached
@@ -108,20 +150,7 @@ class Jobs:
                 >= self.settings.max_jobs
             ):
                 raise CapacityError("The processing queue is full")
-            size = 0
-            for path in self.settings.cache_dir.rglob("*"):
-                try:
-                    if path.is_file():
-                        size += path.stat().st_size
-                except FileNotFoundError:
-                    pass  # Another worker can finish/delete a temporary download during this scan.
-            excess = size + self.settings.max_download_bytes - self.settings.max_cache_bytes
-            if excess > 0 and isinstance(self.pipeline, Pipeline):
-                excess -= self.pipeline.exposure_cache.prune(excess)
-            if excess > 0:
-                raise CapacityError(
-                    "Temporary storage is full; retry after cached jobs expire"
-                )
+            self._check_storage()
             job_id = uuid4().hex
             self.started[job_id] = time.monotonic()
             now = datetime.now(UTC)
@@ -154,34 +183,19 @@ class Jobs:
     def _demo(self, query: Query, directory: Path, job_id: str) -> Manifest | None:
         for name in ("barnard", "epsilon", "wise", "rw", "rdraconis"):
             folder = self.settings.demo_dir / name
-            source = folder / "manifest.json"
-            if not source.is_file():
+            manifest = prepared_manifest(folder)
+            if manifest is None or manifest.query != query:
                 continue
             try:
-                manifest = Manifest.model_validate_json(
-                    source.read_text(encoding="utf-8")
-                )
-                if (
-                    manifest.query != query
-                    or not manifest.frames
-                    or manifest.processing.get("version") not in {"1.0.0", PIPELINE_VERSION}
-                ):
-                    continue
-                allowed = {f"frame-{i:02}.png" for i in range(12)}
-                if any(
-                    f.id not in allowed or not (folder / f.id).is_file()
-                    for f in manifest.frames
-                ):
-                    continue
-                if any(f.pixels and (f.pixels != Path(f.id).with_suffix(".bin").name
-                       or not (folder / f.pixels).is_file()) for f in manifest.frames):
-                    continue
-                if any(f.quality and (
-                    not f.pixels or manifest.processing.get("version") != PIPELINE_VERSION
-                    or f.quality != f"{Path(f.id).stem}-quality.bin"
-                    or not (folder / f.quality).is_file()
-                ) for f in manifest.frames):
-                    continue
+                if not manifest.observations:
+                    manifest.discovery_complete = False
+                    manifest.observations = [
+                        ObservationRecord(id=f.observation_id, detector=f.detector, release=f.release,
+                                          observed_at=f.observed_at, source_url=f.source_url.split("?")[0],
+                                          status="ready", frame_id=f.id)
+                        for f in manifest.frames
+                    ]
+                    update_counts(manifest)
                 for frame in manifest.frames:
                     if frame.pixels:
                         shutil.copyfile(folder / frame.pixels, directory / frame.pixels)
@@ -225,6 +239,38 @@ class Jobs:
                 self.cache = {k: v for k, v in self.cache.items() if v != job_id}
             return job.model_copy(deep=True) if job else None
 
+    def load_more(self, job_id: str, ids: list[str], detector: str | None) -> str:
+        with self.lock:
+            self.cleanup()
+            job = self.records.get(job_id)
+            if job is None or job.manifest is None:
+                raise KeyError("Unknown or expired field; search again")
+            if job.status in ("running", "queued", "cancelling") or self.active_count() >= self.settings.max_jobs:
+                raise CapacityError("Wait for the current batch or retry when the queue has space")
+            manifest = job.manifest
+            records = {o.id: o for o in manifest.observations}
+            if any(i not in records for i in ids):
+                raise ValueError("Observation is not part of this field")
+            remaining = self.settings.max_frames - len(manifest.frames)
+            if remaining <= 0:
+                raise CapacityError("This field reached the loaded-image limit; narrow the date range")
+            requested = list(dict.fromkeys(ids)) if ids else [r.id for r in records.values() if r.status == "pending"]
+            selected = [i for i in requested if records[i].status != "ready"
+                        and (detector is None or records[i].detector == detector)]
+            selected = selected[:min(self.settings.batch_size, remaining)]
+            if not selected:
+                raise ValueError("No unloaded observations match this selection")
+            self._check_storage()
+            job.status = job.stage = "queued"
+            job.error = None
+            self.cancel_events[job_id] = threading.Event()
+            key = cache_key(manifest.query)
+            self.cache[key] = job_id
+            self.futures[job_id] = self.executor.submit(
+                self._run, job_id, manifest.query, self.root / job_id, key, selected
+            )
+            return job_id
+
     # Call under self.lock so polling always sees a consistent manifest and clock.
     def _timing(self, job, stage, duration=None, observation_id=None, outcome="ok"):
         elapsed = time.monotonic() - self.started[job.job_id]
@@ -261,7 +307,7 @@ class Jobs:
         except OSError:
             logger.exception("Could not persist timings for job %s", job.job_id)
 
-    def _run(self, job_id: str, query: Query, directory: Path, key: str):
+    def _run(self, job_id: str, query: Query, directory: Path, key: str, ids=None):
         job = self.records[job_id]
         cancelled = self.cancel_events[job_id]
 
@@ -291,7 +337,10 @@ class Jobs:
         try:
             if cancelled.is_set():
                 raise JobCancelled("Search cancelled")
-            if isinstance(self.pipeline, Pipeline):
+            if ids is not None:
+                result = self.pipeline.load(job.manifest, ids, directory, job_id, report,
+                                            publish=publish, timing=timing)
+            elif isinstance(self.pipeline, Pipeline):
                 result = self.pipeline.run(
                     query, directory, job_id, report, publish=publish, timing=timing
                 )
@@ -314,8 +363,16 @@ class Jobs:
             else:
                 self._publish(job, result)
                 job.status = result_status(result)
-            if job.status in ("failed", "cancelled") and self.cache.get(key) == job_id:
-                self.cache.pop(key)
+            if job.status in ("failed", "cancelled"):
+                if job.manifest:
+                    for record in job.manifest.observations:
+                        if record.status == "loading":
+                            record.status = "pending"
+                    update_counts(job.manifest)
+                    job.manifest.processing["revision"] = job.manifest.processing.get("revision", 0) + 1
+                    atomic_json(directory / "manifest.json", job.manifest.model_dump(mode="json"))
+                if self.cache.get(key) == job_id:
+                    self.cache.pop(key)
             job.expires_at = (datetime.now(UTC) + timedelta(seconds=self.settings.ttl_seconds)).isoformat()
             self._finish_timing(job)
 
@@ -334,7 +391,7 @@ class Jobs:
             allowed = self.published_assets.get(job_id, set()).copy()
             if job.status in ("complete", "partial", "cancelled", "failed"):
                 allowed.add("timings.json")
-            if job.status in ("complete", "partial"):
+            if job.manifest and job.status in ("complete", "partial", "cancelled", "failed"):
                 allowed.add("manifest.json")
             if asset_id not in allowed:
                 return None

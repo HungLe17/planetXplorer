@@ -20,21 +20,37 @@ const path = require("node:path");
       throw new Error("Submission failed: " + (await response.text()));
     const { job_id } = await response.json();
     await expect(
-      page.getByRole("button", { name: "Play", exact: true }),
-    ).toBeEnabled({ timeout: 60000 });
-    const acquisition = page
-      .locator(".detail-group")
-      .first()
-      .locator("dd")
-      .first();
-    const first = await acquisition.innerText();
-    await page.getByRole("button", { name: "Next frame", exact: true }).click();
-    const second = await acquisition.innerText();
-    if (first === second)
-      throw new Error("Displayed acquisition time did not advance");
-    const job = await (
-      await fetch("http://127.0.0.1:8000/api/jobs/" + job_id)
-    ).json();
+      page.getByRole("button", { name: "Zoom in", exact: true }),
+    ).toBeEnabled({ timeout: 180000 });
+    let job;
+    const deadline = Date.now() + 180000;
+    while (Date.now() < deadline) {
+      job = await (
+        await fetch("http://127.0.0.1:8000/api/jobs/" + job_id)
+      ).json();
+      if (["complete", "partial", "failed"].includes(job.status)) break;
+      await page.waitForTimeout(1000);
+    }
+    if (!job.manifest?.frames?.length)
+      throw new Error(job.error || "No archive-backed image was loaded");
+    const best = [...(job.manifest.sequences || [])].sort(
+      (a, b) => b.frame_ids.length - a.frame_ids.length,
+    )[0];
+    let first, second;
+    if (best?.frame_ids.length > 1) {
+      await page.getByRole("button", { name: "Matched", exact: true }).click();
+      await page.getByLabel("Wavelength sequence").selectOption(best.id);
+    }
+    if (best?.frame_ids.length > 1 || job.manifest.frames.length > 1) {
+      await expect(page.getByRole("button", { name: "Play", exact: true })).toBeEnabled();
+      const acquisition = page.locator(".detail-group").filter({
+        has: page.getByRole("heading", { name: "Acquisition", exact: true }),
+      }).locator("dd").first();
+      first = await acquisition.innerText();
+      await page.getByRole("button", { name: "Next frame", exact: true }).click();
+      await expect(acquisition).not.toHaveText(first);
+      second = await acquisition.innerText();
+    }
     const destination = path.join(__dirname, "..", ".cache", "integration");
     fs.mkdirSync(destination, { recursive: true });
     await page.screenshot({
@@ -45,6 +61,9 @@ const path = require("node:path");
       job_id,
       status: job.status,
       cached: job.manifest.cached,
+      observations: job.manifest.observations.length,
+      sequences: job.manifest.sequences.length,
+      largest_sequence: best?.frame_ids.length || 0,
       frames: job.manifest.frames.length,
       first,
       second,

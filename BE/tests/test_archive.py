@@ -349,3 +349,31 @@ def test_cutout_retry_and_first_byte_measure_separate_attempts(tmp_path):
     assert [(stage, identity, outcome) for stage, _, identity, outcome in timings] == [
         ("cutout_retry", obs.identity, "HTTP 503"), ("cutout_first_byte", obs.identity, "ok")
     ]
+
+
+def test_catalog_keeps_all_six_detectors_without_100_row_or_24_candidate_sampling():
+    a = archive_with(lambda _: httpx.Response(500))
+    try:
+        rows = []
+        for i in range(180):
+            detector = f"D{i % 6 + 1}"
+            identity = f"2025W19_1B_{i:04}_1{detector}"
+            rows.append(
+                {
+                    "uri": uri(identity=identity),
+                    "time_bounds_lower": str(60800 + i / 100),
+                    "energy_bandpassname": "SPHEREx-" + detector,
+                }
+            )
+        observations = a._select_rows(rows)
+        assert len(observations) == 180
+        assert {o.detector for o in observations} == {
+            "D1",
+            "D2",
+            "D3",
+            "D4",
+            "D5",
+            "D6",
+        }
+    finally:
+        a.close()

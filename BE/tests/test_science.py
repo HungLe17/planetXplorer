@@ -300,6 +300,16 @@ def test_live_candidate_yields_image_before_catalog_and_is_replaced(tmp_path):
     assert initial.observation_id == final.observation_id
     assert initial.pixels != final.pixels
     assert (tmp_path / initial.pixels).is_file()
+    assert all(len(s.frames) == 1 for s in snapshots)
+
+
+def test_shared_preview_supports_cached_frame_without_quality_sidecar(tmp_path):
+    from app.pixel_quality import PixelQuality
+    data = np.arange(25, dtype=float).reshape(5, 5)
+    quality = PixelQuality.from_detector(data, np.zeros_like(data, dtype="u4"), np.ones_like(data))
+    paths = [tmp_path/"older.png", tmp_path/"newer.png"]
+    render_pngs([data, data], paths, [None, quality])
+    assert np.array_equal(np.asarray(Image.open(paths[0])), np.asarray(Image.open(paths[1])))
 
 
 def test_partial_catalog_cannot_downgrade_preferred_cached_exposure(tmp_path):
@@ -330,3 +340,49 @@ def test_partial_catalog_cannot_downgrade_preferred_cached_exposure(tmp_path):
     assert result.cached and not result.processing["archive_complete"]
     assert result.processing["archive_products"] == {OBS.identity: OBS.uri}
     assert [f.release for f in result.frames] == ["DR1"]
+
+
+def test_distinct_wavelength_groups_are_preserved_and_later_batches_extend_them(
+    tmp_path, monkeypatch
+):
+    import shutil
+    import app.pipeline as pipeline_module
+    from app.config import Settings
+    from app.pipeline import Pipeline
+
+    observations = [
+        replace(OBS, identity=f"obs-{i}", mjd=OBS.mjd + i) for i in range(6)
+    ]
+
+    class Recorded:
+        def search(self, *_):
+            return observations, []
+
+        def fetch(self, obs, query, path, deadline):
+            shutil.copyfile(FIXTURE, path)
+            return SOURCE
+
+    original_decode = pipeline_module.decode
+
+    def spectral_fixture(path, obs, query, source):
+        c = original_decode(path, obs, query, source)
+        wavelength = 1.0 if int(obs.identity[-1]) % 2 == 0 else 2.0
+        return replace(
+            c, wavelengths=np.full(5, wavelength), bandwidths=np.full(5, 0.1)
+        )
+
+    monkeypatch.setattr(pipeline_module, "decode", spectral_fixture)
+    pipeline = Pipeline(Settings(batch_size=4), Recorded())
+    result = pipeline.run(QUERY, tmp_path, "groups", lambda _: None)
+    assert len(result.observations) == 6 and len(result.frames) == 4
+    assert len(result.sequences) == 2
+    locked = {g.id: dict(g.stretch) for g in result.sequences}
+    old_frames = {f.id for f in result.frames}
+    result = pipeline.load(
+        result, ["obs-4", "obs-5"], tmp_path, "groups", lambda _: None
+    )
+    assert len(result.frames) == 6 and len(result.sequences) == 2
+    assert old_frames.issubset({f.id for f in result.frames})
+    assert all(g.stretch == locked[g.id] for g in result.sequences)
+    assert all(len(g.frame_ids) == 3 for g in result.sequences)
+    assert all(o.status == "ready" for o in result.observations)

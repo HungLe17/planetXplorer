@@ -23,7 +23,12 @@ def test_prepared_barnard_quality_matches_preview_and_science(tmp_path):
         assert published["cached"]
         height, width = published["processing"]["output_shape"]
         n = height * width
-        saw_marker = False
+        center = (height // 2) * width + width // 2
+        expected_centers = {
+            "2025W34_2B_0030_4D6": 1661.5427,
+            "2026W12_1A_0610_1D6": 1544.3727,
+        }
+        assert {f["observation_id"] for f in published["frames"]} == set(expected_centers)
         for frame in published["frames"]:
             prefix = f"/api/assets/{job_id}/"
             quality = client.get(prefix + frame["quality"])
@@ -32,13 +37,12 @@ def test_prepared_barnard_quality_matches_preview_and_science(tmp_path):
             archived = np.frombuffer(quality.content, "<f4", n)
             flags = np.frombuffer(quality.content, "<u4", n, 4 * n)
             states = np.frombuffer(quality.content, "u1", n, 8 * n) & 0x7F
-            markers = states == 3
-            saw_marker |= bool(markers.any())
-            assert np.all(np.isnan(archived[markers]))
-            assert np.all((flags[markers] & (1 << 1)) != 0)
+            assert states[center] == 2
+            assert flags[center] == (1 << 1) | (1 << 21) | (1 << 26)
+            np.testing.assert_allclose(archived[center], expected_centers[frame["observation_id"]])
             science = np.frombuffer(client.get(prefix + frame["pixels"]).content, "<f4")
-            assert np.all(np.isnan(science[markers]))
-            preview = np.asarray(Image.open(BytesIO(client.get(frame["url"]).content)))
-            assert np.all(preview.reshape(n, 4)[markers] == 255)
-            assert np.all(preview.reshape(n, 4)[states == 0, 3] == 0)
-        assert saw_marker
+            assert np.isnan(science[center])
+            with Image.open(BytesIO(client.get(frame["url"]).content)) as image:
+                rgba = np.asarray(image).reshape(n, 4)
+                assert rgba[center, 3] == 255
+                assert np.array_equal(rgba[:, 3] > 0, np.isin(states, (1, 2, 3)))

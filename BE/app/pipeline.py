@@ -21,11 +21,11 @@ from astropy.wcs import WCS
 from PIL import Image
 from reproject import reproject_interp
 
-from .archive import Archive, ArchiveError, Observation, evenly_spaced
+from .archive import Archive, ArchiveError, Observation
 from .config import Settings
 from .exposure_cache import CachedExposure, ExposureCache
 from .pixel_quality import SOURCE_BIT, PixelQuality, PixelState
-from .schemas import Frame, Manifest, Query
+from .schemas import Frame, Manifest, ObservationRecord, Query, Sequence
 
 PIPELINE_VERSION = "2.0.0"
 # Quantitative samples retain the conservative mask independently of display policy.
@@ -93,9 +93,9 @@ def decode(path: Path, obs: Observation, query: Query, source: str) -> Cutout:
             for x, y in [(-1.5, -1.5), (-1.5, 1.5), (1.5, -1.5), (1.5, 1.5)]
         ]
         pixels = [wcs.world_to_pixel(c) for c in positions]
-        if any(not (0 <= x < shape[1] and 0 <= y < shape[0]) for x, y in pixels):
+        if not (0 <= pixels[0][0] < shape[1] and 0 <= pixels[0][1] < shape[0]):
             raise ValueError(
-                "Exposure does not cover the target and interior field samples"
+                "Exposure does not cover the target"
             )
         spectral_header = image.header.copy()
         # SIP describes celestial distortion, not the alternate spectral table WCS.
@@ -108,13 +108,17 @@ def decode(path: Path, obs: Observation, query: Query, source: str) -> Cutout:
         spectral.sip = None
         waves, bands = [], []
         for x, y in pixels:
+            if not (0 <= x < shape[1] and 0 <= y < shape[0]):
+                waves.append(float("nan"))
+                bands.append(float("nan"))
+                continue
             wave, band = spectral.pixel_to_world(x, y)
             waves.append(float(wave.to_value(u.um)))
             bands.append(float(band.to_value(u.um)))
         waves, bands = np.array(waves), np.array(bands)
         if (
-            not np.all(np.isfinite(waves))
-            or not np.all(np.isfinite(bands))
+            not np.isfinite(waves[0])
+            or not np.isfinite(bands[0])
             or np.any(bands <= 0)
         ):
             raise ValueError("Cutout spectral WCS is invalid")
@@ -211,20 +215,24 @@ def align(cutout: Cutout, grid: WCS, shape: tuple[int, int]) -> np.ndarray:
 
 
 def render_pngs(
-    arrays: list[np.ndarray], paths: list[Path], quality: list[PixelQuality] | None = None
+    arrays: list[np.ndarray], paths: list[Path], quality: list[PixelQuality | None] | None = None,
+    *, stretch: dict | None = None,
 ) -> dict:
     if quality is not None:
-        arrays = [q.display_values(a) for a, q in zip(arrays, quality, strict=True)]
+        arrays = [q.display_values(a) if q is not None else a for a, q in zip(arrays, quality, strict=True)]
     samples = np.concatenate([a[np.isfinite(a)] for a in arrays])
     # An overflow-only field has markers but no measured values for a stretch.
-    low, high = np.percentile(samples, [1, 99.5]) if samples.size else (0.0, 1.0)
+    if stretch:
+        low, high = stretch["vmin"], stretch["vmax"]
+    else:
+        low, high = np.percentile(samples, [1, 99.5]) if samples.size else (0.0, 1.0)
     if high <= low:
         high = low + max(abs(low) * 1e-6, 1e-6)
     for index, (array, path) in enumerate(zip(arrays, paths, strict=True)):
         values = np.clip((np.nan_to_num(array, nan=low) - low) / (high - low), 0, 1)
         grey = np.round(np.arcsinh(10 * values) / np.arcsinh(10) * 255).astype(np.uint8)
         visible = np.isfinite(array)
-        if quality is not None:
+        if quality is not None and quality[index] is not None:
             maximum = quality[index].states == PixelState.OVERFLOW_MAX
             grey[maximum] = 255
             visible |= maximum
@@ -257,23 +265,37 @@ def timed(timing: Timing | None, stage: str, observation: str | None = None):
             timing(stage, time.monotonic() - start, observation, outcome)
 
 
-def channel_frames(accepted: list[CachedExposure], tolerance: float):
-    channels: list[list[CachedExposure]] = []
-    frames = []
-    for e in accepted:
-        group = next((g for g in channels if all(
-            same_channel(e, other, e.frame.processing_version, other.frame.processing_version,
-                         tolerance) for other in g
-        )), None)
-        if group is None:
-            group = []
-            channels.append(group)
-        group.append(e)
-        anchor = group[0]
-        name = (f"{anchor.observation.detector} {anchor.wavelengths[0]:.6f} µm "
-                f"({anchor.frame.processing_version})")
-        frames.append(e.frame.model_copy(update={"channel": name}))
-    return frames, channels
+def assign_sequence(frame: Frame, existing: list[Frame], sequences: list[Sequence], tolerance: float):
+    """Extend a sequence only when every member agrees at all five field samples."""
+    def matches(other):
+        if len(other.match_wavelengths) != 5 or len(other.match_bandwidths) != 5:
+            return False
+        waves = np.asarray(frame.match_wavelengths, dtype=float)
+        other_waves = np.asarray(other.match_wavelengths, dtype=float)
+        widths = np.minimum(np.asarray(frame.match_bandwidths, dtype=float),
+                            np.asarray(other.match_bandwidths, dtype=float))
+        return np.all(np.abs(waves - other_waves) <= tolerance * widths)
+
+    sequence = next((s for s in sequences
+                     if frame.processing_version != "unknown"
+                     and s.detector == frame.detector and s.processing_version == frame.processing_version
+                     and all(matches(f) for f in existing if f.sequence_id == s.id)), None)
+    if sequence is None:
+        key = hashlib.sha256(frame.observation_id.encode()).hexdigest()[:24]
+        sequence = Sequence(id="sequence-" + key, detector=frame.detector,
+                            wavelength_um=frame.wavelength_um, processing_version=frame.processing_version)
+        sequences.append(sequence)
+    frame.sequence_id = sequence.id
+    frame.channel = f"{sequence.detector} {sequence.wavelength_um:.6f} Ãƒâ€šÃ‚Âµm ({sequence.processing_version})"
+    sequence.frame_ids.append(frame.id)
+    return sequence
+
+
+def update_counts(manifest):
+    manifest.processing["counts"] = {
+        status: sum(o.status == status for o in manifest.observations)
+        for status in ("pending", "loading", "ready", "failed")
+    }
 
 
 def product_stem(obs: Observation) -> str:
@@ -314,6 +336,8 @@ def frame_metadata(c: Cutout, quality: PixelQuality) -> Frame:
         mask_fraction=float(np.mean(~np.isin(quality.states, (
             PixelState.NORMAL, PixelState.WARNING, PixelState.OVERFLOW_MAX,
         )))),
+        match_wavelengths=[float(v) if np.isfinite(v) else None for v in c.wavelengths],
+        match_bandwidths=[float(v) if np.isfinite(v) else None for v in c.bandwidths],
         warnings=["Display preview; no PSF/background matching or photometric inference."],
     )
 
@@ -328,6 +352,19 @@ class Pipeline:
         return _FrameJob(self, query, directory, job_id, report, publish, timing).run()
 
 
+    def load(self, manifest, ids, directory, job_id, report, *, publish=None, timing=None):
+        job = _FrameJob(self, manifest.query, directory, job_id, report, publish, timing)
+        job.result = manifest.model_copy(deep=True)
+        job.result.cached = False
+        job.result.omissions = [item for item in job.result.omissions if item.get("observation_id") not in ids]
+        records = {r.id: r for r in job.result.observations}
+        rows = [Observation(r.id, r.source_url, float(Time(datetime.fromisoformat(r.observed_at)).mjd),
+                            r.detector, r.release) for r in (records[key] for key in ids)]
+        with ThreadPoolExecutor(max_workers=self.settings.cutout_workers) as pool:
+            job.batch(pool, rows)
+        return job.finalize()
+
+
 class _FrameJob:
     """The job thread publishes snapshots while catalog and transfer threads report results."""
 
@@ -335,7 +372,9 @@ class _FrameJob:
         self.settings, self.archive, self.cache = pipeline.settings, pipeline.archive, pipeline.exposure_cache
         self.query, self.directory, self.job_id = query, directory, job_id
         self.report, self.publish, self.timing = report, publish, timing
-        self.progressive = query.live and publish is not None
+        self.progressive = publish is not None
+        self.batch_records = set()
+        self.alloc_index = 0
         self.deadline = time.monotonic() + self.settings.job_seconds
         self.download_deadline = self.deadline - min(10, self.settings.job_seconds / 4)
         self.accepted: dict[str, CachedExposure] = {}
@@ -346,6 +385,8 @@ class _FrameJob:
             query=query,
             processing={
                 "version": PIPELINE_VERSION,
+                "batch_size": self.settings.batch_size,
+                "revision": 0,
                 "archive_products": {},
                 "archive_complete": False,
                 "spectral_tolerance": self.settings.spectral_tolerance,
@@ -359,15 +400,53 @@ class _FrameJob:
     def ordered(self):
         return sorted(self.accepted.values(), key=lambda e: (e.observation.mjd, e.observation.identity))
 
+    def refresh_records(self, frames):
+        available = {f.observation_id: f for f in frames}
+        failures = {o["observation_id"]: o["reason"] for o in self.result.omissions}
+        for record in self.result.observations:
+            frame = available.get(record.id)
+            if frame is not None:
+                record.status, record.frame_id, record.reason = "ready", frame.id, None
+            elif record.id in failures:
+                record.status, record.frame_id, record.reason = "failed", None, failures[record.id]
+            elif record.id in self.batch_records:
+                record.status, record.frame_id, record.reason = "loading", None, None
+        update_counts(self.result)
+
+    def grouped(self):
+        frames = list(self.result.frames)
+        sequences = [s.model_copy(deep=True) for s in self.result.sequences]
+        for entry in self.ordered():
+            f = entry.frame.model_copy(deep=True)
+            assign_sequence(f, frames, sequences, self.settings.spectral_tolerance)
+            frames.append(f)
+        frames.sort(key=lambda f: (f.observed_at, f.observation_id))
+        return frames, sequences
+
     def snapshot(self):
         if self.progressive:
-            frames, _ = channel_frames(self.ordered(), self.settings.spectral_tolerance)
+            frames, sequences = self.grouped()
+            self.refresh_records(frames)
+            self.result.processing["revision"] += 1
             self.publish(self.result.model_copy(update={
-                "frames": frames, "stretch": "asinh (individual preview scales while loading)",
+                "frames": frames, "sequences": sequences,
+                "stretch": "asinh (individual preview scales while loading)",
             }, deep=True))
 
-    def install(self, entry, index=None):
-        stem = product_stem(entry.observation) if self.query.live else f"frame-{index:02}"
+    def install(self, entry):
+        if self.query.live:
+            stem = product_stem(entry.observation)
+        else:
+            # A cancelled batch may leave unpublished files or published previews.
+            # Never allocate an existing basename to another observation.
+            while True:
+                stem = f"frame-{self.alloc_index:02}"
+                self.alloc_index += 1
+                if not (self.directory / f"{stem}.bin").exists() and not (self.directory / f"{stem}.png").exists():
+                    break
+        # Older cache rows store the five samples beside the frame metadata.
+        entry.frame.match_wavelengths = [float(v) if np.isfinite(v) else None for v in entry.wavelengths]
+        entry.frame.match_bandwidths = [float(v) if np.isfinite(v) else None for v in entry.bandwidths]
         with timed(self.timing, "write_assets", entry.observation.identity):
             materialize(entry, self.directory, self.job_id, stem, self.progressive)
         self.accepted[entry.observation.identity] = entry
@@ -379,13 +458,14 @@ class _FrameJob:
             with timed(self.timing, "cutout_download", obs.identity):
                 if time.monotonic() >= self.download_deadline:
                     raise ArchiveError("Search time limit reached")
+                kwargs = {"timing": self.timing} if isinstance(self.archive, Archive) else {}
                 source = self.archive.fetch(obs, self.query, path, self.download_deadline, **kwargs)
             with timed(self.timing, "fits_decode", obs.identity):
                 return decode(path, obs, self.query, source)
         finally:
             path.unlink(missing_ok=True)
 
-    def accept(self, c, index=None):
+    def accept(self, c):
         obs = c.observation
         with timed(self.timing, "align", obs.identity):
             if time.monotonic() > self.deadline:
@@ -399,10 +479,10 @@ class _FrameJob:
             ))) < 16:
                 raise ValueError("Insufficient usable common-grid coverage")
         entry = CachedExposure(obs, frame_metadata(c, quality), array, c.wavelengths, c.bandwidths, quality)
-        self.install(entry, index)
+        self.install(entry)
+        self.snapshot()
         if self.query.live:
             self.fresh.add((obs.identity, obs.uri))
-            self.snapshot()
             self.cache.store(self.query, obs, entry.frame, array, entry.wavelengths, entry.bandwidths, quality)
 
     def catalog(self, on_candidate=None):
@@ -424,12 +504,25 @@ class _FrameJob:
         rows = list(by_id.values())
         self.result.processing.update(refreshing_cache=False, archive_complete=complete,
                                       archive_products={o.identity: o.uri for o in rows})
-        selected = Archive.candidates(rows, self.settings.max_candidates)
+        rows.sort(key=lambda o: (o.mjd, o.identity))
+        self.result.discovery_complete = complete
+        self.result.observations = [
+            ObservationRecord(id=o.identity, source_url=o.uri, detector=o.detector, release=o.release,
+                              observed_at=Time(o.mjd, format="mjd").to_datetime(timezone=UTC).isoformat())
+            for o in rows
+        ]
+        if self.query.live:
+            selected = Archive.candidates(rows, min(self.settings.max_candidates, self.settings.max_frames))
+        else:
+            detectors = [f"D{i}" for i in range(1, 7)]
+            detector = max(detectors, key=lambda d: sum(o.detector == d for o in rows))
+            selected = [o for o in rows if o.detector == detector][:min(self.settings.batch_size, self.settings.max_frames)]
+        self.batch_records = {o.identity for o in selected}
         self.result.warnings.extend(notes)
         if len(selected) < len(rows):
             self.result.warnings.append(
                 f"Processing {len(selected)} of {len(rows)} distinct exposures "
-                "sampled across dates and detectors. Narrow dates for additional frames."
+                "in the initial batch. Use the observation catalog to load additional frames."
             )
         return rows, selected, complete
 
@@ -488,7 +581,8 @@ class _FrameJob:
         self.cache.reconcile(self.query, rows, complete, as_of=search_started)
         targets = {o.identity: o.uri for o in selected}
         old_ids = set(self.accepted)
-        self.accepted = {k: e for k, e in self.accepted.items() if targets.get(k) == e.observation.uri}
+        # Keep a published revision visible until its replacement has usable assets.
+        self.accepted = {k: e for k, e in self.accepted.items() if k in targets}
         futures = {}
         for obs in selected:
             if self.restore(obs):
@@ -510,6 +604,10 @@ class _FrameJob:
                 self.accept(future.result())
             except (ArchiveError, ValueError, KeyError, OSError) as exc:
                 self.omit(futures[future], exc)
+        valid = {k: e for k, e in self.accepted.items() if e.observation.uri == targets[k]}
+        if len(valid) < len(self.accepted):
+            self.accepted = valid
+            self.snapshot()
         self.result.cached = bool(self.accepted) and not any(
             (e.observation.identity, e.observation.uri) in self.fresh for e in self.accepted.values()
         )
@@ -518,66 +616,88 @@ class _FrameJob:
     def omit(self, obs, exc):
         self.result.omissions.append({"observation_id": obs.identity, "reason": str(exc)[:200]})
 
-    def matched(self, pool):
-        rows, notes = self.catalog()
-        _, selected, _ = self.resolve(rows, notes)
-        pending = {pool.submit(self.retrieve, obs): obs for obs in selected}
-        cutouts = []
-        for completed, future in enumerate(as_completed(pending), 1):
+    def batch(self, pool, selected):
+        self.batch_records = {o.identity for o in selected}
+        self.snapshot()
+        pending = {}
+        for obs in selected:
+            if self.query.live and self.restore(obs):
+                self.snapshot()
+            else:
+                pending[pool.submit(self.retrieve, obs)] = obs
+        for completed, future in enumerate(as_completed(pending), len(selected) - len(pending) + 1):
             self.report(f"fetch:{completed}/{len(selected)}")
             try:
-                cutouts.append(future.result())
+                self.accept(future.result())
             except (ArchiveError, ValueError, KeyError, OSError) as exc:
                 self.omit(pending[future], exc)
-        cutouts.sort(key=lambda c: (c.observation.mjd, c.observation.identity))
-        group = evenly_spaced(choose_group(cutouts, self.settings.spectral_tolerance), self.settings.max_frames)
-        ids = {c.observation.identity for c in group}
-        for c in cutouts:
-            if c.observation.identity not in ids:
-                self.omit(c.observation, "Outside selected spectral group or frame limit")
+                self.snapshot()
         self.report("align")
-        for c in group:
-            try:
-                self.accept(c, len(self.accepted))
-            except (ValueError, KeyError, OSError) as exc:
-                self.omit(c.observation, exc)
-        return bool(selected)
 
     def run(self):
         self.report("query")
         with ThreadPoolExecutor(max_workers=self.settings.cutout_workers) as pool:
-            candidates = self.live(pool) if self.query.live else self.matched(pool)
-        result = self.result
-        if candidates and not self.accepted:
-            raise ArchiveError("No usable cutouts could be decoded or aligned. " +
-                               (result.omissions[0]["reason"] if result.omissions else ""))
-        accepted = self.ordered()
+            if self.query.live:
+                self.live(pool)
+            else:
+                rows, notes = self.catalog()
+                _, selected, _ = self.resolve(rows, notes)
+                self.batch(pool, selected)
+        return self.finalize()
+
+    def finalize(self):
         self.report("render")
+        result = self.result
         with timed(self.timing, "finalize"):
-            frames, channels = channel_frames(accepted, self.settings.spectral_tolerance)
-            # Final PNGs share one stretch. Published preview PNGs and raw pixels stay immutable.
-            paths = [self.directory / frame.id for frame in frames]
-            result.processing["stretch"] = (
-                render_pngs([e.array for e in accepted], paths, [e.quality for e in accepted]) if paths else {}
-            )
-            for frame in frames:
-                frame.url = f"/api/assets/{self.job_id}/{frame.id}"
-            result.frames = frames
-            result.retrieved_at = datetime.now(UTC).isoformat()
-            if result.omissions:
-                result.warnings.append(
-                    f"{len(result.omissions)} candidate exposure(s) omitted; see the manifest for reasons."
+            frames, sequences = self.grouped()
+            by_id = {e.frame.id: e for e in self.accepted.values()}
+            for sequence in sequences:
+                # Resume a cancelled batch from its immutable preview and saved numeric planes.
+                pending = [f for f in frames if f.sequence_id == sequence.id and (
+                    f.id in by_id or (f.pixels and f.url.rsplit("/", 1)[-1] != f.id)
+                )]
+                if not pending:
+                    continue
+                arrays, quality = [], []
+                for frame in pending:
+                    entry = by_id.get(frame.id)
+                    if entry is not None:
+                        array, flags = entry.array, entry.quality
+                    else:
+                        array = np.flipud(np.fromfile(self.directory / frame.pixels, dtype="<f4").reshape(self.shape))
+                        flags = (PixelQuality.from_bytes((self.directory / frame.quality).read_bytes(), self.shape)
+                                 if frame.quality else None)
+                    arrays.append(array)
+                    quality.append(flags)
+                sequence.stretch = render_pngs(
+                    arrays, [self.directory / f.id for f in pending], quality,
+                    stretch=sequence.stretch,
                 )
-            if not any(len(channel) >= 2 for channel in channels):
+                for frame in pending:
+                    frame.url = f"/api/assets/{self.job_id}/{frame.id}"
+            result.frames, result.sequences = frames, sequences
+            self.refresh_records(frames)
+            result.processing["revision"] += 1
+            if len(sequences) == 1:
+                result.processing["stretch"] = sequences[0].stretch
+            else:
+                result.processing.pop("stretch", None)
+            result.retrieved_at = datetime.now(UTC).isoformat()
+            result.warnings = [w for w in result.warnings if not (
+                w.startswith("No wavelength channel") or w.startswith("Fewer than two compatible")
+                or "candidate exposure(s) omitted" in w)]
+            if result.omissions:
+                result.warnings.append(f"{len(result.omissions)} candidate exposure(s) omitted; see the manifest for reasons.")
+            if not any(len(s.frame_ids) >= 2 for s in sequences):
                 result.warnings.append(
                     "No wavelength channel has two usable exposures for a time comparison."
-                    if self.query.live else
-                    "Fewer than two compatible frames; motion playback is unavailable."
+                    if self.query.live else "Fewer than two compatible frames; motion playback is unavailable."
                 )
-            result.warnings.extend([
-                "Bounded exposure sample across available detectors.",
+            for warning in (
                 "Wavelength groups match the detector, processing version and spectral response at five field positions within half the narrower bandwidth.",
                 "Overflow with unavailable archived brightness is marked at display maximum; flagged measurements retain their recorded brightness for inspection.",
-            ])
+            ):
+                if warning not in result.warnings:
+                    result.warnings.append(warning)
             atomic_json(self.directory / "manifest.json", result.model_dump(mode="json"))
         return result

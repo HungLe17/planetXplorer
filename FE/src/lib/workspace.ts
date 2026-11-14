@@ -107,7 +107,7 @@ export function readDisplay(v: unknown): Display {
   if (
     !["single", "rgb"].includes(s.mode) ||
     !["linear", "sqrt", "asinh", "log"].includes(s.stretch) ||
-    !between(s.zoom, 1, 8) ||
+    !between(s.zoom, 0.02, 32) ||
     !between(s.speed, 0.1, 10) ||
     ![s.windowDays, s.exclusionDays].every((n) => between(n, 0, 1e6)) ||
     ![s.invert, s.coords, s.legend, s.difference, s.markFlagged, s.inspectFlagged].every(
@@ -137,7 +137,7 @@ export function readDisplay(v: unknown): Display {
   return s;
 }
 function config(v: unknown): Config {
-  if (!object(v) || !between(v.fov, 60, 1800) || typeof v.frame !== "string")
+  if (!object(v) || !between(v.fov, 30, 1800) || typeof v.frame !== "string")
     throw Error("Invalid workspace configuration.");
   let query: Query | null = null;
   if (v.query !== null) {
@@ -160,7 +160,7 @@ function config(v: unknown): Config {
       date(q.end_utc),
     );
     const fov = q.fov_arcsec === undefined ? v.fov : q.fov_arcsec;
-    if (!between(fov, 60, 1800)) throw Error("Invalid saved field of view.");
+    if (!between(fov, 30, 1800)) throw Error("Invalid saved field of view.");
     query = { ...bounds, fov_arcsec: fov };
   }
   return { query, frame: v.frame, fov: v.fov, display: readDisplay(v.display) };

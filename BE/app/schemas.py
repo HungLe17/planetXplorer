@@ -6,10 +6,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 class Query(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    fov_arcsec: float = Field(default=300, ge=60, le=1800)
     live: bool = False
     ra_deg: float = Field(ge=0, lt=360)
     dec_deg: float = Field(ge=-90, le=90)
+    fov_arcsec: float = Field(default=300, ge=30, le=1800)
     start_utc: datetime | None = None
     end_utc: datetime | None = None
 
@@ -50,15 +50,47 @@ class Frame(BaseModel):
     exposure_flags: dict[str, str | int | float] = Field(default_factory=dict)
     flag_names: dict[int, str] = Field(default_factory=dict)
     mask_fraction: float = 0
+    sequence_id: str = ""
+    match_wavelengths: list[float | None] = Field(default_factory=list)
+    match_bandwidths: list[float | None] = Field(default_factory=list)
+
+
+class ObservationRecord(BaseModel):
+    id: str
+    source_url: str
+    observed_at: str
+    detector: str
+    release: str
+    status: Literal["pending", "loading", "ready", "failed"] = "pending"
+    reason: str | None = None
+    frame_id: str | None = None
+
+
+class Sequence(BaseModel):
+    id: str
+    detector: str
+    wavelength_um: float
+    processing_version: str
+    frame_ids: list[str] = Field(default_factory=list)
+    stretch: dict = Field(default_factory=dict)
+
+
+class LoadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    observation_ids: list[str] = Field(default_factory=list, max_length=8)
+    detector: Literal["D1", "D2", "D3", "D4", "D5", "D6"] | None = None
 
 
 class Manifest(BaseModel):
     frames: list[Frame] = Field(default_factory=list)
+    observations: list[ObservationRecord] = Field(default_factory=list)
+    sequences: list[Sequence] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     retrieved_at: str
     cached: bool = False
+    discovery_complete: bool = False
     grid: str = "ICRS TAN; north up, east left; 6.14 arcsec/pixel"
-    stretch: str = "asinh (one shared intensity scale)"
+    stretch: str = "asinh (fixed within each wavelength sequence)"
     query: Query
     processing: dict = Field(default_factory=dict)
     omissions: list[dict] = Field(default_factory=list)

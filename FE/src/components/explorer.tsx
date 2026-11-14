@@ -1,5 +1,12 @@
 "use client";
-import { useState, useEffect, useRef, useCallback, FormEvent } from "react";
+import {
+  useState,
+  useEffect,
+  useRef,
+  useMemo,
+  useCallback,
+  FormEvent,
+} from "react";
 import {
   ArrowUpRight,
   Check,
@@ -20,6 +27,11 @@ import {
   Crosshair,
   Layers,
   ChevronDown,
+  SlidersHorizontal,
+  Download,
+  Minimize2,
+  Maximize2,
+  Repeat,
 } from "lucide-react";
 import SkyViewer from "./sky-viewer";
 import Spectrum from "./spectrum";
@@ -45,8 +57,17 @@ import {
   validateManifest,
   assetUrl,
   cancelJob,
+  loadObservations,
 } from "@/lib/api";
 import { angularWidth, parseQuery, queryUrl } from "@/lib/view-url";
+type LoadBatch = {
+  jobId: string;
+  ids?: string[];
+  detector?: string;
+  all?: boolean;
+  recordIds?: string[];
+  size: number;
+};
 const empty: Frame[] = [];
 const stamp = (date?: string) =>
   date
@@ -87,13 +108,21 @@ export default function Explorer() {
     [copied, setCopied] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [datesOpen, setDatesOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(true);
+  const [fieldJobId, setFieldJobId] = useState("");
+  const [sequenceId, setSequenceId] = useState("");
+  const [viewMode, setViewMode] = useState<"browse" | "matched">("browse");
+  const [loop, setLoop] = useState(true);
+  const [statusFilter, setStatusFilter] = useState("");
+  const [recordSearch, setRecordSearch] = useState("");
+  const [dockExpanded, setDockExpanded] = useState(false);
+  const [detectorFilter, setDetectorFilter] = useState("");
   const [tab, setTab] = useState("Settings");
   const [display, setDisplay] = useState(defaults);
   const update = useCallback(
     (patch: Partial<Display>) => setDisplay((old) => ({ ...old, ...patch })),
     [],
   );
-  const setZoom = useCallback((zoom: number) => update({ zoom }), [update]);
   const setSpeed = (speed: number) => update({ speed });
   const setInvert = (invert: boolean) => update({ invert });
   const { speed, zoom, invert } = display;
@@ -117,7 +146,29 @@ export default function Explorer() {
     generation = useRef(0),
     activeJob = useRef<string | null>(null);
   const [displayedQuery, setDisplayedQuery] = useState<Query | null>(null);
-  const frames = science.frames,
+  const allFrames = manifest?.frames ?? empty;
+  const batchSize = Math.max(
+    1,
+    Math.min(8, manifest?.processing?.batch_size ?? 8),
+  );
+  const sequences = manifest?.sequences ?? [];
+  const sequence =
+    sequences.find((s) => s.id === sequenceId) ||
+    [...sequences].sort((a, b) => b.frame_ids.length - a.frame_ids.length)[0];
+  const derived =
+    display.mode === "rgb" ||
+    display.difference ||
+    Object.keys(display.operands).length > 0;
+  const matched = viewMode === "matched" && !derived;
+  const frames = useMemo(
+      () =>
+        matched
+          ? science.frames.filter(
+              (f) => sequence && f.sequence_id === sequence.id,
+            )
+          : science.frames,
+      [matched, science.frames, sequence],
+    ),
     index = Math.max(
       0,
       frames.findIndex((f) => f.observation_id === selectedFrame),
@@ -139,13 +190,97 @@ export default function Explorer() {
     },
     [frames],
   );
-  const product = science.result[index];
+  const product = frame
+    ? science.result[science.frames.indexOf(frame)]
+    : undefined;
+  const observedFrames = useRef(allFrames);
+  useEffect(() => {
+    observedFrames.current = allFrames;
+  }, [allFrames]);
+  const frameByObservation = useMemo(
+    () => new Map(allFrames.map((f) => [f.observation_id, f])),
+    [allFrames],
+  );
+  const observations = manifest?.observations?.length
+    ? manifest.observations
+    : undefined;
+  const filteredObservations = useMemo(
+    () =>
+      (observations || []).filter(
+        (o) =>
+          (!detectorFilter || o.detector === detectorFilter) &&
+          (!statusFilter || o.status === statusFilter) &&
+          (!recordSearch ||
+            `${o.id} ${o.observed_at} ${o.release}`
+              .toLowerCase()
+              .includes(recordSearch.toLowerCase())),
+      ),
+    [observations, detectorFilter, statusFilter, recordSearch],
+  );
+  const pendingCount = filteredObservations.filter(
+    (o) => o.status === "pending",
+  ).length;
+  const failedRecords = filteredObservations.filter(
+    (o) => o.status === "failed",
+  );
+  const unmatchedFrames =
+    !matched &&
+    !derived &&
+    new Set(frames.map((f) => f.sequence_id || f.channel || f.detector)).size >
+      1;
+  function setMode(mode: "browse" | "matched") {
+    setPlaying(false);
+    if (derived) update({ mode: "single", difference: false, operands: {} });
+    setViewMode(mode);
+    if (mode === "matched" && sequence) setSequenceId(sequence.id);
+  }
+  function exportCatalog() {
+    const quote = (v: unknown) => `"${String(v ?? "").replaceAll('"', '""')}"`;
+    const rows = [
+      [
+        "observation_id",
+        "observed_at_utc",
+        "detector",
+        "release",
+        "status",
+        "wavelength_um",
+        "bandwidth_um",
+        "reason",
+        "source_url",
+      ],
+      ...filteredObservations.map((o) => {
+        const f = frameByObservation.get(o.id);
+        return [
+          o.id,
+          o.observed_at,
+          o.detector,
+          o.release,
+          o.status,
+          f?.wavelength_um,
+          f?.bandwidth_um,
+          o.reason,
+          f?.source_url || o.source_url,
+        ];
+      }),
+    ];
+    const url = URL.createObjectURL(
+      new Blob([rows.map((r) => r.map(quote).join(",")).join("\r\n")], {
+        type: "text/csv;charset=utf-8",
+      }),
+    );
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "observations.csv";
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
   const configuration: Config = {
     query: displayedQuery,
     display,
     frame: frame?.observation_id ?? "",
     fov:
-      Number(fov) >= 60 && Number(fov) <= 1800
+      Number(fov) >= 30 && Number(fov) <= 1800
         ? Number(fov)
         : (displayedQuery?.fov_arcsec ?? 300),
   };
@@ -238,6 +373,7 @@ export default function Explorer() {
       query: Query,
       wantedFrame = "",
       wantedPosition: Entry["position"] | null = null,
+      more?: LoadBatch,
     ) => {
       controller.current?.abort();
       if (activeJob.current) void cancelJob(activeJob.current).catch(() => {});
@@ -247,19 +383,32 @@ export default function Explorer() {
       const current = ++generation.current;
       const started = performance.now();
       let publication = "";
+      let targetSelected = false;
+      let firstFramePublished = false;
+      let previousPendingCount = Infinity;
+      const before = new Set(
+        observedFrames.current.map((f) => f.observation_id),
+      );
       timing.current = null;
       setBusy(true);
       setError("");
       setNotice("");
-      setPlaying(false);
+      if (!more) setPlaying(false);
       setCommitted(query);
-      setStage("Finding observations");
+      setStage(more ? "Loading images" : "Finding observations");
       restorePosition.current = null;
       restoreFrame.current = "";
-      window.history.replaceState({}, "", queryUrl(query));
+      if (!more) window.history.replaceState({}, "", queryUrl(query));
       try {
-        const id = await submit(query, abort.signal),
-          deadline = Date.now() + 150000;
+        const id = more
+          ? await loadObservations(
+              more.jobId,
+              abort.signal,
+              more.ids ?? more.recordIds?.slice(0, more.size),
+              more.detector,
+            )
+          : await submit(query, abort.signal);
+        let deadline = Date.now() + 180000;
         if (abort.signal.aborted || current !== generation.current) {
           void cancelJob(id).catch(() => {});
           return;
@@ -283,8 +432,16 @@ export default function Explorer() {
           );
           const finished =
             job.status === "complete" || job.status === "partial";
-          if (job.manifest && (finished || publication || job.manifest.frames.length)) {
+          if (
+            job.manifest &&
+            (finished ||
+              publication ||
+              job.manifest.frames.length ||
+              job.manifest.observations?.length)
+          ) {
             const signature = JSON.stringify([
+              job.manifest.processing?.revision ??
+                job.manifest.observations?.map((o) => [o.id, o.status]),
               job.manifest.processing?.refreshing_cache === true,
               job.manifest.processing?.archive_complete === true,
               job.manifest.frames.map((f) => [f.id, f.url]),
@@ -292,15 +449,50 @@ export default function Explorer() {
             if (finished || signature !== publication) {
               const result = validateManifest(job.manifest);
               if (!publication) {
-                restoreFrame.current = wantedFrame;
-                restorePosition.current = wantedPosition;
-                setPixel(null);
-                setSelectedFrame("");
+                if (!more) {
+                  restoreFrame.current = wantedFrame;
+                  restorePosition.current = wantedPosition;
+                  setPixel(null);
+                  setSelectedFrame("");
+                  setSequenceId("");
+                  setViewMode("browse");
+                  setDetectorFilter("");
+                  setRecordSearch("");
+                  setStatusFilter("");
+                }
+                setFieldJobId(id);
                 setDisplayedQuery(query);
-                if (result.frames.length)
-                  performance.measure(`planetx:${id}:first-manifest`, {
-                    start: started,
-                  });
+              }
+              if (result.frames.length && !firstFramePublished) {
+                firstFramePublished = true;
+                performance.measure(`planetx:${id}:first-manifest`, {
+                  start: started,
+                });
+              }
+              if (
+                more &&
+                !targetSelected &&
+                (more.ids?.length === 1 || more.detector)
+              ) {
+                const wanted = result.frames.find((f) =>
+                  more.ids?.length === 1
+                    ? f.observation_id === more.ids[0]
+                    : f.detector === more.detector &&
+                      !before.has(f.observation_id),
+                );
+                if (wanted) {
+                  setViewMode("browse");
+                  setSequenceId(wanted.sequence_id ?? "");
+                  setDisplay((previous) => ({
+                    ...previous,
+                    mode: "single",
+                    operands: {},
+                    difference: false,
+                  }));
+                  restoreFrame.current = wanted.observation_id;
+                  setSelectedFrame(wanted.observation_id);
+                  targetSelected = true;
+                }
               }
               publication = signature;
               setManifest({
@@ -322,8 +514,40 @@ export default function Explorer() {
           if (finished) {
             if (!job.manifest)
               throw new Error("The service returned no observation manifest.");
-            if (job.manifest.processing?.cache_fallback)
-              setNotice("Showing saved observations. The archive could not confirm the latest data.");
+            if (more?.all) {
+              const remaining = (job.manifest.observations ?? []).filter(
+                (o) =>
+                  o.status === "pending" &&
+                  (!more.detector || o.detector === more.detector) &&
+                  (!more.recordIds || more.recordIds.includes(o.id)),
+              );
+              if (remaining.length) {
+                if (remaining.length >= previousPendingCount)
+                  throw new Error(
+                    "Loading stopped because the last batch made no progress. Retry the pending observations.",
+                  );
+                previousPendingCount = remaining.length;
+                await loadObservations(
+                  id,
+                  abort.signal,
+                  remaining.slice(0, more.size).map((o) => o.id),
+                  more.detector,
+                );
+                deadline = Date.now() + 150000;
+                continue;
+              }
+            }
+            if (
+              !job.manifest.frames.length &&
+              job.manifest.observations?.length
+            )
+              setNotice(
+                "No image in this batch could be loaded. Inspect the failed rows or load another observation.",
+              );
+            else if (job.manifest.processing?.cache_fallback)
+              setNotice(
+                "Showing saved observations. The archive could not confirm the latest data.",
+              );
             else if (!job.manifest.frames.length)
               setNotice(
                 "No comparable observations were found for this field and date range.",
@@ -366,6 +590,14 @@ export default function Explorer() {
     },
     [],
   );
+  function loadBatch(batch: Omit<LoadBatch, "jobId" | "size">) {
+    if (displayedQuery && fieldJobId)
+      void load(displayedQuery, "", null, {
+        ...batch,
+        jobId: fieldJobId,
+        size: batchSize,
+      });
+  }
   function cancelSearch() {
     const id = activeJob.current;
     controller.current?.abort();
@@ -382,6 +614,15 @@ export default function Explorer() {
       });
   }
   useEffect(() => {
+    const narrow = window.matchMedia("(max-width: 1023px)");
+    const changed = () => {
+      if (narrow.matches) setInspectorOpen(false);
+    };
+    narrow.addEventListener("change", changed);
+    return () => narrow.removeEventListener("change", changed);
+  }, []);
+  useEffect(() => {
+    if (window.innerWidth < 700) setDockOpen(false);
     if (window.innerWidth < 1024) setInspectorOpen(false);
     const abort = new AbortController();
     const params = new URLSearchParams(window.location.search);
@@ -449,18 +690,23 @@ export default function Explorer() {
             Number.isFinite(p.ra_deg) &&
             Number.isFinite(p.dec_deg),
         );
+        const opening =
+          initial ||
+          data.presets.find(
+            (p) => Number.isFinite(p.ra_deg) && Number.isFinite(p.dec_deg),
+          );
         if (
           !hasSharedField &&
-          initial &&
+          opening &&
           generation.current === 0 &&
           !document.querySelector<HTMLInputElement>('input[name="ra"]')
             ?.value &&
           !document.querySelector<HTMLInputElement>('input[name="dec"]')?.value
         ) {
-          setSelected(initial.id);
-          setRa(String(initial.ra_deg));
-          setDec(String(initial.dec_deg));
-          void load({ ra_deg: initial.ra_deg, dec_deg: initial.dec_deg });
+          setSelected(opening.id);
+          setRa(String(opening.ra_deg));
+          setDec(String(opening.dec_deg));
+          void load({ ra_deg: opening.ra_deg, dec_deg: opening.dec_deg });
         }
       })
       .catch(() => {});
@@ -496,12 +742,15 @@ export default function Explorer() {
   }, [load]);
   useEffect(() => {
     if (!playing || !canPlay) return;
-    const timer = setInterval(
-      () => setIndex((i) => (i + 1) % frames.length),
-      1000 / speed,
-    );
-    return () => clearInterval(timer);
-  }, [playing, canPlay, speed, frames.length, setIndex]);
+    const timer = setTimeout(() => {
+      if (!loop && index === frames.length - 1) {
+        setPlaying(false);
+        return;
+      }
+      setIndex((i) => (i + 1) % frames.length);
+    }, 1000 / speed);
+    return () => clearTimeout(timer);
+  }, [playing, canPlay, speed, frames.length, index, loop, setIndex]);
   useEffect(() => {
     const hide = () => {
       if (document.hidden) setPlaying(false);
@@ -513,11 +762,12 @@ export default function Explorer() {
       }
       if ((e.target as HTMLElement).closest("input,select,textarea,button,a"))
         return;
-      if (!canPlay) return;
       if (e.code === "Space") {
+        if (!canPlay && !playing) return;
         e.preventDefault();
         setPlaying((p) => !p);
       }
+      if (!frames.length) return;
       if (e.key === "ArrowRight") {
         e.preventDefault();
         setPlaying(false);
@@ -534,7 +784,7 @@ export default function Explorer() {
       document.removeEventListener("visibilitychange", hide);
       window.removeEventListener("keydown", keys);
     };
-  }, [canPlay, frames.length, setIndex]);
+  }, [canPlay, frames.length, playing, setIndex]);
   const onReady = useCallback((value: boolean) => setReady(value), []);
   const onFailure = useCallback(() => {
     setError(
@@ -629,7 +879,7 @@ export default function Explorer() {
     setIndex((i) => Math.max(0, Math.min(frames.length - 1, i + n)));
   }
   return (
-    <div className="app-layout">
+    <div className={"app-layout" + (settingsOpen ? "" : " settings-collapsed")}>
       <a className="skip-link" href="#workspace">
         Skip to workspace
       </a>
@@ -643,6 +893,15 @@ export default function Explorer() {
           </span>
         </a>
         <div className="header-actions">
+          <button
+            className="button mobile-field-toggle"
+            aria-label="Toggle field settings"
+            aria-expanded={settingsOpen}
+            onClick={() => setSettingsOpen((v) => !v)}
+          >
+            <SlidersHorizontal size={14} />
+            Field
+          </button>
           <button
             className="button share"
             onClick={share}
@@ -724,7 +983,7 @@ export default function Explorer() {
                   <input
                     id="fov"
                     type="number"
-                    min="60"
+                    min="30"
                     max="1800"
                     required
                     value={fov}
@@ -733,7 +992,7 @@ export default function Explorer() {
                   <input
                     aria-label="Field of view slider"
                     type="range"
-                    min="60"
+                    min="30"
                     max="1800"
                     value={fov}
                     onChange={(e) => setFov(e.target.value)}
@@ -916,10 +1175,10 @@ export default function Explorer() {
               </section>
             </>
           ) : tab === "Surveys" ? (
-            committed ? (
+            displayedQuery ? (
               <FieldSurveys
-                key={`${committed.ra_deg},${committed.dec_deg}`}
-                query={committed}
+                key={`${displayedQuery.ra_deg},${displayedQuery.dec_deg}`}
+                query={displayedQuery}
               />
             ) : (
               <p className="panel-copy">
@@ -1008,7 +1267,8 @@ export default function Explorer() {
             {busy && (
               <p className="processing">
                 <LoaderCircle size={14} className="spin" />
-                {displayedQuery === committed && manifest?.processing?.refreshing_cache
+                {displayedQuery === committed &&
+                manifest?.processing?.refreshing_cache
                   ? "Showing cached observations while checking the archive for updates."
                   : `${stage}.`}
                 {manifest?.frames.length
@@ -1070,14 +1330,85 @@ export default function Explorer() {
                   </button>
                 </div>
               </div>
+              {allFrames.length > 0 && (
+                <div className="sequence-toolbar">
+                  <div
+                    className="view-modes"
+                    role="group"
+                    aria-label="Playback mode"
+                  >
+                    <button
+                      aria-pressed={!matched && !derived}
+                      onClick={() => setMode("browse")}
+                      title="Browse loaded observations in acquisition order"
+                    >
+                      Browse
+                    </button>
+                    <button
+                      aria-pressed={matched}
+                      disabled={!sequences.some((s) => s.frame_ids.length)}
+                      onClick={() => setMode("matched")}
+                      title="Play observations with compatible wavelength and calibration"
+                    >
+                      Matched
+                    </button>
+                  </div>
+                  {matched && sequences.length > 0 ? (
+                    <>
+                      <label className="sr-only" htmlFor="sequence">
+                        Wavelength sequence
+                      </label>
+                      <select
+                        id="sequence"
+                        value={sequence?.id || ""}
+                        onChange={(e) => {
+                          setSequenceId(e.target.value);
+                          setSelectedFrame("");
+                          setPlaying(false);
+                        }}
+                      >
+                        {[...sequences]
+                          .filter((g) => g.frame_ids.length)
+                          .sort(
+                            (a, b) => b.frame_ids.length - a.frame_ids.length,
+                          )
+                          .map((g) => (
+                            <option key={g.id} value={g.id}>
+                              {g.detector} / {g.wavelength_um.toFixed(3)}{" "}
+                              microns / {g.frame_ids.length} frame
+                              {g.frame_ids.length === 1 ? "" : "s"}
+                            </option>
+                          ))}
+                      </select>
+                    </>
+                  ) : (
+                    <span
+                      className={
+                        unmatchedFrames
+                          ? "wavelength-warning"
+                          : "browse-summary"
+                      }
+                    >
+                      {unmatchedFrames
+                        ? "Unmatched observations; brightness is not directly comparable."
+                        : derived
+                          ? String(frames.length) +
+                            (frames.length === 1
+                              ? " derived image"
+                              : " derived images")
+                          : `${allFrames.length} loaded image${allFrames.length === 1 ? "" : "s"}`}
+                    </span>
+                  )}
+                </div>
+              )}
               <SkyViewer
+                unmatchedFrames={unmatchedFrames}
                 frames={frames}
                 index={index}
                 onReady={onReady}
                 onFailure={onFailure}
                 onPaint={onPaint}
                 zoom={zoom}
-                onZoom={setZoom}
                 invert={invert}
                 display={display}
                 update={update}
@@ -1099,7 +1430,7 @@ export default function Explorer() {
                 <div className="transport">
                   <button
                     aria-label="First frame"
-                    disabled={!canPlay}
+                    disabled={frames.length < 2}
                     onClick={() => {
                       setPlaying(false);
                       setIndex(0);
@@ -1109,7 +1440,7 @@ export default function Explorer() {
                   </button>
                   <button
                     aria-label="Previous frame"
-                    disabled={!canPlay}
+                    disabled={frames.length < 2}
                     onClick={() => step(-1)}
                   >
                     <ChevronLeft size={17} />
@@ -1117,21 +1448,21 @@ export default function Explorer() {
                   <button
                     className="play"
                     aria-label={playing ? "Pause" : "Play"}
-                    disabled={!canPlay}
+                    disabled={!canPlay && !playing}
                     onClick={() => setPlaying((p) => !p)}
                   >
                     {playing ? <Pause size={16} /> : <Play size={16} />}
                   </button>
                   <button
                     aria-label="Next frame"
-                    disabled={!canPlay}
+                    disabled={frames.length < 2}
                     onClick={() => step(1)}
                   >
                     <ChevronRight size={17} />
                   </button>
                   <button
                     aria-label="Last frame"
-                    disabled={!canPlay}
+                    disabled={frames.length < 2}
                     onClick={() => {
                       setPlaying(false);
                       setIndex(frames.length - 1);
@@ -1158,6 +1489,15 @@ export default function Explorer() {
                     <option value={4}>250 ms</option>
                   </select>
                 </div>
+                <button
+                  className={"loop-toggle " + (loop ? "active" : "")}
+                  aria-label="Loop playback"
+                  aria-pressed={loop}
+                  title="Loop playback"
+                  onClick={() => setLoop((v) => !v)}
+                >
+                  <Repeat size={14} />
+                </button>
                 <span className="frame-counter">
                   {frames.length ? String(index + 1).padStart(2, "0") : "—"}{" "}
                   <span>
@@ -1175,7 +1515,7 @@ export default function Explorer() {
                   min={0}
                   max={Math.max(1, frames.length - 1)}
                   value={index}
-                  disabled={!canPlay}
+                  disabled={frames.length < 2}
                   onChange={(e) => {
                     setPlaying(false);
                     setIndex(Number(e.target.value));
@@ -1192,6 +1532,24 @@ export default function Explorer() {
                   </span>
                 </div>
               </div>
+              {frames.length === 1 && (
+                <div className="playback-guidance">
+                  {matched ? (
+                    <>
+                      <span>One matched frame loaded.</span>
+                      {allFrames.length > 1 && (
+                        <button onClick={() => setMode("browse")}>
+                          Browse all {allFrames.length} images
+                        </button>
+                      )}
+                    </>
+                  ) : (
+                    <span>
+                      One image loaded. Load more observations to play.
+                    </span>
+                  )}
+                </div>
+              )}
             </section>
             {inspectorOpen && (
               <aside className="inspector" aria-label="Frame details">
@@ -1220,7 +1578,8 @@ export default function Explorer() {
                         {product.reference.map((f) => (
                           <p key={f.id}>Reference · {stamp(f.observed_at)}</p>
                         ))}
-                        {(display.mode === "rgb" || product.sourcePlanes?.some((p) => p.quality)) && (
+                        {(display.mode === "rgb" ||
+                          product.sourcePlanes?.some((p) => p.quality)) && (
                           <Spectrum
                             product={product}
                             pixel={pixel}
@@ -1277,7 +1636,9 @@ export default function Explorer() {
                         <dt>Data origin</dt>
                         <dd>
                           {manifest
-                            ? manifest.cached || manifest.processing?.refreshing_cache || manifest.processing?.cache_fallback
+                            ? manifest.cached ||
+                              manifest.processing?.refreshing_cache ||
+                              manifest.processing?.cache_fallback
                               ? "Cached archive data"
                               : "Live archive query"
                             : "—"}
@@ -1310,60 +1671,304 @@ export default function Explorer() {
             )}
           </div>
           <section
-            className={"observations-dock " + (!dockOpen ? "collapsed" : "")}
+            className={
+              "observations-dock " +
+              (!dockOpen ? "collapsed" : "") +
+              (dockExpanded ? " expanded" : "")
+            }
             aria-label="Observations"
           >
-            <button
-              className="dock-heading"
-              onClick={() => setDockOpen(!dockOpen)}
-              aria-expanded={dockOpen}
-            >
-              <Layers size={14} />
-              <strong>Observations</strong>
-              <span className="count-badge">{frames.length}</span>
-              <ChevronDown size={14} />
-            </button>
-            {dockOpen && (
-              <div className="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Frame</th>
-                      <th>Acquired · UTC</th>
-                      <th>Detector</th>
-                      <th>Release</th>
-                      <th>Observation ID</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {frames.map((f, i) => (
-                      <tr key={f.id} className={i === index ? "active" : ""}>
-                        <td>
-                          <button
-                            aria-label={`Select frame ${i + 1}`}
-                            onClick={() => {
-                              setPlaying(false);
-                              setIndex(i);
-                            }}
-                          >
-                            {String(i + 1).padStart(2, "0")}
-                            <ChevronRight size={12} />
-                          </button>
-                        </td>
-                        <td>{stamp(f.observed_at).replace(" UTC", "")}</td>
-                        <td>{f.detector || "—"}</td>
-                        <td>{f.release || "—"}</td>
-                        <td className="mono">{f.observation_id}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                {!frames.length && (
-                  <div className="table-empty">
-                    <span>No observations</span>
-                  </div>
+            <div className="dock-header">
+              <button
+                className="dock-heading"
+                onClick={() => {
+                  setDockOpen(!dockOpen);
+                  if (dockExpanded) setDockExpanded(false);
+                }}
+                aria-expanded={dockOpen}
+              >
+                <Layers size={14} />
+                <strong>Observations</strong>
+                <span className="count-badge">
+                  {observations?.length ?? allFrames.length}
+                </span>
+                <ChevronDown size={14} />
+              </button>
+              <button
+                className="dock-expand"
+                aria-label={
+                  dockExpanded ? "Restore image view" : "Expand observations"
+                }
+                title={
+                  dockExpanded ? "Restore image view" : "Expand observations"
+                }
+                onClick={() => {
+                  setDockExpanded((v) => !v);
+                  setDockOpen(true);
+                }}
+              >
+                {dockExpanded ? (
+                  <Minimize2 size={14} />
+                ) : (
+                  <Maximize2 size={14} />
                 )}
-              </div>
+              </button>
+            </div>
+            {dockOpen && (
+              <>
+                {observations && (
+                  <>
+                    <div className="catalog-controls">
+                      <label htmlFor="detector-filter">Detector</label>
+                      <select
+                        id="detector-filter"
+                        value={detectorFilter}
+                        onChange={(e) => setDetectorFilter(e.target.value)}
+                      >
+                        <option value="">All six</option>
+                        {["D1", "D2", "D3", "D4", "D5", "D6"].map((d) => (
+                          <option key={d} value={d}>
+                            {d} (
+                            {observations?.filter((o) => o.detector === d)
+                              .length ?? 0}
+                            )
+                          </option>
+                        ))}
+                      </select>
+                      <label className="sr-only" htmlFor="status-filter">
+                        Observation status
+                      </label>
+                      <select
+                        id="status-filter"
+                        value={statusFilter}
+                        onChange={(e) => setStatusFilter(e.target.value)}
+                      >
+                        <option value="">All statuses</option>
+                        <option value="ready">Loaded</option>
+                        <option value="pending">Not loaded</option>
+                        <option value="loading">Loading</option>
+                        <option value="failed">Failed</option>
+                      </select>
+                      <input
+                        className="catalog-search"
+                        aria-label="Find observation"
+                        placeholder="Find observation…"
+                        value={recordSearch}
+                        onChange={(e) => setRecordSearch(e.target.value)}
+                      />
+                      <span>
+                        {
+                          filteredObservations.filter(
+                            (o) => o.status === "ready",
+                          ).length
+                        }{" "}
+                        loaded /{" "}
+                        {filteredObservations.filter(
+                          (o) => o.status === "failed",
+                        ).length || 0}{" "}
+                        failed /{" "}
+                        {filteredObservations.filter(
+                          (o) =>
+                            o.status === "pending" || o.status === "loading",
+                        ).length || 0}{" "}
+                        not loaded
+                      </span>
+                      <button
+                        className="button"
+                        disabled={busy || !pendingCount || !fieldJobId}
+                        onClick={() => {
+                          loadBatch({
+                            detector: detectorFilter || undefined,
+                            ids: filteredObservations
+                              .filter((o) => o.status === "pending")
+                              .slice(0, batchSize)
+                              .map((o) => o.id),
+                          });
+                        }}
+                      >
+                        {pendingCount
+                          ? `Load next ${Math.min(batchSize, pendingCount)}`
+                          : "No pending images"}
+                      </button>
+                      <button
+                        className="button"
+                        disabled={busy || !pendingCount || !fieldJobId}
+                        onClick={() => {
+                          loadBatch({
+                            detector: detectorFilter || undefined,
+                            all: true,
+                            recordIds: filteredObservations
+                              .filter((o) => o.status === "pending")
+                              .map((o) => o.id),
+                          });
+                        }}
+                      >
+                        Load all{detectorFilter ? ` ${detectorFilter}` : ""}
+                      </button>
+                      {busy && (
+                        <button
+                          className="button"
+                          aria-label="Stop loading"
+                          onClick={cancelSearch}
+                        >
+                          Stop
+                        </button>
+                      )}
+                      {failedRecords.length > 0 && (
+                        <button
+                          className="button"
+                          disabled={busy || !fieldJobId}
+                          onClick={() => {
+                            loadBatch({
+                              ids: failedRecords
+                                .slice(0, batchSize)
+                                .map((o) => o.id),
+                            });
+                          }}
+                        >
+                          Retry {Math.min(batchSize, failedRecords.length)}{" "}
+                          failed
+                        </button>
+                      )}
+                      <button
+                        className="catalog-export"
+                        aria-label="Export observation catalog"
+                        title="Export filtered catalog as CSV"
+                        disabled={!filteredObservations.length}
+                        onClick={exportCatalog}
+                      >
+                        <Download size={15} />
+                      </button>
+                      {manifest?.discovery_complete === false && (
+                        <span>Partial archive results; refine dates.</span>
+                      )}
+                    </div>
+                  </>
+                )}
+                <div className="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Frame</th>
+                        <th>Acquired · UTC</th>
+                        <th>Detector</th>
+                        <th>Release</th>
+                        <th>Observation ID</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {observations
+                        ? filteredObservations.map((o) => {
+                            const f = frameByObservation.get(o.id);
+                            return (
+                              <tr
+                                key={o.id}
+                                className={
+                                  frame?.observation_id === o.id ? "active" : ""
+                                }
+                              >
+                                <td>
+                                  <button
+                                    disabled={busy && !f}
+                                    title={
+                                      o.reason ||
+                                      (f
+                                        ? "Inspect observation"
+                                        : "Load this observation")
+                                    }
+                                    onClick={() => {
+                                      setDockExpanded(false);
+                                      if (f) {
+                                        setSequenceId(f.sequence_id || "");
+                                        setViewMode("browse");
+                                        update({
+                                          mode: "single",
+                                          difference: false,
+                                          operands: {},
+                                        });
+                                        setSelectedFrame(f.observation_id);
+                                        setPlaying(false);
+                                      } else if (fieldJobId)
+                                        loadBatch({
+                                          ids: [o.id],
+                                        });
+                                    }}
+                                  >
+                                    {f
+                                      ? "View"
+                                      : o.status === "failed"
+                                        ? "Retry"
+                                        : o.status === "loading"
+                                          ? "Loading"
+                                          : "Load"}
+                                  </button>
+                                </td>
+                                <td>
+                                  {stamp(o.observed_at).replace(" UTC", "")}
+                                </td>
+                                <td>{o.detector}</td>
+                                <td>{o.release}</td>
+                                <td>
+                                  <span
+                                    className="observation-status"
+                                    title={o.reason || ""}
+                                  >
+                                    {o.status}
+                                    {o.reason ? `: ${o.reason}` : ""}
+                                  </span>
+                                  <span className="mono">{o.id}</span>
+                                </td>
+                              </tr>
+                            );
+                          })
+                        : frames.map((f, i) => (
+                            <tr
+                              key={f.id}
+                              className={i === index ? "active" : ""}
+                            >
+                              <td>
+                                <button
+                                  aria-label={`Select frame ${i + 1}`}
+                                  onClick={() => {
+                                    setPlaying(false);
+                                    setIndex(i);
+                                  }}
+                                >
+                                  {String(i + 1).padStart(2, "0")}
+                                  <ChevronRight size={12} />
+                                </button>
+                              </td>
+                              <td>
+                                {stamp(f.observed_at).replace(" UTC", "")}
+                              </td>
+                              <td>{f.detector}</td>
+                              <td>{f.release || "—"}</td>
+                              <td className="mono">{f.observation_id}</td>
+                            </tr>
+                          ))}
+                    </tbody>
+                  </table>
+                  {!!observations?.length && !filteredObservations.length && (
+                    <div className="table-empty">
+                      <span>No matching observations</span>
+                      <button
+                        onClick={() => {
+                          setDetectorFilter("");
+                          setStatusFilter("");
+                          setRecordSearch("");
+                        }}
+                      >
+                        Clear filters
+                      </button>
+                    </div>
+                  )}
+                  {!(observations?.length || allFrames.length) && (
+                    <div className="table-empty">
+                      <span>No observations</span>
+                    </div>
+                  )}
+                </div>
+              </>
             )}
           </section>
         </div>

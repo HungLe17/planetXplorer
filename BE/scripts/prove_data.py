@@ -47,6 +47,12 @@ def main():
                 "target": preset["id"],
                 "checked_at": datetime.now(UTC).isoformat(),
                 "query": query.model_dump(mode="json"),
+                "observations": len(result.observations),
+                "detectors": sorted({o.detector for o in result.observations}),
+                "sequences": len(result.sequences),
+                "largest_sequence": max(
+                    (len(g.frame_ids) for g in result.sequences), default=0
+                ),
                 "frames": len(result.frames),
                 "dates": [f.observed_at for f in result.frames],
                 "sources": [f.source_url for f in result.frames],
@@ -54,15 +60,19 @@ def main():
                 "warnings": result.warnings,
                 "omissions": result.omissions,
                 "outcome": "playable sequence"
-                if len(result.frames) > 1
-                else "insufficient compatible frames",
+                if any(len(g.frame_ids) > 1 for g in result.sequences)
+                else "images available; no compatible pair in the loaded batch"
+                if result.frames
+                else "no usable frames in the loaded batch",
                 "detection_claim": "none; visual inspection is required",
             }
             if args.bundle and result.frames:
                 dest = ROOT / "demos" / preset["id"]
                 dest.mkdir(parents=True, exist_ok=True)
                 for f in result.frames:
-                    shutil.copyfile(directory / f.id, dest / f.id)
+                    for asset in (f.id, f.pixels, f.quality):
+                        if asset:
+                            shutil.copyfile(directory / asset, dest / asset)
                 atomic_json(dest / "manifest.json", result.model_dump(mode="json"))
         except Exception as exc:  # noqa: BLE001 -- record each target's independent failure
             report = {

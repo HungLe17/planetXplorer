@@ -14,6 +14,7 @@ export type Frame = {
   detector: string;
   wavelength_um?: number;
   bandwidth_um?: number;
+  sequence_id?: string;
   pixels?: string;
   quality?: string;
   channel?: string;
@@ -24,12 +25,35 @@ export type Frame = {
   source_url?: string;
   warnings?: string[];
 };
+export type Observation = {
+  id: string;
+  source_url: string;
+  observed_at: string;
+  detector: string;
+  release: string;
+  status: "pending" | "loading" | "ready" | "failed";
+  reason?: string;
+  frame_id?: string;
+};
+export type Sequence = {
+  id: string;
+  detector: string;
+  wavelength_um: number;
+  processing_version: string;
+  frame_ids: string[];
+  stretch: { vmin?: number; vmax?: number; units?: string };
+};
 export type Manifest = {
+  observations?: Observation[];
+  sequences?: Sequence[];
+  discovery_complete?: boolean;
   frames: Frame[];
   warnings?: string[];
   retrieved_at?: string;
   cached?: boolean;
   processing?: {
+    batch_size?: number;
+    revision?: number;
     output_shape?: number[];
     archive_complete?: boolean;
     refreshing_cache?: boolean;
