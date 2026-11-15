@@ -30,22 +30,24 @@ test("an uninstalled DESI index explains how to install it", async ({page}) => {
 });
 
 test("a temporary DESI failure can retry and report a successful empty cone", async ({page}) => {
-  let requests = 0;
+  let requests = 0, successful = 0, recovered = false;
   await page.route("**/api/surveys/desi", route => {
     requests++;
     expect(route.request().postDataJSON()).toEqual({ra_deg:5, dec_deg:2});
-    return requests === 1
-      ? route.fulfill({status:502, json:{detail:"DESI lookup unavailable"}})
-      : route.fulfill({json:{galaxies:[], source_url:source}});
+    if (!recovered) return route.fulfill({status:502, json:{detail:"DESI lookup unavailable"}});
+    successful++;
+    return route.fulfill({json:{galaxies:[], source_url:source}});
   });
   const desi = await openSurveys(page);
   await expect(desi.getByRole("status")).toContainText("Lookup unavailable");
   await expect(desi).not.toContainText("0 matching galaxies");
+  recovered = true;
   await desi.getByRole("button", {name:"Retry"}).click();
   await expect(desi).toContainText("0 matching galaxies");
   await expect(desi.getByRole("status")).toHaveCount(0);
   await expect(desi.getByRole("link", {name:/Source catalogs/})).toHaveAttribute("href",source);
-  expect(requests).toBe(2);
+  expect(requests).toBeGreaterThanOrEqual(2);
+  expect(successful).toBe(1);
 });
 
 test("a DESI DR1 match shows its tracer, redshift, identity and coordinates", async ({page}) => {

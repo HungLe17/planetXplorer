@@ -6,11 +6,13 @@ import {
   products,
   cycleDifferences,
   mapBounds,
+  isSignedMap,
   palette,
   renderProduct,
   frameAsset,
   imageTimeline,
   motionSelection,
+  matchesChannel,
   responseKey,
   archivedAt,
   grey,
@@ -35,8 +37,9 @@ async function fetchBytes(
     throw Error(kind + " data has unexpected dimensions.");
   return buffer;
 }
-export function useImages(manifest: Manifest | null, s: Display, raw: boolean, choices: Record<string, boolean>, query: Query | null,
-  referenceId: string | null = null, differenceMapId = "", matchedSteps?: CycleInput[]) {
+export function useImages(manifest: Manifest | null, s: Display, browse: boolean, choices: Record<string, boolean>, query: Query | null,
+  referenceId: string | null = null, matchedSteps?: CycleInput[],
+  automaticMap = false) {
   const source = manifest?.frames ?? empty;
   const [height, width] = manifest?.processing?.output_shape ?? [0, 0];
   const count = width * height;
@@ -92,62 +95,92 @@ export function useImages(manifest: Manifest | null, s: Display, raw: boolean, c
     [requests, assets, quality, version, qualityVersion],
   );
   const plan = useMemo(() => motionSelection(manifest, s, choices, query), [manifest, s.maps, choices, query]);
-  const differenceMaps = plan.nativeMap ? [plan.nativeMap] : plan.raw ? [] : s.maps;
-  const differenceMap = differenceMaps.find(m => m.id === differenceMapId) ?? differenceMaps[0];
-  const difference = useMemo(() => referenceId === null || raw ? null :
-    cycleDifferences(data, plan.steps, differenceMap, referenceId), [data, plan, differenceMap, referenceId, raw]);
+  const eligibleFrames = useMemo(() => source.filter(f => {
+    if (choices[f.observation_id] === false ||
+        (query?.detectors && !query.detectors.some(det => det === f.detector))) return false;
+    const labels = Object.entries(query?.channels ?? {}).find(([det]) => det === f.detector)?.[1];
+    return !labels?.length || labels.some(key => matchesChannel(key, f));
+  }), [source, choices, query]);
+  const selectedData = useMemo(() => {
+    const ids = new Set(eligibleFrames.map(f => f.observation_id));
+    return data.filter(p => ids.has(p.frame.observation_id));
+  }, [data, eligibleFrames]);
+  const fullCycles = useMemo<CycleInput[]>(() => {
+    const byId = new Map(eligibleFrames.map(f => [f.observation_id, f]));
+    return (manifest?.visits ?? []).flatMap(visit => {
+      if (visit.kind === "supplemental" || visit.status === "invalid") return [];
+      const members = visit.observation_ids.flatMap(id => byId.get(id) ?? []);
+      return members.length ? [{ visit, members, source: members[0] }] : [];
+    });
+  }, [eligibleFrames, manifest?.visits]);
+  const differenceSteps = useMemo(() => {
+    if (!matchedSteps) return fullCycles;
+    const byId = new Map(eligibleFrames.map(f => [f.observation_id, f]));
+    return matchedSteps.map(step => {
+      const repeats = new Set(step.members.map(f => f.observation_id));
+      const peers = step.visit.observation_ids.flatMap(id => {
+        const frame = byId.get(id);
+        return frame && !repeats.has(id) ? [frame] : [];
+      });
+      return { ...step, members: [step.source, ...peers] };
+    });
+  }, [matchedSteps, fullCycles, eligibleFrames]);
+  const difference = useMemo(() => referenceId === null || browse ? null :
+    cycleDifferences(selectedData, differenceSteps, s.maps, referenceId, automaticMap,
+      manifest?.processing?.spectral_tolerance ?? 0.5),
+    [selectedData, differenceSteps, s.maps, referenceId, browse, automaticMap, manifest?.processing?.spectral_tolerance]);
   const series = useMemo(() => {
-    const selected = data.filter(p => plan.includedIds.has(p.frame.observation_id));
-    const style = plan.nativeMap ? {...s, maps:[plan.nativeMap]} : s;
-    const maps = plan.raw || !manifest?.visits?.length ? [] : products(selected, style, manifest.visits);
+    // Map every eligible exposure in an epoch. Motion representatives select
+    // comparable playback steps; they must not discard other map wavelengths.
+    const maps = !manifest?.visits?.length ? [] :
+      products(selectedData, s, manifest.visits, automaticMap ? "available" : false);
     const byVisit = new Map(maps.map(map => [map.frame.observation_id, map]));
     const groups = new Map<string, typeof plan.steps>();
     const reasons = new Map(plan.reasons);
-    const responses = (frames: Frame[]) => frames.map(responseKey).sort();
+    const responses = (frames: Frame[]) => frames.map(f => plan.responseKeys.get(f.observation_id) ?? responseKey(f)).sort();
     for (const step of plan.steps) {
       const map = byVisit.get(step.visit.id);
-      const complete = map && map.layers.length === style.maps.length &&
+      const complete = map && map.layers.length === s.maps.length &&
         step.members.every(f => map.inputs.some(input => input.observation_id === f.observation_id));
       // Include primary and reference multiplicities. A sum of two frames or
       // a partial difference map cannot be compared with a one-frame product.
       let signature: string;
       if (complete) signature = JSON.stringify([responses(map.inputs), responses(map.reference)]);
-      else if (step.members.length === 1 && (plan.raw || (style.maps.length === 1 && !style.maps[0].difference &&
-        Object.keys(style.maps[0].operands).length === 1))) signature = "raw";
+      else if (step.members.length === 1 && !numeric) signature = "preview";
       else {
         reasons.set(step.visit.id, "Waiting for comparable map inputs");
         continue;
       }
       const group = groups.get(signature) ?? [];
-      group.push(step);
+      group.push(map ? { ...step, members: map.inputs } : step);
       groups.set(signature, group);
     }
     const pins = (group: typeof plan.steps) => group.filter(step => step.members.some(f => choices[f.observation_id])).length;
     const span = (group: typeof plan.steps) => Date.parse(group.at(-1)!.visit.end_utc) - Date.parse(group[0].visit.start_utc);
     const ordered = [...groups].sort(([a, x], [b, y]) => pins(y)-pins(x) || y.length-x.length ||
-      span(y)-span(x) || Number(a === "raw") - Number(b === "raw"));
-    const [signature, steps] = ordered[0] ?? ["", [] as typeof plan.steps];
+      span(y)-span(x) || Number(a === "preview") - Number(b === "preview"));
+    const steps = ordered[0]?.[1] ?? [];
     for (const [,group] of ordered.slice(1)) for (const step of group)
       reasons.set(step.visit.id, "Different map inputs or calibration pending");
     const includedIds = new Set(steps.flatMap(step => step.members.map(f => f.observation_id)));
     const frameReasons = new Map(plan.frameReasons);
     for (const step of plan.steps) if (reasons.has(step.visit.id))
       for (const f of step.members) frameReasons.set(f.observation_id, reasons.get(step.visit.id)!);
-    const mapped = signature !== "raw" ? steps.flatMap(step => byVisit.get(step.visit.id) ?? []) : [];
-    return {steps, mapped, includedIds, frameReasons, reasons};
-  }, [plan, data, s.maps, manifest?.visits, choices]);
+    return {steps, allMapped: maps, includedIds, frameReasons, reasons};
+  }, [plan, selectedData, s.maps, manifest?.visits, choices, automaticMap, numeric]);
   // A single pending exposure can paint immediately, including from a legacy
   // manifest without spectral matching. It never becomes a second motion step.
   const shown = useMemo(() => series.steps.length ? series.steps : plan.preview ? [plan.preview] : [], [series.steps, plan.preview]);
   const result = useMemo(() => {
     if (difference) return difference.products;
-    if (matchedSteps) return products(data, s, manifest?.visits, false, matchedSteps);
-    if (raw || !manifest?.visits?.length) return products(data, s, manifest?.visits, true);
-    const mapped = series.mapped;
+    if (matchedSteps) return products(selectedData, s, manifest?.visits, automaticMap ? "available" : false, matchedSteps);
+    if (browse || !manifest?.visits?.length) return products(data, s, manifest?.visits, "mapped");
+    const visible = new Set(shown.map(step => step.visit.id));
+    const mapped = series.allMapped.filter(p => visible.has(p.frame.observation_id));
     const represented = new Set(mapped.map(p => p.frame.observation_id));
     const fallback = new Set(shown.filter(step => !represented.has(step.visit.id)).map(step => step.source.observation_id));
-    return [...mapped, ...products(data.filter(p => fallback.has(p.frame.observation_id)), s, [], true)];
-  }, [difference, series.mapped, shown, raw, data, s.maps, manifest?.visits, matchedSteps]);
+    return [...mapped, ...products(data.filter(p => fallback.has(p.frame.observation_id)), s, [], "mapped")];
+  }, [difference, series.allMapped, shown, browse, data, selectedData, s.maps, manifest?.visits, matchedSteps, automaticMap]);
   const rendered = useMemo<RenderedFrame[]>(
     () =>
       result.map((p) => {
@@ -155,8 +188,8 @@ export function useImages(manifest: Manifest | null, s: Display, raw: boolean, c
           name: map.name,
           stretch: map.stretch,
           stops: map.stops,
-          bounds: p.subtraction && difference ? difference.bounds : mapBounds(values, map),
-          signed: !!p.subtraction,
+          bounds: p.subtraction && difference ? difference.boundsByMap.get(map.id) ?? difference.bounds : mapBounds(values, map),
+          signed: !!p.subtraction || isSignedMap(map),
         }));
         const used = new Set([...p.inputs, ...(p.subtraction ? p.reference : [])].map((f) => f.observation_id));
         const bands = p.sourcePlanes.filter(
@@ -191,8 +224,8 @@ export function useImages(manifest: Manifest | null, s: Display, raw: boolean, c
     [result, difference, count, width, height],
   );
   const timeline = useMemo(
-    () => imageTimeline(manifest, rendered, result, raw, difference?.steps ?? shown),
-    [manifest, rendered, result, raw, shown, difference],
+    () => imageTimeline(manifest, rendered, result, browse, difference?.steps ?? shown),
+    [manifest, rendered, result, browse, shown, difference],
   );
   const failure =
     urls.map((u) => assets.get(u)?.error).find(Boolean) ||
@@ -209,7 +242,7 @@ export function useImages(manifest: Manifest | null, s: Display, raw: boolean, c
   );
   const message =
     failure ||
-    (difference && !difference.products.length ? "Subtraction needs two calibrated cycles with matching wavelengths and overlapping measured pixels. Choose a reference or return to Visits to inspect exposures." : "") ||
+    (difference && !difference.products.length ? difference.reason || "Subtraction needs two calibrated cycles with matching wavelengths and overlapping measured pixels. Choose a reference or return to Visits to inspect exposures." : "") ||
     (invalid ? "Minimum exceeds maximum for " + invalid.name + "." : "") ||
     (numeric && !result.length
       ? !settled
@@ -217,13 +250,13 @@ export function useImages(manifest: Manifest | null, s: Display, raw: boolean, c
         : !s.maps.length
           ? "Add a map to display a visit."
           : "No visit has a usable combination for these map inputs. Browse exposures to inspect individual data."
-      : !numeric && !raw && manifest?.visits?.length && source.length
+      : !numeric && !browse && manifest?.visits?.length && source.length
         ? "Only preview images are available. Browse exposures to view them."
         : "");
   return {
     ...timeline,
     steps:difference?.steps ?? series.steps,
-    difference, differenceMaps, differenceMap,
+    difference,
     includedIds:series.includedIds,
     reasons:series.reasons,
     frameReasons:series.frameReasons,

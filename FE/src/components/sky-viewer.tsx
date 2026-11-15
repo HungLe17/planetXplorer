@@ -36,7 +36,7 @@ type FrameImage = HTMLCanvasElement | HTMLImageElement;
 export type PixelBox = [number, number, number, number];
 
 function frameLegend(frame: RenderedFrame, bounds: number[], stretch: string, colors: number[][], invert: boolean) {
-  const scales = frame.mapScales?.length ? frame.mapScales : [{
+  const scales = frame.mapScales ?? [{
     name: "Intensity", bounds: frame.previewScale?.bounds ?? bounds,
     stretch: frame.previewScale?.stretch ?? stretch, stops: undefined,
   }];
@@ -52,6 +52,27 @@ function frameLegend(frame: RenderedFrame, bounds: number[], stretch: string, co
     const units = frame.previewScale?.units ?? "MJy/sr";
     return {stops, label:`${scale.name} · ${lo.toPrecision(4)} … ${hi.toPrecision(4)} ${units} · ${scale.stretch}`};
   });
+}
+
+function captionLines(ctx: CanvasRenderingContext2D, text: string, width: number) {
+  const lines: string[] = [];
+  let line = "";
+  for (const word of text.split(/\s+/)) {
+    const next = line ? line + " " + word : word;
+    if (line && ctx.measureText(next).width > width) {
+      lines.push(line);
+      line = "";
+    }
+    for (const character of (line ? " " : "") + word) {
+      if (line && ctx.measureText(line + character).width > width) {
+        lines.push(line);
+        line = "";
+      }
+      line += character;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
 }
 
 function loadPreview(url: string, signal: AbortSignal, retry = false) {
@@ -295,11 +316,9 @@ export default function SkyViewer({
   function paint(
     ctx: CanvasRenderingContext2D,
     img: FrameImage,
-    width: number,
-    height: number,
+    g: { x: number; y: number; w: number; h: number },
     warningPixels?: Uint32Array,
   ) {
-    const g = geometry(img, width, height);
     ctx.imageSmoothingEnabled = false;
     ctx.filter = invert ? "invert(1)" : "none";
     ctx.drawImage(img, g.x, g.y, g.w, g.h);
@@ -355,36 +374,45 @@ export default function SkyViewer({
     if (skyReadout.current.textContent !== value) skyReadout.current.textContent = value;
   }
   async function exportImage(animated: boolean) {
-    if (!query || !box.current || !current || exportController.current) return;
+    if (!query || !currentImage || !current || exportController.current) return;
     const controller = new AbortController();
     exportController.current = controller;
     setExporting(true);
     setExportError("");
     try {
-      const rect = box.current.getBoundingClientRect();
-      const width = Math.round(rect.width),
-        height = Math.round(rect.height);
+      const width = Math.max(1024, currentImage.width);
+      const height = Math.round(currentImage.height * width / currentImage.width);
       const exportFrames = animated ? frames : [frames[index]];
       const qualityLegend =
         display.markFlagged &&
         exportFrames.some((f) => f.warningPixels?.length);
-      const scaleHeight =
-        38 * Math.max(1, ...exportFrames.map((f) => f.mapScales?.length ?? 0));
-      const legendHeight = display.legend
-        ? scaleHeight + (qualityLegend ? 18 : 0)
-        : 0;
       const out = document.createElement("canvas");
-      out.width = Math.round(width);
-      out.height = height + legendHeight;
+      out.width = width;
       const ctx = out.getContext("2d", { willReadFrequently: true })!;
+      const font = "18px monospace", lineHeight = 26, gap = 12, rampHeight = 22;
+      ctx.font = font;
+      const position = skyPosition(query, (currentImage.width - 1) / 2,
+        (currentImage.height - 1) / 2, currentImage.width, currentImage.height, gridHeader);
+      const coordinates = display.coords ? captionLines(ctx,
+        `ICRS · RA ${position.ra_deg.toFixed(6)}° · Dec ${position.dec_deg.toFixed(6)}°`, width - 24) : [];
+      const legends = exportFrames.map(frame => display.legend
+        ? frameLegend(frame, bounds, display.stretch, colors, invert)
+          .map(scale => ({ ...scale, lines: captionLines(ctx, scale.label, width - 24) }))
+        : []);
+      const coordinateHeight = coordinates.length ? gap + coordinates.length * lineHeight : 0;
+      const legendHeight = Math.max(0, ...legends.map(scales => scales.reduce((sum, scale) =>
+        sum + gap + rampHeight + scale.lines.length * lineHeight, 0)));
+      const qualityHeight = display.legend && qualityLegend ? gap + lineHeight : 0;
+      const footerHeight = coordinateHeight + legendHeight + qualityHeight;
+      out.height = height + (footerHeight ? footerHeight + gap : 0);
       const name = exportName(
         animated ? frames : [frames[index]],
         query,
-        magnification,
+        1,
       );
       const lib = animated ? await import("gifenc") : null,
         gif = lib?.GIFEncoder();
-      for (const frame of exportFrames) {
+      for (const [frameIndex, frame] of exportFrames.entries()) {
         controller.signal.throwIfAborted();
         const img =
           frame.canvas ??
@@ -398,40 +426,49 @@ export default function SkyViewer({
         ctx.clearRect(0, 0, out.width, out.height);
         ctx.fillStyle = "#000";
         if (animated) ctx.fillRect(0, 0, out.width, out.height);
-        else if (legendHeight) ctx.fillRect(0, height, out.width, legendHeight);
+        else if (footerHeight) ctx.fillRect(0, height, width, out.height - height);
         ctx.save();
         ctx.beginPath();
         ctx.rect(0, 0, width, height);
         ctx.clip();
-        paint(ctx, img, width, height, frame.warningPixels);
+        const scale = Math.min(width / img.width, height / img.height);
+        const mapWidth = Math.round(img.width * scale), mapHeight = Math.round(img.height * scale);
+        const mapX = Math.round((width - mapWidth) / 2);
+        paint(ctx, img, { x: mapX, y: 0, w: mapWidth, h: mapHeight }, frame.warningPixels);
         ctx.restore();
         ctx.fillStyle = "white";
-        ctx.font = "13px monospace";
-        if (display.coords)
-          ctx.fillText(
-            "ICRS " + query.ra_deg + "°, " + query.dec_deg + "°",
-            8,
-            18,
-          );
+        ctx.font = font;
+        ctx.textBaseline = "top";
+        ctx.textAlign = "center";
+        let y = height;
+        if (coordinates.length) {
+          y += gap;
+          for (const line of coordinates) {
+            ctx.fillText(line, width / 2, y);
+            y += lineHeight;
+          }
+        }
         if (display.legend) {
-          for (const [row, scale] of frameLegend(frame, bounds, display.stretch, colors, invert).entries()) {
-            const gradient = ctx.createLinearGradient(8, 0, width - 8, 0);
-            scale.stops.forEach((color, index) => gradient.addColorStop(index / 255, color));
+          for (const legend of legends[frameIndex]) {
+            y += gap;
+            const gradient = ctx.createLinearGradient(mapX, 0, mapX + mapWidth, 0);
+            legend.stops.forEach((color, index) => gradient.addColorStop(index / 255, color));
             ctx.fillStyle = gradient;
-            ctx.fillRect(8, height + 4 + row * 38, width - 16, 11);
+            ctx.fillRect(mapX, y, mapWidth, rampHeight);
+            y += rampHeight;
             ctx.fillStyle = "white";
-            ctx.fillText(
-              scale.label,
-              8,
-              height + 30 + row * 38,
-              width - 16,
-            );
+            for (const line of legend.lines) {
+              ctx.fillText(line, width / 2, y);
+              y += lineHeight;
+            }
           }
           if (qualityLegend) {
+            y += gap;
+            ctx.textAlign = "left";
             ctx.fillStyle = "#ffbd45";
-            ctx.fillRect(9, height + scaleHeight + 3, 7, 7);
+            ctx.fillRect(12, y + 4, 12, 12);
             ctx.fillStyle = "white";
-            ctx.fillText("Flagged pixel", 22, height + scaleHeight + 11);
+            ctx.fillText("Flagged pixel", 32, y);
           }
         }
         if (lib && gif) {
@@ -481,7 +518,7 @@ export default function SkyViewer({
       ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
       ctx.clearRect(0, 0, rect.width, rect.height);
       if (!currentImage) return;
-      paint(ctx, currentImage, rect.width, rect.height, currentWarnings);
+      paint(ctx, currentImage, geometry(currentImage, rect.width, rect.height), currentWarnings);
       if (markers.length) {
         const g = geometry(currentImage, rect.width, rect.height);
         ctx.save();
@@ -869,14 +906,14 @@ export default function SkyViewer({
         <span className="canvas-tool-label"><Download size={12} />Export</span>
         <button
           disabled={!loaded || exporting}
-          title="Download the displayed image as PNG"
+          title="Download the full map and selected annotations as PNG"
           onClick={() => void exportImage(false)}
         >
           PNG
         </button>
         <button
           disabled={!loaded || exporting || !cycleView || frames.length < 2}
-          title={cycleView && frames.length >= 2 ? "Export the observing cycles as an animated GIF" : "GIF export needs two cycles in Visits or Matched view"}
+          title={cycleView && frames.length >= 2 ? "Export the full cycle maps as an animated GIF" : "GIF export needs two cycles in Visits or Matched view"}
           onClick={() => void exportImage(true)}
         >
           GIF

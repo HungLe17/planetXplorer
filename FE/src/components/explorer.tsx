@@ -49,6 +49,7 @@ import {
   activeChannels,
   activeDetectors,
   defaults,
+  detectors,
   matchesChannel,
   skyPixel,
   skyPosition,
@@ -155,8 +156,14 @@ export default function Explorer() {
   const [detectorFilter, setDetectorFilter] = useState("");
   const [tab, setTab] = useState("Settings");
   const [display, setDisplay] = useState(defaults);
+  const automaticMap = useRef(true);
   const update = useCallback(
-    (patch: Partial<Display>) => setDisplay((old) => ({ ...old, ...patch })),
+    (patch: Partial<Display>) => {
+      if (patch.maps) {
+        automaticMap.current = false;
+      }
+      setDisplay((old) => ({ ...old, ...patch }));
+    },
     [],
   );
   const setSpeed = (speed: number) => update({ speed });
@@ -200,8 +207,7 @@ export default function Explorer() {
   const lastSaved = useRef<Backup | null>(null);
   const hasCycles = !!manifest?.visits?.some(v => v.kind !== "supplemental");
   const [referenceCycle, setReferenceCycle] = useState<string | null>(null);
-  const [differenceMapId, setDifferenceMapId] = useState("");
-  const subtracting = viewMode === "visits" && hasCycles && referenceCycle !== null;
+  const subtracting = referenceCycle !== null && viewMode !== "browse";
   const [dockOpen, setDockOpen] = useState(true);
   const [committed, setCommitted] = useState<Query | null>(null);
   const bandsEdited = !!committed?.live && (
@@ -212,6 +218,19 @@ export default function Explorer() {
     generation = useRef(0),
     activeJob = useRef<string | null>(null);
   const allFrames = manifest?.frames ?? empty;
+  useEffect(() => {
+    if (!automaticMap.current || !manifest) return;
+    const available = detectors.filter(det => {
+      if (displayedQuery?.detectors && !displayedQuery.detectors.includes(det)) return false;
+      const channels = displayedQuery?.channels?.[det];
+      return manifest.frames.some(f => f.detector === det &&
+        (!channels?.length || channels.some(key => matchesChannel(key, f))));
+    });
+    const operands = Object.fromEntries(available.map(det => [det, 1]));
+    setDisplay(old => old.maps.length !== 1 ||
+      JSON.stringify(old.maps[0].operands) === JSON.stringify(operands) ? old :
+      { ...old, maps: [{ ...old.maps[0], operands }] });
+  }, [manifest, displayedQuery, display.maps]);
   const batchSize = Math.max(
     1,
     Math.min(8, manifest?.processing?.batch_size ?? 8),
@@ -219,33 +238,34 @@ export default function Explorer() {
   const spectra = useMemo(() => matchedSpectra(manifest, timelineChoices, displayedQuery?.min_separation_days),
     [manifest, timelineChoices, displayedQuery?.min_separation_days]);
   const sequence = spectra.find(s => s.id === sequenceId) ?? spectra.find(s => s.sequenceIds.includes(sequenceId)) ?? spectra[0];
-  const derived = viewMode === "visits" && hasCycles;
-  const matched = viewMode === "matched" && !derived;
+  const derived = (viewMode === "visits" && hasCycles) || subtracting;
+  const matched = viewMode === "matched";
   const matchedSteps = sequence?.epochs;
   const science = useImages(manifest, display, !derived, timelineChoices, displayedQuery,
-    subtracting ? referenceCycle : null, differenceMapId, matched ? matchedSteps : undefined);
+    subtracting ? referenceCycle : null, matched ? matchedSteps : undefined,
+    automaticMap.current);
   const frames = useMemo(() => {
-    if (!matched) return science.frames;
+    if (!matched || subtracting) return science.frames;
     const byId = new Map(science.frames.map(f => [f.observation_id, f]));
     return (matchedSteps ?? []).flatMap(step => byId.get(step.source.observation_id) ?? []);
-  }, [matched, matchedSteps, science.frames]),
+  }, [matched, subtracting, matchedSteps, science.frames]),
     index = Math.max(
       0,
       frames.findIndex((f) => f.observation_id === selectedFrame || (derived && f.visit_id === selectedFrame)),
     ),
     frame = frames[index];
   const isVisitMap = !!frame?.visit_id && frame.observation_id === frame.visit_id;
-  const steps = matched ? (matchedSteps ?? []) : science.steps;
+  const steps = matched && !subtracting ? (matchedSteps ?? []) : science.steps;
   const cycleIndex = frame ? steps.findIndex(({ visit }) =>
     frame.visit_id === visit.id || visit.observation_ids.includes(frame.observation_id)) : -1;
   const selectCycle = useCallback((position: number) => {
     const step = steps[position];
     if (!step) return;
-    const key = matched ? step.source.observation_id : step.visit.id;
+    const key = matched && !subtracting ? step.source.observation_id : step.visit.id;
     restoreFrame.current = key;
     if (!matched) setViewMode("visits");
     setSelectedFrame(key);
-  }, [steps, matched]);
+  }, [steps, matched, subtracting]);
   // A raw exposure outside a cycle can jump to the nearest cycle in either direction.
   const previousCycle = cycleIndex >= 0 ? cycleIndex - 1
     : steps.findLastIndex(s => frame && Date.parse(s.visit.end_utc) < Date.parse(frame.observed_at));
@@ -832,14 +852,21 @@ export default function Explorer() {
       !fieldJobId || !manifest || (!manifest.visits?.length && !manifest.processing?.sampling_tracks)
     )
       return;
-    const detectors = activeDetectors(display);
-    const channels = activeChannels(display);
+    const samplingOrder = manifest.processing?.sampling_order;
+    // Expanding the untouched display sum must not request more archive bands.
+    // Legacy discovery still needs its initially submitted representative band.
+    const automaticDemand = automaticMap.current && !samplingOrder;
+    const detectors = automaticDemand
+      ? [displayedQuery.detectors?.[0] ?? "D1"]
+      : activeDetectors(display);
+    const channels = automaticDemand
+      ? displayedQuery.channels ?? {}
+      : activeChannels(display);
     const pinnedIds = new Set(
       display.maps.flatMap(m => Object.keys(m.operands))
         .filter(key => key.startsWith("exposure:"))
         .map(key => key.slice(9)),
     );
-    const samplingOrder = manifest.processing?.sampling_order;
     const representativeRank = new Map(samplingOrder?.map((id, i) => [id, i]));
     const metadataIds = new Set(manifest.processing?.sampling_metadata_ids);
     const wanted = observations.filter(o => (o.status === "pending" || (o.status === "ready" && metadataIds.has(o.id))) &&
@@ -863,7 +890,7 @@ export default function Explorer() {
         if (timelineChoices[o.id] !== false && metadataIds.has(o.id)) return 1;
         return display.prefetchBands ? 3 : 4;
       }
-      // Older manifests have no archive sampling plan. Use their existing map inputs.
+      // Explicitly edited maps can request their inputs in older manifests.
       if (
         requestedId &&
         manifest.visits?.some(
@@ -979,6 +1006,7 @@ export default function Explorer() {
       const state = params.get("view");
       if (state) openingDisplay = readDisplay(JSON.parse(state));
       else if (!viaUrl && saved?.config) openingDisplay = saved.config.display;
+      automaticMap.current = !state && (viaUrl || !saved?.config);
       setDisplay(openingDisplay);
       if (!params.has("ra") && saved?.config?.query) {
         const q = saved.config.query;
@@ -1185,6 +1213,7 @@ export default function Explorer() {
     c: Config,
     wantedPosition: RestorePosition | null = null,
   ) {
+    automaticMap.current = false;
     setDisplay(c.display);
     setFov(String(c.fov));
     if (c.query) {
@@ -1507,6 +1536,7 @@ export default function Explorer() {
                         setStart("");
                         setEnd("");
                         setSelected("");
+                        automaticMap.current = true;
                         setDisplay(defaults);
                         setBandDraft({ D1: null });
                         setMinDays(null);
@@ -1545,9 +1575,8 @@ export default function Explorer() {
               <ImageControls
                 s={display}
                 manifest={manifest}
-                update={(patch, keepView) => {
+                update={(patch) => {
                   setAutoPaused(false);
-                  if (!keepView && !matched) setViewMode("visits");
                   update(patch);
                 }}
               />
@@ -1723,6 +1752,9 @@ export default function Explorer() {
         <div className="content">
           <h1 className="sr-only">planetXplorer</h1>
           <div className="feedback" aria-live="polite">
+            {product && !product.layers.length && (
+              <p><Info size={14} />No configured map inputs apply to this exposure. Choose matching spectra in the map’s Inputs.</p>
+            )}
             {conflicts.length > 0 && (
               <Notification key={fieldJobId + conflicts.map(v => v.id).join("/")} label="visit warning">
               <details>
@@ -1854,13 +1886,18 @@ export default function Explorer() {
                         Visits
                       </button>
                     )}
-                    {hasCycles && (
-                      <button aria-pressed={subtracting} title="Subtract one calibrated cycle from the others"
+                    {(hasCycles || (matchedSteps?.length ?? 0) > 1) && (
+                      <button aria-pressed={subtracting} title="Subtract one calibrated observing epoch from the others"
                         onClick={() => {
-                          if (subtracting) { setMode("visits"); return; }
-                          setMode("visits");
-                          setReferenceCycle(steps[0]?.visit.id ?? "");
-                          if (steps.length > 1 && cycleIndex <= 0) selectCycle(1);
+                          if (subtracting) { setMode(matched ? "matched" : "visits"); return; }
+                          const useMatched = matched || !hasCycles;
+                          const epochs = useMatched ? matchedSteps ?? [] : steps;
+                          setMode(useMatched ? "matched" : "visits");
+                          setReferenceCycle(epochs[0]?.visit.id ?? "");
+                          if (epochs.length > 1 && cycleIndex <= 0) {
+                            restoreFrame.current = epochs[1].visit.id;
+                            setSelectedFrame(epochs[1].visit.id);
+                          }
                         }}>Subtract</button>
                     )}
                     <button
@@ -1871,7 +1908,7 @@ export default function Explorer() {
                       Browse
                     </button>
                     <button
-                      aria-pressed={matched}
+                      aria-pressed={matched && !subtracting}
                       disabled={!spectra.length}
                       onClick={() => setMode("matched")}
                       title="Inspect exposures with compatible wavelength and calibration"
@@ -1879,7 +1916,7 @@ export default function Explorer() {
                       Matched
                     </button>
                   </div>
-                  {matched && sequence ? (
+                  {matched && !subtracting && sequence ? (
                     <MatchedPicker spectra={spectra} selected={sequence} currentId={frame?.observation_id}
                       stamp={stamp} select={(id, exposure) => {
                         setPlaying(false);
@@ -1911,10 +1948,6 @@ export default function Explorer() {
               )}
               {subtracting && science.difference && (
                 <div className="sequence-toolbar" role="group" aria-label="Cycle subtraction">
-                  {science.differenceMaps.length > 1 && <label>Map{" "}
-                    <select value={science.differenceMap?.id ?? ""} onChange={e => setDifferenceMapId(e.target.value)}>
-                      {science.differenceMaps.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
-                    </select></label>}
                   <label>Reference cycle{" "}
                     <select value={referenceCycle ?? ""} onChange={e => {setPlaying(false); setReferenceCycle(e.target.value);}}>
                       <option value="">Earliest calibrated cycle</option>
@@ -1924,12 +1957,12 @@ export default function Explorer() {
                     </select>
                   </label>
                   <span className="browse-summary">
-                    Displayed cycle − reference · MJy/sr · {invert ? "inverted colors" : "orange brighter, blue fainter"}
+                    Displayed cycle − reference · MJy/sr · {invert ? "inverted map colors" : "configured map colors"}
                   </span>
                 </div>
               )}
               <SkyViewer
-                cycleView={derived}
+                cycleView={derived || matched}
                 unmatchedFrames={unmatchedFrames}
                 frames={frames}
                 index={index}

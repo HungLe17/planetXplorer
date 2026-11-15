@@ -344,7 +344,7 @@ test("exposure PNG and calibrated brightness paint before lazy wavelength data",
     await expect(page.locator(".image-readout")).toContainText("Exposure PNG preview");
     await page.getByRole("button",{name:"Close frame details"}).click();
     brightness();
-    await expect(page.locator(".image-readout")).toContainText("Calibrated exposure");
+    await expect(page.locator(".image-readout")).toContainText("Visit composite");
     expect(waveRequests).toBe(0);
     await page.getByRole("button",{name:"Toggle frame details"}).click();
     await expect(page.getByLabel("Visit spectra")).toContainText("42 MJy/sr");

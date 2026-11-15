@@ -15,6 +15,7 @@ import {
   inspectBand,
   imageTimeline,
   intensityByte,
+  isSignedMap,
   mapBounds,
   measureSpectrum,
   motionSelection,
@@ -38,6 +39,8 @@ function exposure(detector, wavelength, date, values, quality) {
       url: id + ".png",
       detector,
       observed_at: date,
+      processing_version: "v1",
+      sequence_id: detector + "-" + wavelength,
       wavelength_um: wavelength,
       channel: detector + " " + wavelength + " µm",
     },
@@ -88,9 +91,13 @@ test("fixed-cycle subtraction preserves both residual signs and uses measured pi
     return p;
   });
   const steps = planes.map((p,i) => ({visit:visit(fields[i][0],[p]), source:p.frame, members:[p.frame]}));
-  const diff = cycleDifferences(planes, steps, defaults.maps[0], "reference");
+  const signedMap = {...defaults.maps[0], stretch:"linear", stops:[
+    {at:0,color:"#40bfff"}, {at:127/255,color:"#000000"}, {at:128/255,color:"#000000"}, {at:1,color:"#ff983e"},
+  ]};
+  const diff = cycleDifferences(planes, steps, signedMap, "reference");
   assert.deepEqual(diff.steps.map(s=>s.visit.id), ["reference", "science", "later"]);
-  assert.deepEqual([...diff.products[1].layers[0].values], [-7, 7, 0, NaN, NaN]);
+  assert.deepEqual([...diff.products[1].layers[0].values], [-7, 7, 0, NaN, -5]);
+  assert.equal(cycleDifferences(planes, steps, signedMap, "science").products[0].layers[0].values[4], 5);
   assert.deepEqual(diff.bounds, [-10, 10]);
   const colors = new Uint8ClampedArray(20);
   const [layer] = diff.products[1].layers;
@@ -99,6 +106,88 @@ test("fixed-cycle subtraction preserves both residual signs and uses measured pi
   assert.deepEqual([...colors.slice(8,16)], [0,0,0,255,0,0,0,0]);
   assert.equal(cycleDifferences(planes, steps, undefined, "unmatched").products.length, 0);
   assert.equal(cycleDifferences(planes, steps, undefined, "missing").products.length, 0);
+});
+
+test("three nominal epochs with separately assigned sequence IDs subtract only verified responses and inherit every map", () => {
+  const dates = ["2025-01-01", "2025-07-01", "2026-01-01", "2026-07-01", "2027-01-01"];
+  const values = [[9,1,3,NaN], [2,8,5,4], [12,0,8,9], [500,500,500,500], [900,900,900,900]];
+  const planes = dates.map((date, index) => {
+    const plane = exposure("D1", 1, date, values[index]);
+    Object.assign(plane.frame, {nominal_channel:3, channel:undefined, sequence_id:"cached-job-" + index,
+      processing_version:index === 4 ? "v2" : "v1",
+      match_wavelengths:Array(5).fill(index === 3 ? 1.2 : 1 + index * 0.001),
+      match_bandwidths:Array(5).fill(0.02)});
+    return plane;
+  });
+  const steps = planes.map((plane,index) => ({visit:visit("epoch-" + index,[plane]), source:plane.frame, members:[plane.frame]}));
+  const warm = map("warm", {"D1-03":1}, {stretch:"sqrt",low:"-20",high:"20",
+    stops:[{at:0,color:"#00000000"},{at:1,color:"#ff0000"}]});
+  const cool = map("cool", {"D1-03":-1}, {stretch:"log",
+    stops:[{at:0,color:"#00000000"},{at:1,color:"#0000ff"}]});
+  const difference = cycleDifferences(planes,steps,[warm,cool],"epoch-0");
+  assert.deepEqual(difference.steps.map(step => step.visit.id),["epoch-0","epoch-1","epoch-2"]);
+  assert.deepEqual(difference.products[1].layers.map(layer => [...layer.values]),[
+    [-7,7,2,NaN],[7,-7,-2,NaN],
+  ]);
+  assert.deepEqual(difference.products[1].layers.map(layer => layer.map),[
+    {...warm,name:"Δ warm",difference:false},{...cool,name:"Δ cool",difference:false},
+  ]);
+  assert.deepEqual(difference.boundsByMap.get("warm"),[-20,20]);
+  assert.deepEqual(difference.boundsByMap.get("cool"),[-7,7]);
+  const manifest = {frames:planes.map(plane => plane.frame),visits:steps.map(step => step.visit)};
+  const motion = motionSelection(manifest,{...defaults,maps:[warm]}, {}, null);
+  assert.deepEqual(motion.steps.map(step => step.visit.id),["epoch-0","epoch-1","epoch-2"]);
+  const noSequence = planes.slice(0,3).map(plane => ({...plane,frame:{...plane.frame,sequence_id:undefined}}));
+  assert.equal(cycleDifferences(noSequence,steps.slice(0,3),warm,"epoch-0").products.length,3);
+});
+
+test("fixed subtraction intersects measured response groups without filling absent map operands or pixels with zero", () => {
+  const make = (channel,date,values) => {
+    const plane=exposure("D1",channel,date,values);
+    Object.assign(plane.frame,{nominal_channel:channel,sequence_id:"nominal-" + channel});
+    return plane;
+  };
+  const early=[make(3,"2025-01-01",[10,NaN]),make(4,"2025-01-01",[100,200])];
+  const late=[make(3,"2025-07-01",[20,3]),make(5,"2025-07-01",[500,600])];
+  const data=[...early,...late];
+  const steps=[early,late].map((planes,index) => ({visit:visit("epoch-" + index,planes),source:planes[0].frame,
+    members:planes.map(plane => plane.frame)}));
+  const common=cycleDifferences(data,steps,map("D1",{D1:1}),"epoch-0");
+  assert.deepEqual([...common.products[1].layers[0].values],[10,NaN]);
+  assert.deepEqual(common.products[1].inputs.map(frame => frame.nominal_channel),[3]);
+  assert.deepEqual(common.products[1].reference.map(frame => frame.nominal_channel),[3]);
+  const missing=cycleDifferences(data,steps,map("required",{"D1-03":1,"D1-04":1}),"epoch-0");
+  assert.equal(missing.products.length,0);
+  const unknown=data.map(plane => ({...plane,frame:{...plane.frame,sequence_id:undefined,processing_version:"unknown"}}));
+  const denied=cycleDifferences(unknown,steps,map("D1",{D1:1}),"epoch-0");
+  assert.equal(denied.products.length,0);
+  assert.match(denied.reason,/verified processing version and spectral response/);
+});
+
+test("Function Difference accepts three verified nominal epochs without legacy channel labels and retains signed missing values", () => {
+  const planes=[10,20,30].map((value,index) => {
+    const plane=exposure("D1",1,`202${5+index}-01-01`,[value,NaN],{
+      archived:Float32Array.of(value,NaN),flags:Uint32Array.of(0,2),status:Uint8Array.of(1,3),
+    });
+    Object.assign(plane.frame,{channel:undefined,nominal_channel:3,sequence_id:"job-" + index,
+      match_wavelengths:Array(5).fill(1 + index * 0.001),match_bandwidths:Array(5).fill(0.02)});
+    return plane;
+  });
+  const style=map("temporal",{"D1-03":1},{difference:true,windowDays:1,exclusionDays:3,
+    stops:[{at:0,color:"#0000ff"},{at:1,color:"#ff0000"}],stretch:"linear"});
+  const result=products(planes,{...defaults,maps:[style]},planes.map((plane,index) => visit("v"+index,[plane])));
+  assert.deepEqual(result.map(product => [...product.layers[0].values]),[[-40,NaN],[-20,NaN],[0,NaN]]);
+  assert.equal(isSignedMap(style),true);
+  assert.deepEqual(mapBounds(result[0].layers[0].values,style),[-40,40]);
+  assert.deepEqual(rgba(result[0]).slice(0,4),[0,0,255,255]);
+  planes[0].quality.archived[0] = -10;
+  const signed = products(planes,{...defaults,maps:[style]},planes.map((plane,index) => visit("v"+index,[plane])));
+  assert.deepEqual(signed.map(product => [...product.layers[0].values]),[[-60,NaN],[0,NaN],[20,NaN]]);
+  const incompatible={...planes[2],frame:{...planes[2].frame,processing_version:"v2"}};
+  const filtered=products([planes[0],incompatible],{...defaults,maps:[style]},[
+    visit("one",[planes[0]]),visit("other-version",[incompatible]),
+  ]);
+  assert.equal(filtered.length,0);
 });
 test("motion representatives maximize distinct comparable cycles before repeat D1 frames", () => {
   const make = (id, cycle, seq, date) => ({id, observation_id:id, visit_id:cycle,
@@ -169,6 +258,7 @@ function rgba(p) {
   const scales = p.layers.map(({ map, values }) => ({
     ...map,
     bounds: mapBounds(values, map),
+    signed: isSignedMap(map),
   }));
   fillComposite(input, p.layers, scales);
   return [...input];

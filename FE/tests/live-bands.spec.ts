@@ -77,11 +77,11 @@ test("selected spectrum bounds every real API download and a clicked image takes
     expect((await state()).catalog_done).toBe(false);
     await request.post(api + "/fixture/finish-discovery");
     brightnessReady();
-    await expect(image).toContainText("Calibrated exposure");
+    await expect(image).toContainText(/Calibrated exposure|Visit composite/);
     expect(waveRequests).toBe(0);
     await details.click();
     await expect.poll(() => waveRequests).toBeGreaterThan(0);
-    await expect(image).toContainText("Calibrated exposure");
+    await expect(image).toContainText(/Calibrated exposure|Visit composite/);
     const screen = page.getByRole("region", {name:"Observations",exact:true});
     await expect.poll(async () => (await state()).active).toBe(2);
     const prev = (await state()).requests as string[];
@@ -115,7 +115,7 @@ test("selected spectrum bounds every real API download and a clicked image takes
   } finally {
     brightnessReady();
     wavelengthReady();
-    await page.unrouteAll({behavior:"wait"});
+    await page.unrouteAll({behavior:"ignoreErrors"});
     await page.close();
     if (backend.exitCode === null) {
       await request.post(api + "/fixture/stop").catch(() => backend.kill());

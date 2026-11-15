@@ -271,15 +271,47 @@ export function responseKey(frame: Frame) {
     : JSON.stringify([frame.observation_id]);
 }
 
+function calibratedResponses(a: Frame, b: Frame, tolerance: number) {
+  if (a.detector !== b.detector || !a.processing_version ||
+      a.processing_version === "unknown" || a.processing_version !== b.processing_version ||
+      (a.nominal_channel != null && b.nominal_channel != null && a.nominal_channel !== b.nominal_channel))
+    return false;
+  let measured = 0;
+  for (let i = 0; i < 5; i++) {
+    const aw = a.match_wavelengths?.[i], bw = b.match_wavelengths?.[i];
+    const ab = a.match_bandwidths?.[i], bb = b.match_bandwidths?.[i];
+    if (aw == null || bw == null || ab == null || bb == null ||
+        ![aw, bw, ab, bb].every(Number.isFinite) || Math.min(aw, bw, ab, bb) <= 0) continue;
+    if (Math.abs(aw - bw) > tolerance * Math.min(ab, bb)) return false;
+    measured++;
+  }
+  // Cached jobs can assign different sequence IDs to the same measured response.
+  // A nominal bin alone does not prove that the full image has matching wavelengths.
+  return measured === 5 || !!a.sequence_id && a.sequence_id === b.sequence_id;
+}
+
+function responseGroups(frames: Frame[], tolerance = 0.5) {
+  const groups: Frame[][] = [];
+  const keys = new Map<string, string>();
+  for (const frame of frames) {
+    let index = groups.findIndex(group => group.every(other => calibratedResponses(frame, other, tolerance)));
+    if (index < 0) { index = groups.length; groups.push([]); }
+    groups[index].push(frame);
+    keys.set(frame.observation_id, JSON.stringify([index, responseKey(groups[index][0])]));
+  }
+  return keys;
+}
+
 type MotionOperand = {accepts:(f: Frame) => boolean; pinned:Set<string>};
 
 /** Choose the common epochs for the complete image. Choosing each map input
  * independently can leave one epoch when a different pair of responses spans years. */
-function commonResponses(cycles: CycleInput[], operands: MotionOperand[], singleExposure: boolean) {
+function commonResponses(cycles: CycleInput[], operands: MotionOperand[], singleExposure: boolean,
+  keyFor: (frame: Frame) => string) {
   const options = operands.map(({accepts, pinned}) => {
     const coverage = new Map<string, Set<string>>();
     for (const c of cycles) for (const f of c.members.filter(accepts)) {
-      const key = responseKey(f);
+      const key = keyFor(f);
       if (!coverage.has(key)) coverage.set(key, new Set());
       coverage.get(key)!.add(c.visit.id);
     }
@@ -341,6 +373,8 @@ export function motionSelection(manifest: Manifest | null, display: Display,
     if (members.length) cycles.push({visit, members, source:members[0]});
   }
   cycles.sort((a,b) => Date.parse(a.visit.start_utc) - Date.parse(b.visit.start_utc));
+  const responseKeys = responseGroups(cycles.flatMap(c => c.members), manifest?.processing?.spectral_tolerance);
+  const keyFor = (frame: Frame) => responseKeys.get(frame.observation_id) ?? responseKey(frame);
   const chosen = cycles.flatMap(c => c.members.filter(f => choices[f.observation_id]));
   const mapKeys = [...new Set(display.maps.flatMap(map => Object.keys(map.operands)))];
   const inMap = (f: Frame) => mapKeys.some(key => matchesChannel(key, f));
@@ -358,16 +392,16 @@ export function motionSelection(manifest: Manifest | null, display: Display,
   });
   const operands = keys.map(key => {
     const accepts = (f: Frame) => !key || matchesChannel(key, f);
-    const pinned = new Set(chosen.filter(accepts).map(responseKey));
+    const pinned = new Set(chosen.filter(accepts).map(keyFor));
     return {accepts, pinned};
   });
-  const {candidates, selectedKeys} = commonResponses(cycles, operands, raw && !nativeMap);
+  const {candidates, selectedKeys} = commonResponses(cycles, operands, raw && !nativeMap, keyFor);
   const available: CycleInput[] = [];
   const includedIds = new Set<string>();
   for (const cycle of candidates) {
     const members: Frame[] = [];
     for (const key of selectedKeys) {
-      const matches = cycle.members.filter(f => responseKey(f) === key);
+      const matches = cycle.members.filter(f => keyFor(f) === key);
       const manual = matches.filter(f => choices[f.observation_id]);
       if (matches.length) members.push(...(manual.length ?
         (raw && !nativeMap ? manual.slice(0,1) : manual) : [matches[0]]));
@@ -388,9 +422,9 @@ export function motionSelection(manifest: Manifest | null, display: Display,
   }
   for (const c of cycles) for (const f of c.members) {
     if (!includedIds.has(f.observation_id)) frameReasons.set(f.observation_id,
-      reasons.get(c.visit.id) ?? (selectedKeys.has(responseKey(f)) ? "Repeat of this wavelength" : "Different wavelength sequence"));
+      reasons.get(c.visit.id) ?? (selectedKeys.has(keyFor(f)) ? "Repeat of this wavelength" : "Different wavelength sequence"));
   }
-  return {steps, includedIds, reasons, frameReasons, raw:raw && !nativeMap, nativeMap, preview:cycles[0]};
+  return {steps, includedIds, reasons, frameReasons, responseKeys, raw:raw && !nativeMap, nativeMap, preview:cycles[0]};
 }
 export function imageTimeline(
   manifest: Manifest | null,
@@ -528,11 +562,12 @@ function mapTerms(
   map: SpectralMap,
   visitPlanes: Plane[],
   comparison: Plane[],
+  allowPartial = false,
 ): MapTerms | null {
   const selected = new Map<Plane, number>();
   for (const [key, sign] of Object.entries(map.operands)) {
     const found = channelMatches(visitPlanes, key);
-    if (!found.length) return null;
+    if (!found.length) { if (allowPartial) continue; return null; }
     for (const plane of found) selected.set(plane, sign);
   }
   if (!selected.size) return null;
@@ -541,14 +576,12 @@ function mapTerms(
   const terms = Array.from(selected, ([plane, sign]) => ({ plane, sign }));
   if (map.difference) {
     for (const [plane, sign] of selected) {
-      const channel = plane.frame.channel;
-      if (!channel) return null;
       const time = Date.parse(plane.frame.observed_at);
       let hasReference = false;
       for (const other of comparison) {
         if (
           visitPlanes.includes(other) ||
-          !matchesChannel(channel, other.frame)
+          !calibratedResponses(plane.frame, other.frame, 0.5)
         )
           continue;
         const days = Math.abs(Date.parse(other.frame.observed_at) - time) / day;
@@ -570,15 +603,19 @@ export function products(
   data: Plane[],
   s: Display,
   visits: Visit[] = [],
-  raw = false,
+  raw: boolean | "mapped" | "available" = false,
   matchedSteps?: CycleInput[],
 ): Product[] {
-  const displays = new Map<Plane, Float32Array>();
-  function values(p: Plane) {
-    let array = displays.get(p);
+  const displays = new Map<Plane, Float32Array>(), measurements = new Map<Plane, Float32Array>();
+  function values(p: Plane, calibrated = false) {
+    const cache = calibrated ? measurements : displays;
+    let array = cache.get(p);
     if (!array) {
-      array = displayArray(p);
-      displays.set(p, array);
+      array = calibrated ? Float32Array.from(p.values, (_, i) => {
+        const value = archivedAt(p, i);
+        return Number.isFinite(value) ? value : NaN;
+      }) : displayArray(p);
+      cache.set(p, array);
     }
     return array;
   }
@@ -590,24 +627,39 @@ export function products(
       return plane ? [plane] : [];
     }),
   }));
-  if (raw || (!matchedSteps && !visits.length)) {
+  if (raw === true || raw === "mapped" || (!matchedSteps && !visits.length)) {
     const lookup = new Map(
       groups.flatMap((g) =>
         g.visit.observation_ids.map((id) => [id, g.planes] as const),
       ),
     );
-    return data.map((p) => {
+    return data.flatMap((p): Product[] => {
+      if (raw === "mapped") {
+        const layers: Product["layers"] = [];
+        const inputs = new Set<Frame>(), reference = new Set<Frame>();
+        for (const map of s.maps) {
+          const input = mapTerms(map, [p], data, true);
+          if (!input) continue;
+          const combined = Float32Array.from(values(p), (_, i) =>
+            input.terms.reduce((sum, term) => sum + values(term.plane, isSignedMap(map))[i] * term.sign, 0));
+          layers.push({map, values:combined});
+          input.primary.forEach(plane => inputs.add(plane.frame));
+          input.reference.forEach(plane => reference.add(plane.frame));
+        }
+        return [{frame:p.frame, layers, sourcePlanes:lookup.get(p.frame.observation_id) ?? [p],
+          inputs:[...inputs], reference:[...reference]}];
+      }
       const map = {
         ...(s.maps[0] ?? defaults.maps[0]),
         name: p.frame.detector,
       };
-      return {
+      return [{
         frame: p.frame,
         layers: [{ map, values: values(p) }],
         sourcePlanes: lookup.get(p.frame.observation_id) ?? [p],
         inputs: [p.frame],
         reference: [],
-      };
+      }];
     });
   }
   const output: Product[] = [];
@@ -631,10 +683,10 @@ export function products(
       inputs = new Set<Frame>(),
       reference = new Set<Frame>();
     for (const map of s.maps) {
-      const input = mapTerms(map, planes, comparison);
+      const input = mapTerms(map, planes, comparison, raw === "available");
       if (!input) continue;
       const arrays = input.terms.map((t) => ({
-        values: values(t.plane),
+        values: values(t.plane, isSignedMap(map)),
         sign: t.sign,
       }));
       const combined =
@@ -661,68 +713,106 @@ export function products(
         inputs: [...inputs],
         reference: [...reference],
       });
-    else if (anchor) {
-      // An incomplete expression has no map value. Keep its exposure inspectable.
-      const appearance = {...(s.maps[0] ?? defaults.maps[0]), name:anchor.frame.detector};
-      output.push({frame:anchor.frame, matchedMap:false, layers:[{map:appearance, values:values(anchor)}],
-        sourcePlanes:planes, inputs:[anchor.frame], reference:[]});
-    }
+    else if (anchor)
+      output.push({frame:anchor.frame, matchedMap:true, layers:[], sourcePlanes:planes, inputs:[], reference:[]});
   }
   return output;
 }
 
 // A fixed reference uses the signed, calibrated map inputs on the common grid.
 // Display-only substitutions (particularly saturated NaN pixels) are not measurements.
-export function cycleDifferences(data: Plane[], steps: CycleInput[], map: SpectralMap | undefined, referenceId: string) {
+export function cycleDifferences(data: Plane[], steps: CycleInput[], maps: SpectralMap | SpectralMap[] | undefined,
+  referenceId: string, allowPartial = false, tolerance = 0.5) {
   const planes = new Map(data.map(p => [p.frame.observation_id, p]));
-  const samples = steps.flatMap(step => {
+  const responseKeys = responseGroups(data.map(p => p.frame), tolerance);
+  const styles = Array.isArray(maps) ? maps : [maps];
+  const samples = steps.map(step => {
     const members = step.members.flatMap(f => planes.get(f.observation_id) ?? []);
-    if (members.length !== step.members.length) return [];
-    const terms = map ? mapTerms({...map, difference:false}, members, [])?.terms :
-      members.length === 1 ? [{plane:members[0], sign:1}] : undefined;
-    if (!terms?.length || terms.some(({plane:{frame}}) =>
-      !frame.sequence_id || !frame.processing_version || frame.processing_version === "unknown")) return [];
-    const signature = JSON.stringify(terms.map(t => JSON.stringify([responseKey(t.plane.frame), t.sign])).sort());
-    return [{step, terms, signature}];
+    const layers = styles.map(map => {
+      const terms = map ? mapTerms({...map, difference:false}, members, [], allowPartial)?.terms :
+        members.length === 1 ? [{plane:members[0], sign:1}] : undefined;
+      return terms?.length && terms.every(({plane:{frame}}) => calibratedResponses(frame, frame, tolerance))
+        ? terms : [];
+    });
+    return {step, layers};
   });
-  const reference = referenceId ? samples.find(s => s.step.visit.id === referenceId) : samples[0];
-  const options = samples.map(s => s.step.visit);
-  const products: Product[] = [];
-  const matched: CycleInput[] = [];
-  let peak = 0;
+  const reference = referenceId ? samples.find(s => s.step.visit.id === referenceId) :
+    samples.find(s => s.layers.some(terms => terms.length));
+  type ResidualLayer = {map:SpectralMap; values:Float32Array; primary:Plane[]; reference:Plane[]};
+  const candidates: {step:CycleInput; layers:ResidualLayer[]}[] = [];
+  const peaks = new Map<string, number>(), coverage = new Map<string, number>();
+  let pairedResponses = false;
   function mapValue(terms: MapTerms["terms"], i: number) {
     let sum = 0;
     for (const {plane, sign} of terms) {
       const value = archivedAt(plane, i);
-      if (!Number.isFinite(value) || value < 0) return NaN;
+      if (!Number.isFinite(value)) return NaN;
       sum += sign * value;
     }
     return sum;
   }
-  if (reference) {
-    const base = Float64Array.from(reference.terms[0].plane.values, (_, i) => mapValue(reference.terms, i));
-    const residualMap = {...newMap("cycle-difference", "Δ " + (map?.name ?? reference.step.source.detector)),
-      stretch:"linear", stops:[
-        {at:0, color:"#40bfff"}, {at:127/255, color:"#000000"}, {at:128/255, color:"#000000"}, {at:1, color:"#ff983e"},
-      ]};
-    for (const {step, terms, signature} of samples) {
-      if (signature !== reference.signature) continue;
-      const values = Float32Array.from(base, (baseValue, i) => mapValue(terms, i) - baseValue);
-      let covered = false;
-      for (const v of values) if (Number.isFinite(v)) { peak = Math.max(peak, Math.abs(v)); covered = true; }
-      if (!covered) continue;
-      matched.push(step);
-      const primary = terms.map(t => t.plane), referencePlanes = reference.terms.map(t => t.plane);
-      products.push({
-        frame:{...step.source, visit_id:step.visit.id, observation_id:step.visit.id, observed_at:step.visit.start_utc},
-        layers:[{map:residualMap, values}], sourcePlanes:[...new Set([...primary, ...referencePlanes])],
-        inputs:primary.map(p => p.frame), reference:referencePlanes.map(p => p.frame),
-        subtraction:{referenceId:reference.step.visit.id, referenceDate:reference.step.visit.start_utc},
-      });
+  function representativeTerms(terms: MapTerms["terms"]) {
+    const groups = new Map<string, MapTerms["terms"][number]>();
+    for (const term of terms) {
+      const key = JSON.stringify([responseKeys.get(term.plane.frame.observation_id), term.sign]);
+      if (!groups.has(key)) groups.set(key, term);
     }
+    return groups;
   }
-  const valid = matched.length >= 2;
-  return {steps:valid ? matched : [], products:valid ? products : [], options, reference:reference?.step.visit, bounds:[-peak, peak]};
+  if (reference) for (const sample of samples) {
+    const layers: ResidualLayer[] = [];
+    styles.forEach((style, index) => {
+      const before = representativeTerms(reference.layers[index]);
+      const after = representativeTerms(sample.layers[index]);
+      const shared = [...before.keys()].filter(key => after.has(key));
+      if (!shared.length) return;
+      const primary = shared.map(key => after.get(key)!);
+      const baseline = shared.map(key => before.get(key)!);
+      if (style && !allowPartial && Object.keys(style.operands).some(key =>
+        !primary.some(term => matchesChannel(key, term.plane.frame)))) return;
+      if (sample !== reference) pairedResponses = true;
+      const values = Float32Array.from(baseline[0].plane.values, (_, i) =>
+        mapValue(primary, i) - mapValue(baseline, i));
+      let peak = 0, measured = false;
+      for (const value of values) if (Number.isFinite(value)) {
+        peak = Math.max(peak, Math.abs(value)); measured = true;
+      }
+      if (!measured) return;
+      const map = {...(style ?? newMap("cycle-difference", sample.step.source.detector)),
+        name:"Δ " + (style?.name ?? sample.step.source.detector), difference:false};
+      peaks.set(map.id, Math.max(peaks.get(map.id) ?? 0, peak));
+      coverage.set(map.id, (coverage.get(map.id) ?? 0) + 1);
+      layers.push({map, values, primary:primary.map(t => t.plane), reference:baseline.map(t => t.plane)});
+    });
+    candidates.push({step:sample.step, layers});
+  }
+  const products: Product[] = [], matched: CycleInput[] = [];
+  const boundsByMap = new Map<string, number[]>();
+  for (const {step, layers:available} of candidates) {
+    const layers = available.filter(layer => (coverage.get(layer.map.id) ?? 0) >= 2);
+    if (!layers.length) continue;
+    const primary = [...new Set(layers.flatMap(layer => layer.primary))];
+    const referencePlanes = [...new Set(layers.flatMap(layer => layer.reference))];
+    for (const {map} of layers) {
+      const peak = peaks.get(map.id)!;
+      boundsByMap.set(map.id, [map.low === "" ? -peak : Number(map.low), map.high === "" ? peak : Number(map.high)]);
+    }
+    matched.push(step);
+    products.push({frame:{...step.source, visit_id:step.visit.id, observation_id:step.visit.id, observed_at:step.visit.start_utc},
+      layers:layers.map(({map, values}) => ({map, values})),
+      sourcePlanes:[...new Set([...primary, ...referencePlanes])], inputs:primary.map(p => p.frame),
+      reference:referencePlanes.map(p => p.frame),
+      subtraction:{referenceId:reference!.step.visit.id, referenceDate:reference!.step.visit.start_utc}});
+  }
+  const peak = Math.max(0, ...peaks.values());
+  const reason = products.length ? "" : !reference?.layers.some(terms => terms.length)
+    ? "The reference has no loaded map inputs with a verified processing version and spectral response."
+    : pairedResponses
+      ? "The matching calibrated inputs have no overlapping finite measured pixels."
+      : "The cycles do not share a verified spectral response and processing version. A nominal spectrum label alone does not verify a full-field wavelength match.";
+  return {steps:matched, products, options:matched.length ? matched.map(step => step.visit) :
+    samples.filter(sample => sample.layers.some(terms => terms.length)).map(sample => sample.step.visit),
+    reference:reference?.step.visit, bounds:[-peak, peak], boundsByMap, reason};
 }
 
 const flagNames: Record<number, string> = {
@@ -915,14 +1005,23 @@ export function measureSpectrum(
   };
 }
 
+export function isSignedMap(map: SpectralMap) {
+  return map.difference || Object.values(map.operands).some(sign => sign < 0);
+}
+
 export function mapBounds(values: Float32Array, map: SpectralMap) {
+  const signed = isSignedMap(map);
   let min = Infinity,
     max = -Infinity;
   for (const v of values)
-    if (Number.isFinite(v) && v >= 0) {
+    if (Number.isFinite(v) && (signed || v >= 0)) {
       min = Math.min(min, v);
       max = Math.max(max, v);
     }
+  if (signed && Number.isFinite(min)) {
+    max = Math.max(Math.abs(min), Math.abs(max));
+    min = -max;
+  }
   return [
     map.low === "" ? (Number.isFinite(min) ? min : 0) : Number(map.low),
     map.high === "" ? (Number.isFinite(max) ? max : 1) : Number(map.high),
