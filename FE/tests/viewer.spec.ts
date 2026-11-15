@@ -213,6 +213,38 @@ test("keyboard resizing and sidebar disclosure keep the current cycle and playba
   await expect(counter).toHaveText(cycle);
 });
 
+test("desktop recenter preserves zoom and the sidebar scrolls through simultaneously expanded settings", async ({page}) => {
+  await page.setViewportSize({width:1440,height:900});
+  await setup(page);
+  const canvas=page.locator("canvas");
+  await page.getByRole("button",{name:"Zoom in",exact:true}).click();
+  const zoom=await zoomValue(page);
+  const pixel=() => canvas.evaluate((el:HTMLCanvasElement) =>
+    [...el.getContext("2d")!.getImageData(Math.floor(el.width/2),Math.floor(el.height/2),1,1).data]);
+  const center=await pixel(), box=(await canvas.boundingBox())!;
+  await page.mouse.move(box.x+box.width/2,box.y+box.height/2);
+  await page.mouse.down({button:"right"});
+  await page.mouse.move(box.x+box.width/2+120,box.y+box.height/2+75,{steps:5});
+  await page.mouse.up({button:"right"});
+  await page.getByRole("button",{name:"Recenter image",exact:true}).click();
+  await expect.poll(pixel).toEqual(center);
+  expect(await zoomValue(page)).toBe(zoom);
+  const sidebar=page.getByRole("complementary",{name:"Query and display settings",exact:true});
+  for (const summary of await sidebar.locator(".sidebar-section > summary").all()) {
+    if (!await summary.evaluate(el=>el.parentElement!.hasAttribute("open"))) await summary.click();
+  }
+  await sidebar.locator(".search-bands > summary").click();
+  for (const detector of ["D1","D2","D3","D4","D5","D6"])
+    await sidebar.getByRole("checkbox",{name:detector+" detector",exact:true}).check();
+  const scroller=sidebar.locator(".settings-scroll");
+  await scroller.evaluate(el=>{el.scrollTop=0;});
+  const bounds=(await scroller.boundingBox())!;
+  await page.mouse.move(bounds.x+bounds.width/2,bounds.y+bounds.height/2);
+  await page.mouse.wheel(0,1000);
+  await expect.poll(()=>scroller.evaluate(el=>el.scrollTop)).toBeGreaterThan(100);
+  expect(await sidebar.locator(".band-options").first().evaluate(el=>el.scrollHeight<=el.clientHeight+1)).toBe(true);
+});
+
 test("wheel, drag, native scale, fit, and fullscreen work without changing frame selection", async ({
   page,
 }) => {

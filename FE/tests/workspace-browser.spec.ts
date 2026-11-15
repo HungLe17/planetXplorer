@@ -36,6 +36,7 @@ function jsonFile(parts: Partial<Backup>) {
 }
 
 test("save the Details rectangle or full frame, reuse field names and update flags immediately", async ({page}) => {
+  await page.setViewportSize({width:1440,height:900});
   const id = "saved-frame", date = "2025-06-01T00:00:00Z";
   const frame = {id, observation_id:id, observed_at:date, detector:"D1", pixels:"frame.bin",
     url:"/api/assets/saved/frame.png", wavelength_um:1, channel:"D1 1 µm (v1)", processing_version:"v1", sequence_id:"one"};
@@ -58,17 +59,28 @@ test("save the Details rectangle or full frame, reuse field names and update fla
   const area = page.getByText(/Region \(2, 2\).*\(4, 3\)/);
   await expect(area).toBeVisible();
   await page.getByText("Saved locations", {exact:true}).click();
-  await page.getByText("Default fields for new locations").click();
-  await page.getByLabel("Field names (one per line)").fill("Candidate class\nReview");
-  await page.getByRole("button",{name:"Save default fields"}).click();
+  await page.getByRole("button",{name:"Default fields for new locations",exact:true}).click();
+  const fields = page.getByRole("dialog",{name:"Default fields for new locations",exact:true});
+  await fields.getByLabel("Default field name 1", {exact:true}).fill("Candidate class");
+  await fields.getByLabel("Default field name 2", {exact:true}).fill("Review");
+  await fields.getByRole("button",{name:"Add default field"}).click();
+  await fields.getByRole("button",{name:"Delete default field 3"}).click();
+  await fields.getByRole("button",{name:"Save default fields"}).click();
   await page.getByRole("button",{name:"Save on this device"}).click();
   const add = page.getByRole("button",{name:"Add location",exact:true});
   await add.click();
   await expect(page.getByLabel("Field name 1", {exact:true})).toHaveValue("Candidate class");
   await expect(page.getByLabel("Color flag", {exact:true})).toHaveValue("");
+  await expect(page.locator(".saved-editor .saved-color-circle")).toHaveAttribute("data-color","none");
   await page.getByLabel("Location name").fill("Region candidate");
   await page.getByRole("button",{name:"Save entry"}).click();
-  await page.getByLabel("Color flag for Region candidate").selectOption("cyan");
+  const browse = page.getByRole("button",{name:"Browse saved locations",exact:true});
+  await browse.click();
+  const browser = page.getByRole("dialog",{name:"Browse saved locations",exact:true});
+  await browser.getByLabel("Color flag for Region candidate").selectOption("cyan");
+  await expect(browser.locator(".saved-color-circle")).toHaveCSS("background-color","rgb(0, 255, 255)");
+  await browser.getByRole("button",{name:"Close",exact:true}).click();
+  await expect(page.locator(".saved-editor .saved-color-circle")).toHaveCSS("background-color","rgb(0, 255, 255)");
   await page.getByLabel("Save area").selectOption("frame");
   await add.click();
   await expect(page.getByLabel("Field name 2", {exact:true})).toHaveValue("Review");
@@ -77,14 +89,20 @@ test("save the Details rectangle or full frame, reuse field names and update fla
   await page.getByRole("button",{name:"Save entry"}).click();
   await page.getByRole("button",{name:"Open view"}).click();
   await expect(page.getByLabel("Selected region spectrum",{exact:true})).toHaveCount(0);
-  await page.getByRole("button",{name:/Region candidate/}).click();
-  await page.getByRole("button",{name:"Open view"}).click();
+  await browse.click();
+  await browser.getByRole("button",{name:"Open Region candidate",exact:true}).click();
   await expect(page.getByLabel("Selected region spectrum",{exact:true})).toBeVisible();
   await expect(page.getByText(/Region \(2, 2\).*\(4, 3\)/).last()).toBeVisible();
   const saved = await page.evaluate(key => JSON.parse(localStorage.getItem(key)!), storageKey);
   expect(saved.locations.map((e:Entry) => [e.scope,e.color])).toEqual([
     [{kind:"region",box:[1,1,3,2],width:5,height:5},"cyan"], [{kind:"frame"},null],
   ]);
+  await browse.click();
+  await expect(browser.getByRole("columnheader",{name:"Candidate class",exact:true})).toBeVisible();
+  page.once("dialog",dialog => dialog.accept());
+  await browser.getByRole("button",{name:"Delete Entire field",exact:true}).click();
+  await expect(browser.getByRole("row")).toHaveCount(2);
+  await browser.getByRole("button",{name:"Close",exact:true}).click();
 });
 
 test("locations-only import preserves the current view, reports new data, and stores the workspace only on consent", async ({
@@ -144,17 +162,20 @@ test("locations-only import preserves the current view, reports new data, and st
   await expect(
     page.getByLabel("Field of view (arcsec)", { exact: true }),
   ).toHaveValue("480");
-  await page.getByRole("button", { name: /East field/ }).click();
+  const browse = page.getByRole("button",{name:"Browse saved locations",exact:true});
+  const browser = page.getByRole("dialog",{name:"Browse saved locations",exact:true});
+  await browse.click();
+  await browser.getByRole("button",{name:"Edit East field",exact:true}).click();
   await page.getByRole("button", { name: "+ Add field", exact: true }).click();
   await page.getByLabel("Field name 2", { exact: true }).fill("Follow up?");
   await page
     .getByRole("textbox", { name: "Notes", exact: true })
     .fill("Updated note");
   await page.getByRole("button", { name: "Save entry", exact: true }).click();
-  await page
-    .getByRole("searchbox", { name: "Find locations" })
-    .fill("Follow up");
-  await expect(page.getByRole("button", { name: /East field/ })).toBeVisible();
+  await browse.click();
+  await browser.getByRole("searchbox",{name:"Filter saved locations"}).fill("Follow up");
+  await expect(browser.getByRole("button",{name:"Edit East field",exact:true})).toBeVisible();
+  await browser.getByRole("button",{name:"Close",exact:true}).click();
   await page
     .getByRole("button", { name: "Save your work", exact: true })
     .click();
@@ -173,7 +194,8 @@ test("locations-only import preserves the current view, reports new data, and st
   await page.goto("/", {waitUntil:"domcontentloaded"});
   await expect(ra).toHaveValue("15");
   await page.getByText("Saved locations", { exact: true }).click();
-  await page.getByRole("button", { name: /East field/ }).click();
+  await browse.click();
+  await browser.getByRole("button",{name:"Edit East field",exact:true}).click();
   await expect(page.getByRole("textbox", { name: "Notes", exact: true })).toHaveValue(
     "Updated note",
   );

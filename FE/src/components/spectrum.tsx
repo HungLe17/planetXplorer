@@ -16,26 +16,34 @@ export function SpectrumGraph({
   rows,
   domain,
   connect = true,
+  logarithmic = false,
 }: {
   title: string;
   rows: SpectrumBin[];
   domain: number[];
   connect?: boolean;
+  logarithmic?: boolean;
 }) {
   const clip = useId();
-  const [xmin, xmax, ymin, ymax] = domain;
+  const [xmin, xmax, linearMin, linearMax] = domain;
   const pts = rows.filter(
-    (p) => Number.isFinite(p.wave) && Number.isFinite(p.mean),
+    (p) => Number.isFinite(p.wave) && Number.isFinite(p.mean) && (!logarithmic || p.mean > 0),
   );
+  const values = pts.map(p => logarithmic ? Math.log(p.mean) : p.mean);
+  const low = values.length ? Math.min(...values) : 0;
+  const high = values.length ? Math.max(...values) : 1;
+  const padding = high === low ? 1 : (high - low) * 0.04;
+  const ymin = logarithmic ? low - padding : linearMin;
+  const ymax = logarithmic ? high + padding : linearMax;
   const x = (v: number) => 49 + ((v - xmin) / (xmax - xmin)) * 229;
-  const y = (v: number) => 107 - ((v - ymin) / (ymax - ymin)) * 87;
+  const y = (v: number) => 107 - (((logarithmic ? Math.log(v) : v) - ymin) / (ymax - ymin)) * 87;
   return (
     <figure className="spectrum-chart" aria-label={title + " spectrum"}>
       <figcaption>{title}</figcaption>
       <svg
         viewBox="0 0 300 146"
         role="img"
-        aria-label={title + " · surface brightness versus wavelength"}
+        aria-label={title + (logarithmic ? " · natural log intensity versus wavelength" : " · surface brightness versus wavelength")}
       >
         <g fill="currentColor" fontSize="10">
           <path d="M49 20 V107 H278" fill="none" stroke="currentColor" />
@@ -53,7 +61,7 @@ export function SpectrumGraph({
             Wavelength (µm)
           </text>
           <text x="49" y="13">
-            Intensity (MJy/sr)
+            {logarithmic ? "ln(Intensity / 1 MJy/sr)" : "Intensity (MJy/sr)"}
           </text>
         </g>
         <defs><clipPath id={clip}><rect x="48" y="18" width="232" height="89" /></clipPath></defs>
@@ -67,7 +75,9 @@ export function SpectrumGraph({
           ))}
         </g>
       </svg>
-      {!pts.length && <p>No finite spectral samples available.</p>}
+      {!pts.length && <p>{logarithmic ? "No positive spectral samples available." : "No finite spectral samples available."}</p>}
+      {logarithmic && rows.some(p => Number.isFinite(p.mean) && p.mean <= 0) &&
+        <p>Zero and negative intensities are listed below and omitted from the logarithmic graph.</p>}
     </figure>
   );
 }
@@ -89,17 +99,6 @@ export default function Spectrum({
   const wavelengths = useSpectralPlanes(brightness, width * height);
   const planes = wavelengths.planes;
   const bins = useMemo(() => spectrumBins(planes), [planes]);
-  const full = useMemo(
-    () =>
-      measureSpectrum(
-        planes,
-        bins,
-        width,
-        [0, 0, width - 1, height - 1],
-        false,
-      ),
-    [planes, bins, width, height],
-  );
   const px = pixel?.[0] ?? Math.floor(width / 2),
     py = pixel?.[1] ?? Math.floor(height / 2);
   const x0 = Math.max(
@@ -142,8 +141,7 @@ export default function Spectrum({
       {wavelengths.failed > 0 && <p role="status">Per-pixel wavelengths unavailable.{" "}
         <button className="button" onClick={wavelengths.retry}>Retry wavelengths</button>
       </p>}
-      <SpectrumGraph title="Whole field" rows={full.bins} domain={full.domain} />
-      <SpectrumGraph title={title} rows={selected.bins} domain={full.domain} />
+      <SpectrumGraph title={title} rows={selected.bins} domain={selected.domain} logarithmic />
       {!!planes.length && !!missing.length && (
         <p>No loaded exposures for {missing.join(", ")}.</p>
       )}

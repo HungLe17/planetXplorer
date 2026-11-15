@@ -27,8 +27,8 @@ test("flag borders show checker severity, preserve pixel interiors and follow PN
     for (let i=0;i<data.length;i+=4) {
       if (!data[i+3]) continue;
       const r=data[i],g=data[i+1],b=data[i+2];
-      if(r>200 && g>180 && b<40)yellow++;
-      if(r>200 && g>80 && g<170 && b<40)orange++;
+      if(r>70 && r<170 && g>210 && b<40)yellow++;
+      if(r>70 && r<170 && g>150 && g<210 && b<40)orange++;
       if(r<40 && g>200 && b<40)green++;
     }
     return {yellow:yellow>0,orange:orange>0,green:green>0};

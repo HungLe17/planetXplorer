@@ -331,7 +331,7 @@ export default function SkyViewer({
       ctx.filter = "none";
       const inset = Math.min(0.5, cellWidth / 4, cellHeight / 4);
       ctx.lineWidth = inset * 2;
-      for (const [indices, color] of [[warningPixels, "#ffd600"], [seriousPixels, "#ff8c00"]] as const) {
+      for (const [indices, color] of [[warningPixels, "rgba(255,214,0,0.5)"], [seriousPixels, "rgba(255,140,0,0.5)"]] as const) {
         ctx.strokeStyle = color;
         ctx.beginPath();
         for (const i of indices ?? []) {
@@ -468,9 +468,9 @@ export default function SkyViewer({
           if (qualityLegend) {
             y += gap;
             ctx.textAlign = "left";
-            ctx.strokeStyle = "#ffd600";
+            ctx.strokeStyle = "rgba(255,214,0,0.5)";
             ctx.strokeRect(12.5, y + 4.5, 12, 12);
-            ctx.strokeStyle = "#ff8c00";
+            ctx.strokeStyle = "rgba(255,140,0,0.5)";
             ctx.strokeRect(208.5, y + 4.5, 12, 12);
             ctx.fillStyle = "white";
             ctx.fillText("Warning", 32, y);
@@ -683,6 +683,10 @@ export default function SkyViewer({
             title="Drag to pan the image (H)" disabled={!loaded}
             onClick={() => { setTool("pan"); setRegionMenu(null); }}>
             <Move size={14} /><span>Pan</span>
+          </button>
+          <button aria-label="Recenter image" title="Center the image while keeping the current zoom"
+            disabled={!loaded} onClick={() => commit({...transform.current,x:0,y:0})}>
+            <Crosshair size={14} /><span>Recenter</span>
           </button>
         </div>
         <span className="canvas-tool-hint">

@@ -31,6 +31,15 @@ function locationArea(target: NonNullable<Props["selected"]>, kind: "frame" | "r
   const center = target.config.query ?? target.position;
   return {scope:{kind:"frame"}, position:{ra_deg:center.ra_deg, dec_deg:center.dec_deg}};
 }
+function ColorFlag({label, color, change}: {label:string; color?:FlagColor | null; change:(color:string) => void}) {
+  return <label className="saved-color-picker">
+    <span className="saved-color-circle" aria-hidden="true" data-color={color ?? "none"} style={{backgroundColor:color ?? "transparent"}} />
+    <select aria-label={label} value={color ?? ""} onChange={e => change(e.target.value)}>
+      <option value="">No color</option>
+      {flagColors.map(c => <option key={c} value={c}>{c[0].toUpperCase() + c.slice(1)}</option>)}
+    </select>
+  </label>;
+}
 export default function WorkspacePanel({
   backup,
   saveEntries,
@@ -54,6 +63,9 @@ export default function WorkspacePanel({
     [checking, setChecking] = useState(false),
     [checks, setChecks] = useState<ArchiveCheck[]>([]);
   const pending = useRef<AbortController | null>(null);
+  const locationsDialog = useRef<HTMLDialogElement>(null);
+  const fieldsDialog = useRef<HTMLDialogElement>(null);
+  const [fieldDraft, setFieldDraft] = useState<string[]>([]);
   useEffect(() => () => pending.current?.abort(), []);
   function add() {
     if (selected) {
@@ -142,8 +154,7 @@ export default function WorkspacePanel({
     saveEntries(entries.map(e => e.id === entry.id ? {...e,color} : e));
     setDraft(d => d?.id === entry.id ? {...d, color} : d);
   }
-  const colorOptions = [<option key="" value="">No color</option>,
-    ...flagColors.map(c => <option key={c} value={c}>{c[0].toUpperCase() + c.slice(1)}</option>)];
+  const columns = [...new Set(entries.flatMap(entry => entry.fields.map(field => field.name)))];
   function updateField(index: number, key: "name" | "value", text: string) {
     if (!draft) return;
     setDraft({
@@ -171,61 +182,75 @@ export default function WorkspacePanel({
           Add location
         </button>
       </div>
-      <details>
-        <summary>Default fields for new locations</summary>
-        <form key={JSON.stringify(fieldNames)} onSubmit={e => {
+      <div className="saved-actions">
+        <button type="button" onClick={() => {
+          setFieldDraft([...fieldNames]);
+          fieldsDialog.current?.showModal();
+        }}>Default fields for new locations</button>
+        <button type="button" onClick={() => locationsDialog.current?.showModal()}>Browse saved locations</button>
+      </div>
+      <dialog ref={fieldsDialog} className="saved-fields-dialog" aria-label="Default fields for new locations">
+        <form onSubmit={e => {
           e.preventDefault();
-          const names = String(new FormData(e.currentTarget).get("fieldNames") ?? "");
-          saveFieldNames([...new Set(names.split(/\r?\n/).map(s => s.trim()).filter(Boolean))]);
+          saveFieldNames([...new Set(fieldDraft.map(s => s.trim()).filter(Boolean))]);
+          fieldsDialog.current?.close();
           if (consent === null) setShowPrompt(true);
         }}>
-          <label>Field names (one per line)
-            <textarea name="fieldNames" rows={3} defaultValue={fieldNames.join("\n")} />
-          </label>
-          <button type="submit">Save default fields</button>
+          <h2>Default fields for new locations</h2>
+          {fieldDraft.map((name,i) => <div className="saved-default-field" key={i}>
+            <label>Field name
+              <input aria-label={"Default field name " + (i+1)} value={name}
+                onChange={e => setFieldDraft(old => old.map((value,index) => index===i ? e.target.value : value))} />
+            </label>
+            <button type="button" aria-label={"Delete default field " + (i+1)}
+              onClick={() => setFieldDraft(old => old.filter((_,index) => index!==i))}>Delete</button>
+          </div>)}
+          <button type="button" onClick={() => setFieldDraft(old => [...old,""])}>Add default field</button>
+          <div className="saved-actions">
+            <button type="submit">Save default fields</button>
+            <button type="button" onClick={() => fieldsDialog.current?.close()}>Cancel</button>
+          </div>
         </form>
-      </details>
-      <div className="saved-split">
-        <div className="saved-list">
-          <label>
-            Find locations
-            <input
-              type="search"
-              value={find}
-              onChange={(e) => setFind(e.target.value)}
-            />
-          </label>
-          <ul aria-label="Saved location list">
-            {visibleEntries.map((entry) => (
-              <li key={entry.id}>
-                <button
-                  type="button"
-                  className="saved-choice"
-                  aria-pressed={entry.id === draft?.id}
-                  onClick={() => setDraft(entry)}
-                >
-                  <strong>{entry.name || "Sky location"}</strong>
-                  <small>
-                    {entry.position.ra_deg.toFixed(5)}°,{" "}
-                    {entry.position.dec_deg.toFixed(5)}°
-                  </small>
-                </button>
-                <label className="saved-flag">
-                  {entry.color && <span aria-hidden="true" style={{backgroundColor:entry.color}} />}
-                  <select aria-label={`Color flag for ${entry.name || "Sky location"}`}
-                    value={entry.color ?? ""} onChange={e => flag(entry, e.target.value)}>{colorOptions}</select>
-                </label>
-              </li>
-            ))}
-          </ul>
-          {visibleEntries.length === 0 && (
-            <p>
-              {entries.length
-                ? "No matching locations."
-                : "No saved locations."}
-            </p>
-          )}
+      </dialog>
+      <dialog ref={locationsDialog} className="saved-browser-dialog" aria-label="Browse saved locations">
+        <div className="saved-browser-heading"><h2>Saved location browser</h2>
+          <button type="button" onClick={() => locationsDialog.current?.close()}>Close</button>
         </div>
+        <label>Filter saved locations
+          <input type="search" value={find} onChange={e => setFind(e.target.value)} />
+        </label>
+        <div className="saved-sheet-scroll">
+          <table className="saved-sheet">
+            <thead><tr><th>Name</th><th>Color flag</th><th>RA (°)</th><th>Dec (°)</th><th>Area</th>
+              {columns.map(name => <th key={name}>{name || "Unnamed field"}</th>)}<th>Notes</th><th>Actions</th></tr></thead>
+            <tbody>{visibleEntries.map(entry => <tr key={entry.id}>
+              <td>{entry.name || "Sky location"}</td>
+              <td><ColorFlag label={"Color flag for " + (entry.name || "Sky location")} color={entry.color}
+                change={value => flag(entry,value)} /></td>
+              <td>{entry.position.ra_deg.toFixed(6)}</td><td>{entry.position.dec_deg.toFixed(6)}</td>
+              <td>{entry.scope?.kind === "region" ? "Selected region" : entry.scope?.kind === "frame" ? "Whole frame" : "Point"}</td>
+              {columns.map(name => <td key={name}>{entry.fields.filter(field => field.name===name).map(field => field.value).join(", ")}</td>)}
+              <td>{entry.note}</td>
+              <td><div className="saved-sheet-actions">
+                <button type="button" aria-label={"Open " + (entry.name || "Sky location")} onClick={() => {
+                  locationsDialog.current?.close(); reopen(entry);
+                }}>Open view</button>
+                <button type="button" aria-label={"Edit " + (entry.name || "Sky location")} onClick={() => {
+                  setDraft(entry); locationsDialog.current?.close();
+                }}>Edit</button>
+                <button type="button" aria-label={"Delete " + (entry.name || "Sky location")} onClick={() => {
+                  if (window.confirm("Delete " + (entry.name || "this location") + "?")) {
+                    saveEntries(entries.filter(e => e.id!==entry.id));
+                    if (draft?.id===entry.id) setDraft(null);
+                  }
+                }}>Delete</button>
+              </div></td>
+            </tr>)}</tbody>
+          </table>
+          {!visibleEntries.length && <p>{entries.length ? "No matching locations." : "No saved locations."}</p>}
+        </div>
+      </dialog>
+      <div className="saved-split">
         {draft ? (
           <form
             className="saved-editor"
@@ -248,12 +273,12 @@ export default function WorkspacePanel({
               RA {draft.position.ra_deg.toFixed(6)}° · Dec{" "}
               {draft.position.dec_deg.toFixed(6)}°
             </p>
-            <label>Color flag
-              <select aria-label="Color flag" value={draft.color ?? ""} onChange={e => {
-                if (saved) flag(saved, e.target.value);
-                else setDraft({...draft, color:e.target.value ? e.target.value as FlagColor : null});
-              }}>{colorOptions}</select>
-            </label>
+            <div>Color flag
+              <ColorFlag label="Color flag" color={draft.color} change={value => {
+                if (saved) flag(saved, value);
+                else setDraft({...draft, color:value ? value as FlagColor : null});
+              }} />
+            </div>
             {draft.fields.map((field, i) => (
               <div className="saved-field-row" key={i}>
                 <label>

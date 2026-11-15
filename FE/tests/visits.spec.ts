@@ -122,9 +122,8 @@ test("cycle navigation and selection preserve the whole spectrum; explicit spect
   await expect(canvas).toHaveAttribute("aria-label", /Observation 1 of 2/);
   expect(batches).toEqual([]);
   const whole = page.getByLabel("Whole field spectrum", { exact: true });
-  await expect(whole.locator("circle")).toHaveCount(1);
-  const wholeBefore = await whole.innerHTML();
-  await expect(whole.locator('text[x="45"]').first()).toHaveText("0");
+  await expect(whole).toHaveCount(0);
+  await expect(page.getByLabel("Selected pixel spectrum", {exact:true}).locator("circle")).toHaveCount(1);
   const rect = (await canvas.boundingBox())!;
   const center = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
   const step = (Math.min(rect.width, rect.height) * 0.94) / 5;
@@ -135,11 +134,12 @@ test("cycle navigation and selection preserve the whole spectrum; explicit spect
   await expect(
     page.getByLabel("Selected region spectrum", { exact: true }),
   ).toHaveCount(1);
-  expect(await whole.innerHTML()).toEqual(wholeBefore);
+  await expect(whole).toHaveCount(0);
+  await expect(page.getByText("ln(Intensity / 1 MJy/sr)", {exact:true})).toBeVisible();
   expect(batches).toEqual([]);
   await page.getByRole("button", { name: /load .* spectrum/i }).click();
   await expect(
-    page.getByLabel("Whole field spectrum", { exact: true }).locator("circle"),
+    page.getByLabel("Selected region spectrum", { exact: true }).locator("circle"),
   ).toHaveCount(3);
   expect(batches.flat()).toEqual(["winterD4", "winterD6"]);
   const region = page.getByText(/Region \(2, 2\).*\(4, 3\)/);
@@ -152,7 +152,7 @@ test("cycle navigation and selection preserve the whole spectrum; explicit spect
   await expect
     .poll(() => batches.flat())
     .toEqual(["winterD4", "winterD6", "summerD4", "summerD6"]);
-  await expect(whole.locator("polyline")).toHaveAttribute("stroke-width", "1");
+  await expect(page.getByLabel("Selected region spectrum", {exact:true}).locator("polyline")).toHaveAttribute("stroke-width", "1");
   await second.locator(".cycle-disclosure").click();
   await second.getByRole("row").filter({hasText:"summerD4"}).getByRole("button",{name:"View",exact:true}).click();
   await expect(page.locator(".image-readout")).toContainText("Calibrated exposure");

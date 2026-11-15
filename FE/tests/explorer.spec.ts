@@ -112,12 +112,11 @@ test("renders and inspects Barnard-like flagged bands and exports their display 
     inspector
       .getByLabel("Selected pixel spectrum", { exact: true })
       .locator("circle"),
-  ).toHaveCount(2);
+  ).toHaveCount(1);
   await expect(
-    inspector
-      .getByLabel("Whole field spectrum", { exact: true })
-      .locator("circle"),
-  ).toHaveCount(3);
+    inspector.getByLabel("Whole field spectrum", { exact: true }),
+  ).toHaveCount(0);
+  await expect(inspector.getByText("ln(Intensity / 1 MJy/sr)", {exact:true})).toBeVisible();
   await expect(page.getByLabel("Mark flagged pixels (1)")).toBeChecked();
   const legend = page.getByRole("group", {name:"Displayed color scale"});
   await page.getByRole("checkbox", {name:"Color scale", exact:true}).check();
@@ -176,6 +175,16 @@ test("renders and inspects Barnard-like flagged bands and exports their display 
     ];
   }, Buffer.concat(chunks).toString("base64"));
   expect(pixel).toEqual(expected);
+  bands[1].archived = 0.5;
+  await page.reload();
+  const selectedGraph = page.getByLabel("Selected pixel spectrum", {exact:true});
+  await expect(page.getByLabel("Visit spectra")).toContainText("0.5 MJy/sr");
+  await expect(selectedGraph.locator('text[x="45"]').first()).toHaveText("-1.6931");
+  await expect(selectedGraph.locator("circle")).toHaveCount(1);
+  bands[1].archived = 0;
+  await page.reload();
+  await expect(selectedGraph.getByText("No positive spectral samples available.", {exact:true})).toBeVisible();
+  await expect(page.getByLabel("Visit spectra")).toContainText("0 MJy/sr");
 });
 test("validates coordinates and handles an unavailable backend", async ({
   page,
@@ -349,9 +358,9 @@ test("exposure PNG and calibrated brightness paint before lazy wavelength data",
     await page.getByRole("button",{name:"Toggle frame details"}).click();
     await expect(page.getByLabel("Visit spectra")).toContainText("42 MJy/sr");
     await expect(page.getByText("Loading per-pixel wavelengths…")).toBeVisible();
-    await expect(page.getByLabel("Whole field spectrum",{exact:true}).locator("circle")).toHaveCount(0);
+    await expect(page.getByLabel("Selected pixel spectrum",{exact:true}).locator("circle")).toHaveCount(0);
     wavelengths();
-    await expect(page.getByLabel("Whole field spectrum",{exact:true}).locator("circle")).toHaveCount(1);
+    await expect(page.getByLabel("Selected pixel spectrum",{exact:true}).locator("circle")).toHaveCount(1);
     expect(waveRequests).toBe(1);
     expect(warnings).toEqual([]);
   } finally {
