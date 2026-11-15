@@ -1,4 +1,5 @@
-import Explorer from "@/components/explorer";
+import SkyLanding from "@/components/sky-landing";
+import "./sky-landing.css";
 export default function Page() {
-  return <Explorer />;
+  return <SkyLanding />;
 }

@@ -34,6 +34,7 @@ from astropy.io.votable import parse_single_table
 from .config import Settings
 from .schemas import ObservationRecord, Query, nominal_parameters
 from .spectral import geometry_header_index, spectral_header_index
+from .cloud_cutouts import cloud_cutout
 
 
 ORIGIN = "https://irsa.ipac.caltech.edu"
@@ -701,6 +702,19 @@ class Archive:
             if on_wait:
                 on_wait()
         try:
+            if self.settings.cloud_cutouts:
+                cloud_started = time.monotonic()
+                try:
+                    cloud_cutout(self.client, checked_url(obs.uri), query, path,
+                                 min(deadline, cloud_started + 12), self.settings.max_download_bytes,
+                                 self.settings.request_seconds)
+                    if timing:
+                        timing("aws_cutout", time.monotonic() - cloud_started, obs.identity, "ok")
+                    return url
+                except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError, OSError) as exc:
+                    path.unlink(missing_ok=True)
+                    if timing:
+                        timing("aws_fallback", time.monotonic() - cloud_started, obs.identity, type(exc).__name__)
             retry_at = 0.0
             for attempt in range(CUTOUT_ATTEMPTS):
                 self._await_cutout(retry_at, deadline, on_wait)

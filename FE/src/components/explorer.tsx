@@ -79,6 +79,7 @@ import {
   loadObservations,
 } from "@/lib/api";
 import { angularWidth, parseQuery, queryUrl, separationDays } from "@/lib/view-url";
+import { clonePresetDisplay, skyTargets, viewingPresets } from "@/lib/exploration-presets";
 type LoadBatch = {
   jobId: string;
   ids?: string[];
@@ -121,7 +122,13 @@ const stages: Record<string, string> = {
   queued: "Waiting for processing",
 };
 export default function Explorer() {
-  const [targets, setTargets] = useState(presets),
+  const [targets, setTargets] = useState<Preset[]>(() => [
+    ...presets,
+    ...skyTargets.filter(t => !presets.some(p => p.id === t.id)).map(t => ({
+      id: t.id, name: t.name, ra: String(t.ra_deg), dec: String(t.dec_deg),
+      kind: "Sky landmark", note: t.description,
+    })),
+  ]),
     [selected, setSelected] = useState(""),
     [ra, setRa] = useState(""),
     [dec, setDec] = useState(""),
@@ -1187,6 +1194,8 @@ export default function Explorer() {
     setSelected(p.id);
     setRa(p.ra);
     setDec(p.dec);
+    const target = skyTargets.find(t => t.id === p.id);
+    if (target) setFov(String(target.fov_arcsec));
     setNotice(
       p.ra
         ? p.note
@@ -1565,6 +1574,22 @@ export default function Explorer() {
             </details>
             <details className="sidebar-section" open>
               <summary><span className="workflow-step" aria-hidden="true">02</span><span>Spectrum</span></summary>
+              <div className="control-section">
+                <label htmlFor="viewing-preset">Viewing preset</label>
+                <select id="viewing-preset"
+                  value={viewingPresets.find(p => JSON.stringify(p.display.maps) === JSON.stringify(display.maps))?.id ?? ""}
+                  onChange={e => {
+                    const preset = viewingPresets.find(p => p.id === e.target.value);
+                    if (!preset) return;
+                    update(clonePresetDisplay(preset));
+                    setBandDraft(draftBands(preset, fieldKey(field)));
+                    setAutoPaused(false);
+                    setNotice(preset.description + " Search observations to load these bands for the field.");
+                  }}>
+                  <option value="">Custom view</option>
+                  {viewingPresets.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+              </div>
               {frame?.previewScale ||
               (manifest?.frames.length && !science.numeric) ? (
                 <p className="preview-note">

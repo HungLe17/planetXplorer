@@ -16,6 +16,7 @@ class Settings:
     metadata_seconds: int = 30
     request_seconds: int = 15
     cutout_workers: int = 4
+    cloud_cutouts: bool = True
     max_download_bytes: int = 64 * 1024 * 1024
     max_cache_bytes: int = 1024 * 1024 * 1024
     max_candidates: int = 24
@@ -55,6 +56,7 @@ class Settings:
     @classmethod
     def from_env(cls):
         return cls(
+            cloud_cutouts=os.environ.get("PLANETX_CLOUD_CUTOUTS", "1") != "0",
             desi_dir=Path(os.environ.get("PLANETX_DESI_DIR", str(ROOT / ".cache-surveys" / "desi-dr1-v1.5"))).resolve(),
             cache_dir=Path(
                 os.environ.get("PLANETX_CACHE_DIR", str(ROOT / ".cache"))

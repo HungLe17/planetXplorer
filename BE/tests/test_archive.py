@@ -1,4 +1,5 @@
 import time
+from dataclasses import replace
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from email.utils import formatdate
@@ -12,7 +13,7 @@ from app.schemas import Query
 
 
 def archive_with(handler, settings=None):
-    archive = Archive(settings or Settings())
+    archive = Archive(replace(settings or Settings(), cloud_cutouts=False))
     archive.client.close()
     archive.client = httpx.Client(
         transport=httpx.MockTransport(handler), follow_redirects=False
