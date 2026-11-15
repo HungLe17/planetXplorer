@@ -1990,6 +1990,14 @@ export default function Explorer() {
                   setInspectorOpen(true);
                 }}
                 message={science.message}
+                searchError={error}
+                onRetrySearch={displayedQuery ? () => { void load(displayedQuery); } : undefined}
+                onInspectExposure={viewMode !== "browse" && !subtracting && allFrames.length ? () => {
+                  const exposure = allFrames[0];
+                  setMode("browse");
+                  restoreFrame.current = exposure.observation_id;
+                  setSelectedFrame(exposure.observation_id);
+                } : undefined}
                 grid={manifest?.grid}
                 gridHeader={manifest?.processing?.grid_header}
               />

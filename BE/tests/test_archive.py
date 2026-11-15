@@ -25,6 +25,45 @@ def uri(release="dr1", identity="2025W19_1B_0116_1D2", version=27):
     return f"ibe/data/spherex/{release}/level2/2025W19_1B/l2b-v{version}-2026-197/2/level2_{identity}_spx_l2b-v{version}-2026-197.fits"
 
 
+def test_broad_search_recovers_windows_retries_and_deduplicates(monkeypatch):
+    a = archive_with(lambda _: httpx.Response(502))
+    query = Query(ra_deg=83.82, dec_deg=-5.38,
+                  start_utc="2025-05-01T00:00:00Z", end_utc="2025-07-01T00:00:00Z")
+    obs = Observation("2025W19_1B_0116_1D2", "https://irsa.ipac.caltech.edu/" + uri(), 60801, "D2", "DR1")
+    calls = []
+
+    def search(window, deadline, offer, timing):
+        calls.append(window)
+        if len(calls) <= 2:
+            raise ArchiveError("IRSA metadata search returned HTTP 502")
+        return [obs], []
+
+    monkeypatch.setattr(a, "_search_field", search)
+    try:
+        rows, notes = a.search(query, time.monotonic() + 30)
+        assert rows == [obs]
+        assert calls[1] == calls[2]
+        assert all((q.end_utc - q.start_utc).days <= 14 for q in calls[1:])
+        assert any(note.startswith("Partial metadata:") for note in notes)
+    finally:
+        a.close()
+
+
+def test_broad_search_outage_remains_error_not_empty_coverage(monkeypatch):
+    a = archive_with(lambda _: httpx.Response(502))
+
+    def unavailable(*args):
+        raise ArchiveError("IRSA metadata search returned HTTP 502")
+
+    monkeypatch.setattr(a, "_search_field", unavailable)
+    try:
+        with pytest.raises(ArchiveError, match="502"):
+            a.search(Query(ra_deg=83, dec_deg=-5, start_utc="2025-05-01T00:00:00Z",
+                           end_utc="2025-07-01T00:00:00Z"), time.monotonic() + 30)
+    finally:
+        a.close()
+
+
 def test_query_utc_bounds_deduplicates_and_prefers_dr1():
     def handler(request):
         sql = request.url.params["QUERY"]

@@ -119,6 +119,9 @@ export default function SkyViewer({
   selection,
   onSelect,
   message,
+  searchError,
+  onRetrySearch,
+  onInspectExposure,
   unmatchedFrames = false,
   cycleView,
   subtracting,
@@ -140,6 +143,9 @@ export default function SkyViewer({
   selection: PixelBox | null;
   onSelect: (selection: PixelBox) => void;
   message: string;
+  searchError?: string;
+  onRetrySearch?: () => void;
+  onInspectExposure?: () => void;
   unmatchedFrames?: boolean;
   cycleView: boolean;
   subtracting?: boolean;
@@ -881,9 +887,11 @@ export default function SkyViewer({
         )}
         {!frames.length && (
           <div className="sky-empty">
-            <h2>No observation loaded</h2>
-            <p>{message || "Enter coordinates to load observations."}</p>
-            {!message && <ol className="empty-workflow">
+            <h2>{searchError ? "Observation search failed" : onInspectExposure ? "Map inputs incomplete" : "No observation loaded"}</h2>
+            <p role={searchError ? "alert" : undefined}>{searchError || message || "Enter coordinates to load observations."}</p>
+            {searchError && onRetrySearch && <button className="button" onClick={onRetrySearch}>Retry observation search</button>}
+            {onInspectExposure && <button className="button" onClick={onInspectExposure}>Inspect loaded exposure</button>}
+            {!message && !searchError && <ol className="empty-workflow">
               <li>Choose a sky position</li>
               <li>Search observations</li>
               <li>Inspect pixels and compare cycles</li>

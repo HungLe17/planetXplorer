@@ -19,7 +19,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, timedelta
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -340,7 +340,45 @@ class Archive:
                     self.discovery_future = self.discovery_pool.submit(self.discovery)
             finally:
                 self.discovery_lock.release()
-        rows, notes = self._search_field(query, deadline, offer if on_candidate or timing else None, timing)
+        notify = offer if on_candidate or timing else None
+        wide = (query.start_utc is not None and query.end_utc is not None
+                and query.end_utc - query.start_utc > timedelta(days=31))
+        initial_deadline = min(deadline, started + self.settings.metadata_seconds / 2) if wide else deadline
+        try:
+            rows, notes = self._search_field(query, initial_deadline, notify, timing)
+        except ArchiveError:
+            if not wide or time.monotonic() >= deadline:
+                raise
+            # Recover from expensive broad searches without claiming complete coverage.
+            rows, notes = [], []
+            end = query.end_utc
+            while end > query.start_utc and time.monotonic() < deadline:
+                start = max(query.start_utc, end - timedelta(days=14))
+                window = query.model_copy(update={"start_utc": start, "end_utc": end})
+                for attempt in range(2):
+                    if time.monotonic() >= deadline:
+                        break
+                    try:
+                        batch, warnings = self._search_field(
+                            window, min(deadline, time.monotonic() + 4), notify, timing,
+                        )
+                        rows.extend(batch)
+                        notes.extend(warnings)
+                        break
+                    except ArchiveError:
+                        continue
+                end = start
+            if not rows:
+                raise
+            unique = {}
+            for obs in rows:
+                previous = unique.get(obs.identity)
+                if previous is None or self._version_key(obs) > self._version_key(previous):
+                    unique[obs.identity] = obs
+            rows = sorted(unique.values(), key=lambda obs: (obs.mjd, obs.identity))
+            notes = list(dict.fromkeys(notes))
+            notes.append("Partial metadata: recovered observations using shorter date windows; "
+                         "archive discovery remains incomplete. Retry to refresh coverage.")
         if query.live and self.discovery_note:
             notes.insert(1, self.discovery_note)
         return rows, notes
@@ -351,7 +389,7 @@ class Archive:
             # for TAP if the image-search service is temporarily unavailable.
             rows, notes = self._search_sia(
                 query,
-                min(deadline, time.monotonic() + self.settings.metadata_seconds / 2),
+                min(deadline, time.monotonic() + max(0, deadline - time.monotonic()) / 2),
                 offer, timing,
             )
             return rows, ["Metadata retrieved via IRSA SIA.", *notes]
