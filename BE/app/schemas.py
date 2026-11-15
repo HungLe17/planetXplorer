@@ -8,6 +8,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 Detector = Literal["D1", "D2", "D3", "D4", "D5", "D6"]
 BandMatch = Literal["matched", "excluded", "unknown", "unavailable"]
 
+def nominal_parameters(label: str):
+    match = re.fullmatch(r"(D[1-6])-(0[1-9]|1[0-7])", label)
+    return (match[1], int(match[2])) if match else None
+
 
 def channel_parameters(channel: str):
     # Older saved views contain different encodings of the wavelength unit.
@@ -20,6 +24,10 @@ def calibrated_channels(groups):
         if not channels or len(channels) > 512:
             raise ValueError("Channel selection must contain 1 to 512 entries")
         for channel in channels:
+            if nominal := nominal_parameters(channel):
+                if nominal[0] != detector:
+                    raise ValueError("Nominal spectrum belongs to another detector")
+                continue
             parsed = channel_parameters(channel) if len(channel) <= 160 else None
             if not parsed or parsed[0] != detector or not 0 < parsed[1] < 100:
                 raise ValueError("Invalid calibrated detector channel")
@@ -34,6 +42,7 @@ class Query(BaseModel):
     fov_arcsec: float = Field(default=300, ge=30, le=1800)
     start_utc: datetime | None = None
     end_utc: datetime | None = None
+    min_separation_days: float | None = Field(default=None, gt=0)
     detectors: list[Detector] | None = Field(None, min_length=1, max_length=6)
     channels: dict[Detector, list[str]] = Field(default_factory=dict)
 
@@ -62,18 +71,25 @@ class Query(BaseModel):
                 raise ValueError("Channel selector belongs to an unrequested detector")
         return self
 
-    def band_match(self, detector, wavelength=None, bandwidth=None, version=None) -> BandMatch:
+    def band_match(self, detector, wavelength=None, bandwidth=None, version=None, nominal_channel=None) -> BandMatch:
         if self.detectors is not None and detector not in self.detectors:
             return "excluded"
         if not self.channels.get(detector):
-            return "matched"
-        if wavelength is None or not bandwidth or version is None:
-            return "unknown"
+            return "excluded" if self.detectors and nominal_channel in (0, 18) else "matched"
+        unresolved = False
         for label in self.channels[detector]:
-            _, center, calibration = channel_parameters(label)
-            if calibration == version and abs(center - wavelength) <= bandwidth / 2 + 0.0000005:
+            if nominal := nominal_parameters(label):
+                if nominal_channel is None:
+                    unresolved = True
+                elif nominal[1] == nominal_channel:
+                    return "matched"
+            elif wavelength is None or not bandwidth or version is None:
+                unresolved = True
+            elif (empirical := channel_parameters(label)) and empirical[2] == version and abs(
+                empirical[1] - wavelength
+            ) <= bandwidth / 2 + 0.0000005:
                 return "matched"
-        return "excluded"
+        return "unknown" if unresolved else "excluded"
 
 
 class Frame(BaseModel):
@@ -83,6 +99,7 @@ class Frame(BaseModel):
     observed_at: str
     midpoint_utc: str | None = None
     detector: str
+    nominal_channel: int | None = Field(default=None, ge=0, le=18)
     wavelength_um: float
     bandwidth_um: float
     release: str
@@ -108,6 +125,8 @@ class ObservationRecord(BaseModel):
     source_url: str
     observed_at: str
     detector: str
+    nominal_channel: int | None = Field(default=None, ge=0, le=18)
+    geometry_checked: bool = False
     release: str
     status: Literal["pending", "loading", "ready", "failed"] = "pending"
     reason: str | None = None
@@ -121,9 +140,20 @@ class ObservationRecord(BaseModel):
     def band_match(self, query: Query) -> BandMatch:
         parsed = channel_parameters(self.channel) if self.channel else None
         return query.band_match(self.detector, self.wavelength_um, self.bandwidth_um,
-                                parsed[2] if parsed else None)
+                                parsed[2] if parsed else None, self.nominal_channel)
+
+    def needs_spectral(self, query: Query):
+        if self.band_match(query) == "unknown":
+            return True
+        if self.nominal_channel is not None:
+            return False
+        return not self.channel or (not query.channels.get(self.detector) and not self.geometry_checked)
 
     def set_spectral(self, info):
+        if info.get("nominal_channel") is not None:
+            self.nominal_channel = info["nominal_channel"]
+        if info.get("wavelength_um") is None:
+            return
         self.wavelength_um = info["wavelength_um"]
         self.bandwidth_um = info["bandwidth_um"]
         self.channel = f"{self.detector} {self.wavelength_um:.6f} µm ({info['processing_version']})"
@@ -151,6 +181,7 @@ class Sequence(BaseModel):
 class LoadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     observation_ids: list[str] = Field(default_factory=list, max_length=8)
+    metadata_only: bool = False
     detector: Literal["D1", "D2", "D3", "D4", "D5", "D6"] | None = None
     channels: dict[Detector, list[str]] = Field(default_factory=dict)
 

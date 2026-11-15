@@ -9,6 +9,7 @@ from astropy.time import Time
 from astropy.wcs import WCS
 import astropy.units as u
 import numpy as np
+from .nominal_geometry import nominal_channel
 
 
 def spectral_wcs(header, hdus):
@@ -60,6 +61,16 @@ def exposure_midpoint(header) -> str | None:
     return middle.utc.isot + "Z"
 
 
+def geometry_header_index(prefix, query):
+    image = image_header(prefix)
+    detector = image.get("DETECTOR") or fits.Header.fromfile(io.BytesIO(prefix)).get("DETECTOR")
+    x, y = WCS(image).celestial.world_to_pixel(SkyCoord(query.ra_deg*u.deg, query.dec_deg*u.deg))
+    if not (-.5 <= x < image["NAXIS1"]-.5 and -.5 <= y < image["NAXIS2"]-.5):
+        return None
+    number = nominal_channel("D" + str(detector).removeprefix("D"), image, x, y)
+    return {"nominal_channel": number} if number is not None else None
+
+
 def spectral_header_index(prefix, tail, query):
     """IRSA's uncompressed full MEFs end with a small, self-contained WCS-WAVE HDU."""
     primary = fits.Header.fromfile(io.BytesIO(prefix))
@@ -82,5 +93,6 @@ def spectral_header_index(prefix, tail, query):
     wave, band = float(wave.to_value(u.um)), float(band.to_value(u.um))
     if not np.isfinite(wave) or not np.isfinite(band) or band <= 0:
         raise ValueError("Invalid spectral lookup")
-    return {"wavelength_um": wave, "bandwidth_um": band,
+    detector = "D" + str(image.get("DETECTOR", primary.get("DETECTOR", ""))).removeprefix("D")
+    return {"wavelength_um": wave, "bandwidth_um": band, "nominal_channel": nominal_channel(detector, image, x, y),
             "processing_version": str(primary.get("VERSION", "unknown"))}

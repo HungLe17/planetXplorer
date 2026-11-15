@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import shutil
 import io
+import time
 from threading import Event
 
 import numpy as np
@@ -308,7 +309,7 @@ def test_search_finds_raw_matches_and_prefers_the_core_cycle(tmp_path, mode):
     if mode != "whole detector":
         query.channels = {"D6": [f"D6 {decoded.wavelengths[0]:.6f} µm ({decoded.version})"]}
     info = {"wavelength_um": decoded.wavelengths[0], "bandwidth_um": decoded.bandwidths[0],
-            "processing_version": decoded.version}
+            "processing_version": decoded.version, "nominal_channel": decoded.nominal_channel}
     sampled = []
 
     class Ranked(Archive):
@@ -323,7 +324,8 @@ def test_search_finds_raw_matches_and_prefers_the_core_cycle(tmp_path, mode):
                 return info
 
         def probe_spectral(self, obs, query, deadline):
-            raise AssertionError("A speculative wavelength displaced a known match")
+            assert mode == "no core match" and obs.identity.startswith("core")
+            return dict(info, wavelength_um=info["wavelength_um"] + 1)
 
         def fetch(self, obs, query, path, deadline, **kwargs):
             sampled.append(obs.identity)
@@ -338,7 +340,7 @@ def test_search_finds_raw_matches_and_prefers_the_core_cycle(tmp_path, mode):
     elif mode == "known core match":
         assert sampled[0] == "coreD6"
     else:
-        assert set(sampled) == {"invalidD6", "supplemental"}
+        assert sampled == ["supplemental"]  # Only one confirmed raw fallback is needed.
 
 
 def test_unindexed_nonmatches_leave_room_for_later_subband(tmp_path):
@@ -511,6 +513,19 @@ def test_channel_menu_probes_only_requested_detector_and_reuses_calibration(tmp_
             assert final["channels"] == first["channels"] and final["unavailable"] == 1
             assert final["next_cursor"] is None and requests[-1] == ("unsupported.fits", "bytes=0-92159")
             assert len(requests) == 5 and not m.frames and not records[2].channel
+            # The same versioned FITS can be reused at a different center, but
+            # its wavelength must be evaluated again at that sky coordinate.
+            shifted = q.model_copy(update={"dec_deg": q.dec_deg + .0003})
+            recalibrated = archive.spectral_at(records[2].source_url, shifted, time.monotonic() + 2)
+            expected = decode(fixture, Observation("first", records[2].source_url, 60800, "D6", "DR1"),
+                              shifted, "fixture").wavelengths[0]
+            assert recalibrated["wavelength_um"] == pytest.approx(expected, abs=1e-10)
+            assert recalibrated["wavelength_um"] != archive.cached_spectral(records[2].source_url, q)["wavelength_um"]
+            assert len(requests) == 5
+            nominal = Query(ra_deg=q.ra_deg, dec_deg=q.dec_deg, detectors=["D6"], channels={"D6":["D6-16"]})
+            product = Observation("geo", records[2].source_url.replace("first.fits", "geo.fits"), 60800, "D6", "DR1")
+            assert archive.probe_spectral(product, nominal, time.monotonic()+2) == {"nominal_channel": 16}
+            assert requests[5:] == [("geo.fits", "bytes=0-92159")]
             assert client.get(url.replace("D6", "D7")).status_code == 422
     finally:
         archive.close()

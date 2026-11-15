@@ -163,13 +163,24 @@ class ExposureCache:
                                    time.time() - self.settings.ttl_seconds)
                 if entry is not None and query.band_match(
                     observation.detector, entry.frame.wavelength_um,
-                    entry.frame.bandwidth_um, entry.frame.processing_version,
+                    entry.frame.bandwidth_um, entry.frame.processing_version, entry.frame.nominal_channel,
                 ) == "matched":
                     return entry
                 return None
         except (OSError, sqlite3.Error):
             logger.warning("Could not read exposure cache", exc_info=True)
             return None
+
+    def enrich_nominal(self, query, identity, uri, number):
+        if number is None or not self.path.is_file():
+            return
+        try:
+            with self._open() as db:
+                db.execute("""UPDATE exposure SET metadata = json_set(metadata, '$.frame.nominal_channel', ?)
+                              WHERE field=? AND identity=? AND uri=? AND json_extract(metadata, '$.frame.nominal_channel') IS NULL""",
+                           (number, self._field(query), identity, uri))
+        except (OSError, sqlite3.Error):
+            logger.warning("Could not enrich cached detector geometry", exc_info=True)
 
     def load(self, query: Query) -> list[CachedExposure]:
         """Find the preferred known revisions within the requested field and date range."""
@@ -196,6 +207,7 @@ class ExposureCache:
                 # preferred release of the same exposure.
                 matches = [obs for obs, frame in available.values() if query.band_match(
                     obs.detector, frame["wavelength_um"], frame["bandwidth_um"], frame["processing_version"],
+                    frame.get("nominal_channel"),
                 ) == "matched"]
                 sample = Archive.candidates(matches, self.settings.max_candidates)
                 return [entry for obs in sample if (entry := self._read(db, field, obs, since))]

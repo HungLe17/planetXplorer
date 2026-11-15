@@ -1,3 +1,4 @@
 import type { NextConfig } from "next";
-const config: NextConfig = { devIndicators: false };
+import path from "node:path";
+const config: NextConfig = { devIndicators: false, turbopack: {root: path.resolve(__dirname, "..")} };
 export default config;

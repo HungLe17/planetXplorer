@@ -6,7 +6,7 @@ import math
 import time
 from collections.abc import Callable
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,8 +26,10 @@ from .archive import Archive, ArchiveError, Observation
 from .config import Settings
 from .exposure_cache import CachedExposure, ExposureCache
 from .pixel_quality import SOURCE_BIT, PixelQuality, PixelState
-from .schemas import Frame, Manifest, Query, Sequence
+from .schemas import Frame, Manifest, Query, Sequence, nominal_parameters
 from .visits import field_visits
+from .sampling import metadata_candidates, pending_metadata, sampling_plan
+from .nominal_geometry import nominal_channel
 from .spectral import exposure_midpoint, spectral_wcs
 from .transfers import CutoutQueue, PriorityLoads
 
@@ -50,6 +52,7 @@ class Cutout:
     flag_names: dict | None = None
     quality: PixelQuality | None = None
     midpoint_utc: str | None = None
+    nominal_channel: int | None = None
 
 
 def decode(path: Path, obs: Observation, query: Query, source: str, *, region=False) -> Cutout:
@@ -140,6 +143,7 @@ def decode(path: Path, obs: Observation, query: Query, source: str, *, region=Fa
              if k.startswith("MSKN") and k[4:].isdigit()},
             quality,
             exposure_midpoint(image.header),
+            nominal_channel(obs.detector, image.header, *pixels[0]),
         )
 
 
@@ -150,6 +154,7 @@ def compatible(a: Cutout, b: Cutout, tolerance: float) -> bool:
 def same_channel(a, b, first_version: str, second_version: str, tolerance: float) -> bool:
     return (
         a.observation.detector == b.observation.detector
+        and (a.nominal_channel is None or b.nominal_channel is None or a.nominal_channel == b.nominal_channel)
         and first_version == second_version
         and first_version != "unknown"
         and bool(
@@ -276,7 +281,11 @@ def timed(timing: Timing | None, stage: str, observation: str | None = None):
 def assign_sequence(frame: Frame, existing: list[Frame], sequences: list[Sequence], tolerance: float):
     """Extend a sequence only when every member agrees at all five field samples."""
     def matches(other):
-        if len(other.match_wavelengths) != 5 or len(other.match_bandwidths) != 5:
+        if (frame.nominal_channel is not None and other.nominal_channel is not None
+                and frame.nominal_channel != other.nominal_channel):
+            return False
+        if any(len(values) != 5 for values in (frame.match_wavelengths, frame.match_bandwidths,
+                                               other.match_wavelengths, other.match_bandwidths)):
             return False
         waves = np.asarray(frame.match_wavelengths, dtype=float)
         other_waves = np.asarray(other.match_wavelengths, dtype=float)
@@ -338,6 +347,7 @@ def frame_metadata(c: Cutout, quality: PixelQuality) -> Frame:
         .to_datetime(timezone=UTC)
         .isoformat(),
         detector=c.observation.detector,
+        nominal_channel=c.nominal_channel,
         midpoint_utc=c.midpoint_utc,
         wavelength_um=float(c.wavelengths[0]),
         bandwidth_um=float(c.bandwidths[0]),
@@ -361,11 +371,15 @@ class Pipeline:
         self.transfers = CutoutQueue(min(settings.cutout_workers, 2))
 
     def run(self, query: Query, directory: Path, job_id: str, report: Callable[[str], None],
-            *, publish: Callable[[Manifest], None] | None = None, timing: Timing | None = None, priority=None):
-        return _FrameJob(self, query, directory, job_id, report, publish, timing, priority).run()
+            *, publish: Callable[[Manifest], None] | None = None, timing: Timing | None = None, priority=None,
+            catalog_hint=()):
+        job = _FrameJob(self, query, directory, job_id, report, publish, timing, priority)
+        job.catalog_hint = catalog_hint
+        return job.run()
 
 
-    def load(self, manifest, ids, directory, job_id, report, *, publish=None, timing=None, channels=None, priority=None):
+    def load(self, manifest, ids, directory, job_id, report, *, publish=None, timing=None, channels=None, priority=None,
+             metadata_only=False):
         job = _FrameJob(self, manifest.query, directory, job_id, report, publish, timing, priority)
         job.result = manifest.model_copy(deep=True)
         job.result.cached = False
@@ -373,7 +387,16 @@ class Pipeline:
         records = {r.id: r for r in job.result.observations}
         rows = [Observation(r.id, r.source_url, float(Time(datetime.fromisoformat(r.observed_at)).mjd),
                             r.detector, r.release) for r in (records[key] for key in ids)]
-        job.batch(rows, extra_channels=channels)
+        if metadata_only:
+            deadline = min(job.download_deadline, time.monotonic() + min(6, self.settings.metadata_seconds))
+            with ThreadPoolExecutor(max_workers=self.settings.cutout_workers) as pool:
+                probes = {pool.submit(self.archive.probe_spectral, o, job.query, deadline): records[o.identity]
+                          for o in rows if records[o.identity].band_match(job.query) != "excluded"}
+                for future in as_completed(probes):
+                    report("validate")
+                    job.apply_probe(probes[future], future)
+        else:
+            job.batch(rows, extra_channels=channels)
         return job.finalize()
 
 
@@ -438,11 +461,30 @@ class _FrameJob:
             else:
                 record.status, record.frame_id, record.reason = "pending", None, None
         self.result.visits = field_visits(self.result, list(available.values()))
+        if self.query.live and self.query.detectors and self.result.observations:
+            tracks, background = sampling_plan(self.result, self.settings.spectral_tolerance)
+            self.result.processing.update(sampling_tracks=tracks, background_tracks=background,
+                                          sampling_metadata_ids=pending_metadata(self.result),
+                                          sampling_order=[key for group in tracks for key in group])
         update_counts(self.result)
 
     def grouped(self):
         frames = list(self.result.frames)
         sequences = [s.model_copy(deep=True) for s in self.result.sequences]
+        # Header-only enrichment can reveal that a previously published
+        # empirical sequence included two different detector stripes.
+        channels = {}
+        for frame in frames:
+            if frame.sequence_id and frame.nominal_channel is not None:
+                channels.setdefault(frame.sequence_id, set()).add(frame.nominal_channel)
+        split = {key for key, numbers in channels.items() if len(numbers) > 1}
+        if split:
+            previous = [f.model_copy(deep=True) for f in frames if f.sequence_id in split]
+            frames = [f for f in frames if f.sequence_id not in split]
+            sequences = [s for s in sequences if s.id not in split]
+            for frame in previous:
+                assign_sequence(frame, frames, sequences, self.settings.spectral_tolerance)
+                frames.append(frame)
         for entry in self.ordered():
             f = entry.frame.model_copy(deep=True)
             assign_sequence(f, frames, sequences, self.settings.spectral_tolerance)
@@ -496,7 +538,14 @@ class _FrameJob:
                 )
                 source = self.archive.fetch(obs, self.query, path, self.download_deadline, **kwargs)
             with timed(self.timing, "fits_decode", obs.identity):
-                return decode(path, obs, self.query, source)
+                cutout = decode(path, obs, self.query, source)
+                if cutout.nominal_channel is None:
+                    cutout.nominal_channel = record.nominal_channel
+                if (any(nominal_parameters(label) for label in self.query.channels.get(obs.detector, []))
+                        and self.query.band_match(obs.detector, cutout.wavelengths[0], cutout.bandwidths[0], cutout.version,
+                                                  cutout.nominal_channel) != "matched"):
+                    raise ArchiveError("Downloaded detector geometry disagrees with the selected spectrum.")
+                return cutout
         finally:
             path.unlink(missing_ok=True)
 
@@ -542,44 +591,27 @@ class _FrameJob:
         self.result.observations = [o.record() for o in rows]
         indexed = self.cache.field_index(self.query) if self.query.live else {}
         eligible = []
-        known_matches = set()
         for obs, record in zip(rows, self.result.observations, strict=True):
             cached = indexed.get((obs.identity, obs.uri))
-            if not cached and obs.detector in self.query.channels and isinstance(self.archive, Archive):
-                cached = self.archive.cached_spectral(obs.uri, self.query)
             if cached:
                 record.set_spectral(cached)
+            if (record.needs_spectral(self.query) and self.query.detectors and obs.detector in self.query.detectors
+                    and isinstance(self.archive, Archive)):
+                if header := self.archive.cached_spectral(obs.uri, self.query):
+                    record.set_spectral(header)
             record.selection = record.band_match(self.query)
             if record.selection != "excluded":
                 eligible.append(obs)
-                if record.selection == "matched":
-                    known_matches.add(obs.identity)
         if self.query.live:
             limit = min(self.settings.max_candidates, self.settings.max_frames)
             if self.query.detectors is None:
                 selected = Archive.candidates(eligible, limit)
             else:
-                # Finish requested measurements within a well-covered field visit first.
-                # The frontend can extend it in bounded batches before moving to another.
-                visits = field_visits(self.result, [])
+                frames, _ = self.grouped()
+                self.refresh_records(frames)
+                order = self.result.processing.get("sampling_order", [])
                 by_id = {obs.identity: obs for obs in eligible}
-                available_detectors = {r.id: r.detector for r in self.result.observations}
-                ranked = sorted(visits, key=lambda v: (
-                    v.kind == "cycle" and v.status != "invalid",
-                    len({available_detectors[i] for i in v.observation_ids}), v.start_utc
-                ), reverse=True)
-                selected = []
-                # A confirmed wavelength in an older cycle can yield an image while
-                # newer exposures still need metadata. Preserve visit ranking within each pass.
-                for confirmed in (True, False):
-                    for visit in ranked:
-                        group = [by_id[i] for i in visit.observation_ids
-                                 if i in by_id and (i in known_matches) == confirmed]
-                        selected.extend(Archive.candidates(group, limit - len(selected)))
-                        if len(selected) >= limit:
-                            break
-                    if len(selected) >= limit:
-                        break
+                selected = [by_id[key] for key in order[:limit]]
         else:
             detectors = [f"D{i}" for i in range(1, 7)]
             detector = max(detectors, key=lambda d: sum(o.detector == d for o in rows))
@@ -605,11 +637,13 @@ class _FrameJob:
 
     def confirm(self, obs, record, extra_channels=None):
         """Verify the search selection and any narrower load request before opening a cutout."""
+        retry_metadata = record.selection == "unavailable"
         record.selection = record.band_match(self.query)
         if record.selection == "excluded":
             return False
         narrower = self.query.model_copy(update={"channels": extra_channels}) if extra_channels else None
-        if record.selection == "unknown" or (narrower and record.band_match(narrower) == "unknown"):
+        if (retry_metadata or record.selection == "unknown" or (self.query.live and self.query.detectors and record.needs_spectral(self.query))
+                or (narrower and record.band_match(narrower) == "unknown")):
             probe = getattr(self.archive, "probe_spectral", None)
             existing = self.early_metadata.pop(obs, None)
             if existing is not None:
@@ -621,9 +655,40 @@ class _FrameJob:
                 record.reason = "Wavelength metadata unavailable. Retry to check this exposure."
                 return False
             record.set_spectral(info)
+            record.geometry_checked = True
             record.selection = record.band_match(self.query)
+            if record.selection == "unknown" or (narrower and record.band_match(narrower) == "unknown"):
+                record.selection = "unavailable"
+                record.reason = "Detector-channel assignment unavailable. Retry to check this exposure."
+                return False
         record.reason = None
         return record.selection == "matched" and (not narrower or record.band_match(narrower) == "matched")
+
+    def apply_probe(self, record, future):
+        try:
+            info = future.result()
+        except (ArchiveError, OSError, ValueError):
+            info = None
+        if info:
+            record.set_spectral(info)
+            record.geometry_checked = True
+            number = record.nominal_channel
+            if number is not None:
+                self.cache.enrich_nominal(self.query, record.id, record.source_url, number)
+                entry = self.accepted.get(record.id)
+                if entry is not None and entry.observation.uri == record.source_url:
+                    entry.frame.nominal_channel = number
+                for frame in self.result.frames:
+                    if frame.observation_id == record.id and frame.source_url.partition("?")[0] == record.source_url:
+                        frame.nominal_channel = number
+            record.reason = None
+            record.selection = record.band_match(self.query)
+            if record.selection == "unknown":
+                record.selection = "unavailable"
+                record.reason = "Detector-channel assignment unavailable. Retry to check this exposure."
+        else:
+            record.selection = "unavailable"
+            record.reason = "Wavelength metadata unavailable. Retry to check this exposure."
 
     def live(self, pool):
         search_started = time.time()
@@ -640,18 +705,36 @@ class _FrameJob:
         early_obs, early_future, early_error = None, None, None
         probe, probing = None, None
         checked = {}
+        # Before discovery finishes the winning cross-cycle wavelength cannot
+        # be known. A search for exactly one channel already identifies it.
+        single_channel = (self.query.detectors and len(self.query.detectors) == 1
+                          and len(self.query.channels.get(self.query.detectors[0], [])) == 1)
+        early_allowed = single_channel or self.query.detectors is None
 
         def start_early(obs, record):
             nonlocal early_obs, early_future
             early_obs = obs
+            self.cache.enrich_nominal(self.query, obs.identity, obs.uri, record.nominal_channel)
             if self.restore(obs):
                 self.snapshot()
             else:
+                self.batch_records.add(obs.identity)
                 early_future = self.transfers.submit(self.retrieve, obs, record)
                 early_future.add_done_callback(events.put)
 
+        if not warm and single_channel:
+            for obs in self.catalog_hint:
+                if obs.detector != self.query.detectors[0]:
+                    continue
+                info = self.archive.cached_spectral(obs.uri, self.query)
+                if info:
+                    record = obs.record()
+                    record.set_spectral(info)
+                    if record.band_match(self.query) == "matched":
+                        start_early(obs, record)
+                        break
         with ThreadPoolExecutor(max_workers=1) as metadata:
-            lookup = metadata.submit(self.catalog, None if warm else events.put)
+            lookup = metadata.submit(self.catalog, events.put if early_allowed and not warm else None)
             lookup.add_done_callback(events.put)
             while not lookup.done():
                 event = events.get()
@@ -693,21 +776,62 @@ class _FrameJob:
                 notes = [f"Partial metadata: archive refresh unavailable. {exc}"]
                 self.result.processing["cache_fallback"] = warm
 
+        if early_obs not in rows:
+            self.batch_records.clear()
         rows, selected, complete = self.resolve(rows, notes)
         for obs, record in zip(rows, self.result.observations, strict=True):
             if obs in checked:
                 old = checked[obs]
                 record.selection, record.reason = old.selection, old.reason
                 record.channel, record.wavelength_um, record.bandwidth_um = old.channel, old.wavelength_um, old.bandwidth_um
+                record.nominal_channel = old.nominal_channel
         selected = [obs for obs in selected if obs not in checked or checked[obs].selection == "matched"]
         # Catalog consumers can browse or prioritize records immediately, even when
         # every candidate still needs a wavelength check and the image cache is cold.
         self.snapshot()
+        row_by_id = {o.identity: o for o in rows}
+        metadata = metadata_candidates(self.result, self.settings.max_candidates) if self.query.detectors else []
+        probe_band = getattr(self.archive, "probe_spectral", None)
+        if metadata and probe_band:
+            # A first detector match is already usable. Publish its image as soon
+            # as ready, while calibration headers identify cross-cycle candidates.
+            records = {r.id: r for r in self.result.observations}
+            if early_allowed and not warm and early_obs is None and selected and records[selected[0].identity].selection == "matched":
+                start_early(selected[0], records[selected[0].identity])
+            until = min(self.download_deadline, time.monotonic() + min(6, self.settings.metadata_seconds))
+            probes = {pool.submit(probe_band, row_by_id[r.id], self.query, until): r for r in metadata}
+            receipts = list(probes)
+            if early_future and early_obs in rows and early_obs.identity not in self.accepted and not early_error:
+                receipts.append(early_future)
+            outstanding = len(probes)
+            for future in as_completed(receipts):
+                self.report("validate")
+                if future is early_future:
+                    try:
+                        self.accept(future.result())
+                    except (ArchiveError, ValueError, KeyError, OSError) as exc:
+                        early_error = str(exc)
+                    continue
+                self.apply_probe(probes[future], future)
+                outstanding -= 1
+                if not outstanding:
+                    break  # The regular queue can fill the other slot while the early cutout is still in flight.
+            frames, _ = self.grouped()
+            self.refresh_records(frames)
+            order = self.result.processing["sampling_order"]
+            selected = [row_by_id[key] for key in order[:min(self.settings.max_candidates, self.settings.max_frames)]]
+            self.snapshot()
         self.cache.reconcile(self.query, rows, complete, as_of=search_started)
         if early_obs in rows and early_obs not in selected:
             selected = [early_obs, *selected][:min(self.settings.max_candidates, self.settings.max_frames)]
         if early_future is not None and early_obs not in selected:
             early_future.cancel()
+        # Other unclassified cycles may belong to the first wavelength. Leave
+        # later tracks for metadata-only follow-up before opening their FITS.
+        tracks = self.result.processing.get("sampling_tracks", [])
+        if len(tracks) > 1 and self.result.processing.get("sampling_metadata_ids"):
+            first = set(tracks[0])
+            selected = [obs for obs in selected if obs.identity in first or obs == early_obs]
         targets = {o.identity: o.uri for o in selected}
         old_ids = set(self.accepted)
         # Keep a published revision visible until its replacement has usable assets.
@@ -739,11 +863,11 @@ class _FrameJob:
         )))
         limit = min(self.settings.max_candidates, self.settings.max_frames)
         while remaining and not self.accepted and time.monotonic() < self.download_deadline:
-            slots = limit - len(self.result.omissions)
-            if slots <= 0:
+            if len(self.result.omissions) >= limit:
                 break
-            count = min(slots, self.settings.batch_size, len(remaining))
-            self.batch([remaining.popleft() for _ in range(count)])
+            # Once one exposure succeeds the fallback is satisfied. Submitting
+            # a full batch here can transfer multiple repeats from the same visit.
+            self.batch([remaining.popleft()])
 
     def omit(self, obs, exc):
         self.result.omissions.append({"observation_id": obs.identity, "reason": str(exc)[:200]})
@@ -781,6 +905,7 @@ class _FrameJob:
                     return None
             events.put((obs.identity, None))
             if self.query.live:
+                self.cache.enrich_nominal(self.query, obs.identity, obs.uri, record.nominal_channel)
                 cached = self.cache.get(self.query, obs)
                 if cached is not None:
                     return cached
@@ -835,15 +960,30 @@ class _FrameJob:
                               record.detector, record.release)
             submit(obs, priority=True)
 
+        # Preserve the wavelength barrier even for a bulk /load request whose
+        # IDs span several tracks. Interactive clicks still use the shared queue.
+        scheduled = {o.identity: o for o in selected}
+        groups = deque()
+        for group in (self.result.processing.get("sampling_tracks", []) +
+                      self.result.processing.get("background_tracks", [])):
+            members = [scheduled.pop(key) for key in group if key in scheduled]
+            if members:
+                groups.append(members)
+        if scheduled:
+            groups.append(list(scheduled.values()))
         try:
             with self.priority.lock:
                 self.priority.dispatch = prioritize
                 for key in self.priority.take_waiting():
                     prioritize(key)
-                for obs in selected:
-                    submit(obs)
+                if groups:
+                    for obs in groups.popleft():
+                        submit(obs)
             while True:
                 with self.priority.lock:
+                    while groups and not pending:
+                        for obs in groups.popleft():
+                            submit(obs)
                     if not pending:
                         self.priority.dispatch = None
                         break
@@ -865,6 +1005,8 @@ class _FrameJob:
                 record.selection, record.reason = checked.selection, checked.reason
                 record.channel, record.bandwidth_um = checked.channel, checked.bandwidth_um
                 record.wavelength_um = checked.wavelength_um
+                record.nominal_channel = checked.nominal_channel
+                record.geometry_checked = checked.geometry_checked
                 self.result.omissions = [o for o in self.result.omissions if o.get("observation_id") != key]
                 publish_outcome = False
                 try:
@@ -939,7 +1081,7 @@ class _FrameJob:
                     frame.url = f"/api/assets/{self.job_id}/{frame.id}"
             result.frames, result.sequences = frames, sequences
             self.refresh_records(frames)
-            result.processing["revision"] += 1
+            result.processing["revision"] = result.processing.get("revision", 0) + 1
             if len(sequences) == 1:
                 result.processing["stretch"] = sequences[0].stretch
             else:

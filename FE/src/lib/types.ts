@@ -1,5 +1,6 @@
 export type Detector = "D1" | "D2" | "D3" | "D4" | "D5" | "D6";
 export type Query = {
+  min_separation_days?: number;
   detectors?: Detector[];
   channels?: Partial<Record<Detector, string[]>>;
   fov_arcsec?: number;
@@ -10,6 +11,7 @@ export type Query = {
   end_utc?: string;
 };
 export type Frame = {
+  nominal_channel?: number | null;
   midpoint_utc?: string;
   id: string;
   url: string;
@@ -25,6 +27,8 @@ export type Frame = {
   visit_id?: string;
   channel?: string;
   processing_version?: string;
+  match_wavelengths?: (number | null)[];
+  match_bandwidths?: (number | null)[];
   exposure_flags?: Record<string, string | number>;
   flag_names?: Record<string, string>;
   release?: string;
@@ -32,6 +36,7 @@ export type Frame = {
   warnings?: string[];
 };
 export type Observation = {
+  nominal_channel?: number | null;
   selection?: "matched" | "excluded" | "unknown" | "unavailable";
   visit_id?: string;
   channel?: string;
@@ -73,6 +78,11 @@ export type Manifest = {
   retrieved_at?: string;
   cached?: boolean;
   processing?: {
+    sampling_order?: string[];
+    sampling_tracks?: string[][];
+    background_tracks?: string[][];
+    sampling_metadata_ids?: string[];
+    spectral_tolerance?: number;
     grid_header?: Record<string, string | number>;
     batch_size?: number;
     revision?: number;

@@ -1,9 +1,13 @@
 import { defaults, readMaps, type Display } from "./imaging";
 import type { Query, Manifest } from "./types";
-import { parseQuery } from "./view-url";
+import { parseQuery, separationDays } from "./view-url";
 import { readBands } from "./search-bands";
 
 export const storageKey = "planetXplorer.workspace.v1";
+export const flagColors = ["red","green","blue","black","white","cyan","yellow","magenta","orange","purple"] as const;
+export type FlagColor = typeof flagColors[number];
+export const defaultFieldNames = ["Object type", "Follow-up"];
+export type LocationScope = {kind:"frame"} | {kind:"region"; box:[number,number,number,number]; width:number; height:number};
 export type Snapshot = Record<string, string>;
 export type Config = {
   query: Query | null;
@@ -16,6 +20,8 @@ export type Entry = {
   name: string;
   note: string;
   fields: { name: string; value: string }[];
+  scope?: LocationScope;
+  color?: FlagColor | null;
   config: Config;
   position: { ra_deg: number; dec_deg: number };
   sources: string[];
@@ -28,6 +34,7 @@ export type Backup = {
   exported: string;
   config?: Config;
   locations?: Entry[];
+  fieldNames?: string[];
   snapshot?: Snapshot;
   snapshotComplete?: boolean;
 };
@@ -94,6 +101,18 @@ function position(
     v.ra_deg < 360 &&
     between(v.dec_deg, -90, 90)
   );
+}
+function readScope(v: unknown): LocationScope | undefined {
+  if (v === undefined) return undefined; // Earlier backups saved only a sky position.
+  if (object(v) && v.kind === "frame") return {kind:"frame"};
+  if (!object(v) || v.kind !== "region" || !between(v.width,1,Number.MAX_SAFE_INTEGER) || !Number.isInteger(v.width) ||
+      !between(v.height,1,Number.MAX_SAFE_INTEGER) || !Number.isInteger(v.height) || !Array.isArray(v.box) ||
+      v.box.length !== 4 || !v.box.every(Number.isSafeInteger))
+    throw Error("Invalid saved region.");
+  const [x1,y1,x2,y2] = v.box;
+  if (x1 < 0 || y1 < 0 || x1 > x2 || y1 > y2 || x2 >= v.width || y2 >= v.height)
+    throw Error("Saved region lies outside its image.");
+  return {kind:"region", width:v.width, height:v.height, box:[x1,y1,x2,y2]};
 }
 export function readDisplay(v: unknown): Display {
   if (!object(v)) throw Error("Invalid display settings.");
@@ -169,6 +188,8 @@ function config(v: unknown): Config {
     const fov = q.fov_arcsec === undefined ? v.fov : q.fov_arcsec;
     if (!between(fov, 30, 1800)) throw Error("Invalid saved field of view.");
     query = { ...bounds, fov_arcsec: fov, ...(Array.isArray(q.detectors) && q.detectors.length ? readBands(q) : {}) };
+    if (q.min_separation_days !== undefined)
+      query.min_separation_days = separationDays(q.min_separation_days);
   }
   return { query, frame: v.frame, fov: v.fov, display: readDisplay(v.display) };
 }
@@ -183,6 +204,11 @@ export function readBackup(raw: string): Backup {
   )
     throw Error("Unsupported workspace JSON.");
   const result: Backup = { version: 2, exported: b.exported };
+  if (b.fieldNames !== undefined) {
+    if (!Array.isArray(b.fieldNames) || !b.fieldNames.every(s => typeof s === "string" && s.trim()))
+      throw Error("Invalid default location fields.");
+    result.fieldNames = [...new Set<string>(b.fieldNames.map(s => s.trim()))];
+  }
   if (b.config !== undefined) result.config = config(b.config);
   if (b.snapshot !== undefined) {
     if (!strings(b.snapshot)) throw Error("Invalid archive snapshot.");
@@ -215,6 +241,7 @@ export function readBackup(raw: string): Backup {
       )
         throw Error("Invalid or duplicate location entry.");
       seen.add(e.id);
+      if (e.color != null && !flagColors.includes(e.color as FlagColor)) throw Error("Invalid location color.");
       let fields: Entry["fields"];
       if (Array.isArray(e.fields)) {
         fields = e.fields.map((field: unknown) => {
@@ -240,6 +267,8 @@ export function readBackup(raw: string): Backup {
         name: e.name,
         note: e.note,
         fields,
+        color: (e.color as FlagColor | null) ?? null,
+        scope: readScope(e.scope),
         position: e.position,
         sources: e.sources,
         metadata: e.metadata,

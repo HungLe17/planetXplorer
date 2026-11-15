@@ -484,8 +484,12 @@ def test_clicked_catalog_exposure_gets_next_slot_once(tmp_path):
     active = set()
     started = threading.Condition()
     release = {f"field-{i}": threading.Event() for i in range(7)}
-    rows = [Observation(key, "https://irsa.ipac.caltech.edu/" + key, 60800 + i, "D6", "DR1")
+    rows = [Observation(key, "https://irsa.ipac.caltech.edu/" + key, 60800 + 60 * i, "D6", "DR1")
             for i, key in enumerate(release)]
+    # Include several distinct cycles so the automatic first batch has two active
+    # transfers and queued work that a click must overtake.
+    rows += [Observation(f"{r.identity}-D{n}", f"{r.uri}-D{n}", r.mjd, f"D{n}", "DR1")
+             for r in list(rows) if r.identity != "field-4" for n in range(1, 6)]
     rows.append(Observation("outside", "https://irsa.ipac.caltech.edu/outside", 60800, "D3", "DR1"))
     field = Query(ra_deg=133.795129, dec_deg=-7.245147, fov_arcsec=30, live=True)
     fixture = Path(__file__).parent / "fixtures" / "wise-d6.fits"
@@ -504,7 +508,7 @@ def test_clicked_catalog_exposure_gets_next_slot_once(tmp_path):
             return rows, []
 
         def cached_spectral(self, uri, query):
-            return None if uri.endswith("field-1") else info
+            return None if uri.endswith("field-4") else info
 
         def probe_spectral(self, obs, query, deadline):
             probed.append(obs.identity)
@@ -534,8 +538,8 @@ def test_clicked_catalog_exposure_gets_next_slot_once(tmp_path):
             with started:
                 assert started.wait_for(lambda: len(seen) == 2, 5)
             catalog = client.get(endpoint).json()["manifest"]
-            assert len(catalog["observations"]) == 8 and not catalog["frames"]
-            clicked = "field-1"  # Both active slots are busy and its wavelength is still unknown.
+            assert len(catalog["observations"]) == len(rows) and not catalog["frames"]
+            clicked = "field-4"  # An unprobed supplemental exposure outside the active track.
             assert clicked not in seen
             assert client.post(f"{endpoint}/priority/outside").status_code == 422
             for _ in range(2):

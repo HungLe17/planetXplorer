@@ -54,13 +54,25 @@ test("round-trips each workspace export section, including picked position and p
     if (data.locations) expect(data.locations[0]).toMatchObject(entry);
   }
 });
-test("restoring a saved search retains its selected subbands", () => {
+test("restoring a saved search retains its selected spectra", () => {
   const bands = {detectors:["D2","D6"],channels:{D6:["D6 4.543210 µm (7.0.5)"]}};
-  const data = readBackup(JSON.stringify({...backup,config:{...config,query:{...config.query,...bands}}}));
+  const data = readBackup(JSON.stringify({...backup,config:{...config,query:{...config.query,...bands,min_separation_days:42}}}));
   expect(data.config?.query?.detectors).toEqual(bands.detectors);
   expect(data.config?.query?.channels).toEqual(bands.channels);
+  expect(data.config?.query?.min_separation_days).toBe(42);
 });
 
+test("region bounds, nullable flag colors, and reusable questions survive export and import", () => {
+  const scope = {kind:"region",box:[1,0,3,4],width:5,height:5};
+  const locations = [{...entry,scope,color:"purple"}, {...entry,id:"frame",scope:{kind:"frame"},color:null}];
+  const restored = readBackup(JSON.stringify({...backup,locations,fieldNames:["Candidate class","Follow up"]}));
+  expect(restored.locations?.map(e=>[e.scope,e.color])).toEqual([[scope,"purple"],[{kind:"frame"},null]]);
+  expect(restored.fieldNames).toEqual(["Candidate class","Follow up"]);
+  expect(readBackup(JSON.stringify(restored))).toEqual(restored);
+  for (const overrides of [{color:"invalid"}, {scope:{...scope,box:[1,0,5,4]}}, {scope:{...scope,box:[3,0,1,4]}}]) {
+    expect(() => readBackup(JSON.stringify({...backup,locations:[{...entry,...overrides}]}))).toThrow();
+  }
+});
 test("upgrades legacy flags and allows blank questions or answers", () => {
   const { fields, ...legacy } = entry;
   for (const flag of ["candidate", ""]) {

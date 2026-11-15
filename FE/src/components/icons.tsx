@@ -147,6 +147,10 @@ export const Minimize2 = icon("Minimize2", [
 
 export const Minus = icon("Minus", [["path", { d: "M5 12h14", key: "1ays0h" }]]);
 
+export const Move = icon("Move", [
+  ["path", { d: "M12 3v18M3 12h18M8 7l4-4 4 4M8 17l4 4 4-4M7 8l-4 4 4 4M17 8l4 4-4 4", key: "arrows" }],
+]);
+
 export const PanelRight = icon("PanelRight", [
   ["rect", { width: "18", height: "18", x: "3", y: "3", rx: "2", key: "afitv7" }],
   ["path", { d: "M15 3v18", key: "14nvp0" }]
@@ -211,6 +215,11 @@ export const Trash2 = icon("Trash2", [
   ["path", { d: "M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2", key: "v07s0e" }],
   ["line", { x1: "10", x2: "10", y1: "11", y2: "17", key: "1uufr5" }],
   ["line", { x1: "14", x2: "14", y1: "11", y2: "17", key: "xtxkd" }]
+]);
+
+export const Bell = icon("Bell", [
+  ["path", {d:"M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9", key:"bell"}],
+  ["path", {d:"M10 20a2 2 0 0 0 4 0", key:"clapper"}],
 ]);
 
 export const X = icon("X", [

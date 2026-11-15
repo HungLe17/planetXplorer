@@ -38,6 +38,10 @@ def field_visits(manifest: Manifest, frames: list[Frame]) -> list[Visit]:
             record.visit_id = visit_id
             if frame := by_id.get(record.id):
                 frame.visit_id = visit_id
+                if frame.nominal_channel is not None:
+                    record.nominal_channel = frame.nominal_channel
+                elif record.nominal_channel is not None:
+                    frame.nominal_channel = record.nominal_channel
                 record.channel, record.bandwidth_um = frame.channel, frame.bandwidth_um
                 record.wavelength_um = frame.wavelength_um
                 members.append(frame)
@@ -79,7 +83,10 @@ def field_visits(manifest: Manifest, frames: list[Frame]) -> list[Visit]:
                     orientations.add(180)
                 else:
                     issues.append(f"{frame.observation_id} has an unclassified pointing angle of {angle:.2f}°.")
+        nominal_samples = defaultdict(list)
         for record in records:
+            if record.nominal_channel is not None and 1 <= record.nominal_channel <= 17:
+                nominal_samples[record.detector, record.nominal_channel].append(record.id)
             if record.wavelength_um is not None and record.bandwidth_um is not None:
                 signals[record.detector].append(record)
         missing = sorted(set(DETECTORS) - detectors)
@@ -91,6 +98,9 @@ def field_visits(manifest: Manifest, frames: list[Frame]) -> list[Visit]:
             issues.append(f"Missing detector coverage in this search: {', '.join(missing)}.")
         if len(orientations) > 1:
             issues.append("Opposite wide-survey pointing orientations overlap in this visit.")
+        for (detector, number), ids in nominal_samples.items():
+            if len(ids) > 1:
+                issues.append(f"{detector}-{number:02} has overlapping exposures {ids[0]} and {ids[1]}.")
         # Compare actual spectral responses at the specified sky position. Similar
         # detectors with distinct center wavelengths are normal parts of one scan.
         for detector, samples in signals.items():
@@ -101,6 +111,8 @@ def field_visits(manifest: Manifest, frames: list[Frame]) -> list[Visit]:
                     delta = other.wavelength_um - sample.wavelength_um
                     if delta > sample.bandwidth_um / 2:
                         break
+                    if sample.nominal_channel is not None and other.nominal_channel is not None:
+                        continue  # Their actual detector channels were compared above.
                     if delta <= min(other.bandwidth_um, sample.bandwidth_um) / 2:
                         issues.append(f"{detector} near {sample.wavelength_um:.4f} µm has overlapping "
                                       f"exposures {sample.id} and {other.id}.")

@@ -1,4 +1,4 @@
-import type { Detector, Frame, Query, Manifest, Visit } from "./types";
+import type { Detector, Frame, Query, Manifest, Sequence, Visit } from "./types";
 
 export type Stop = { at: number; color: string };
 export const grey = [
@@ -12,7 +12,7 @@ export const thermal = [
   { at: 1, color: "#ffffc8" },
 ];
 export const detectors: Detector[] = ["D1", "D2", "D3", "D4", "D5", "D6"];
-const functions = ["linear", "sqrt", "log", "asinh"];
+export const stretches = ["linear", "sqrt", "log", "asinh"];
 export type SpectralMap = {
   id: string;
   name: string;
@@ -113,7 +113,7 @@ export function readMaps(value: unknown, legacy: Display): SpectralMap[] {
       !Object.entries(row.operands).every(
         ([key, sign]) => key.length && (sign === 1 || sign === -1),
       ) ||
-      !functions.includes(row.stretch) ||
+      !stretches.includes(row.stretch) ||
       typeof row.difference !== "boolean" ||
       ![row.windowDays, row.exclusionDays].every(
         (n) => Number.isFinite(n) && n >= 0 && n <= 1e6,
@@ -151,7 +151,7 @@ export function readMaps(value: unknown, legacy: Display): SpectralMap[] {
   });
 }
 function detectorFor(key: string): Detector | undefined {
-  return key.match(/^(D[1-6])(?:\s|$)/)?.[1] as Detector | undefined;
+  return key.match(/^(D[1-6])(?:\s|-(?:0[1-9]|1[0-7])$|$)/)?.[1] as Detector | undefined;
 }
 export function activeDetectors(s: Display): Detector[] {
   const selected = new Set<Detector>();
@@ -191,6 +191,7 @@ export type Product = {
   sourcePlanes: Plane[];
   inputs: Frame[];
   reference: Frame[];
+  subtraction?: { referenceId: string; referenceDate: string };
 };
 export type PreviewScale = { bounds: number[]; stretch: string; units: string };
 export type MapScale = {
@@ -198,8 +199,10 @@ export type MapScale = {
   stops: Stop[];
   bounds: number[];
   stretch: string;
+  signed?: boolean;
 };
 export type RenderedFrame = Frame & {
+  subtraction?: Product["subtraction"];
   canvas?: HTMLCanvasElement;
   sourceDates?: string[];
   previewScale?: PreviewScale;
@@ -212,23 +215,187 @@ export function frameAsset(frame: Frame, path: string, base: string) {
     throw Error("Unsupported image address.");
   return url.href;
 }
-/** Only assigned, conflict-free cycles with a published exposure are time steps. */
-export function cycleSteps(manifest: Manifest | null) {
-  const byId = new Map(manifest?.frames.map(f => [f.observation_id, f]));
-  return (manifest?.visits ?? [])
-    .filter(v => v.kind !== "supplemental" && v.status !== "invalid")
-    .flatMap(visit => {
-      const source = visit.observation_ids.map(id => byId.get(id)).find(f => !!f);
-      return source ? [{ visit, source }] : [];
-    })
-    .sort((a, b) => Date.parse(a.visit.start_utc) - Date.parse(b.visit.start_utc));
+type CycleStep = { visit: Visit; source: Frame };
+type CycleInput = CycleStep & { members: Frame[] };
+
+function spacedSteps(available: CycleInput[], choices: Record<string, boolean>, minimumDays?: number) {
+  if (!minimumDays || available.length < 2) return available;
+  const minGap = minimumDays * 86400000;
+  const retained = new Set(available.filter(c => c.members.some(f => choices[f.observation_id])));
+  for (const c of [available[0], available.at(-1)!, ...available.slice(1,-1)]) {
+    if ([...retained].every(other => Math.abs(Date.parse(c.source.observed_at) -
+      Date.parse(other.source.observed_at)) >= minGap)) retained.add(c);
+  }
+  return available.filter(c => retained.has(c));
+}
+
+/** Matched uses the archive's calibrated sequence even when no composite visit map can be made. */
+export function matchedEpochs(manifest: Manifest, sequence: Sequence, visits: Map<string, Visit>,
+  choices: Record<string, boolean>, minimumDays?: number): CycleInput[] {
+  const ids = new Set(sequence.frame_ids);
+  const frames = manifest.frames.filter(f => ids.has(f.id) &&
+    choices[f.observation_id] !== false && Number.isFinite(Date.parse(f.observed_at)))
+    .sort((a,b) => Date.parse(a.observed_at) - Date.parse(b.observed_at) || a.observation_id.localeCompare(b.observation_id));
+  const groups = new Map<string, CycleInput>();
+  let legacy: Visit | undefined, lastLegacy = -Infinity;
+  for (const f of frames) {
+    let visit = visits.get(f.observation_id);
+    if (!visit) {
+      // Prepared manifests may predate visit IDs. Mirror the archive's 14-day gap
+      // for these raw epochs, without exposing them as verified visit maps.
+      const stamp = Date.parse(f.observed_at);
+      if (!legacy || (f.visit_id && f.visit_id !== legacy.id) || stamp - lastLegacy > 14 * 86400000)
+        legacy = {id:f.visit_id || f.observation_id, start_utc:f.observed_at, end_utc:f.observed_at,
+          observation_ids:[], status:"pending", issues:[]};
+      legacy.end_utc = f.observed_at;
+      legacy.observation_ids.push(f.observation_id);
+      lastLegacy = stamp;
+      visit = legacy;
+    }
+    const step = groups.get(visit.id);
+    if (step) {
+      step.members.push(f);
+      if (choices[f.observation_id] && !choices[step.source.observation_id]) step.source = f;
+    } else groups.set(visit.id, {visit, source:f, members:[f]});
+  }
+  return spacedSteps([...groups.values()], choices, minimumDays);
+}
+
+/** Sequence IDs are assigned by the backend's pairwise five-position wavelength check.
+ * An older frame without a sequence can be inspected, but can't establish a match. */
+export function responseKey(frame: Frame) {
+  return frame.sequence_id && frame.processing_version !== "unknown"
+    ? JSON.stringify([frame.detector, frame.nominal_channel ?? null, frame.processing_version ?? "", frame.sequence_id])
+    : JSON.stringify([frame.observation_id]);
+}
+
+type MotionOperand = {accepts:(f: Frame) => boolean; pinned:Set<string>};
+
+/** Choose the common epochs for the complete image. Choosing each map input
+ * independently can leave one epoch when a different pair of responses spans years. */
+function commonResponses(cycles: CycleInput[], operands: MotionOperand[], singleExposure: boolean) {
+  const options = operands.map(({accepts, pinned}) => {
+    const coverage = new Map<string, Set<string>>();
+    for (const c of cycles) for (const f of c.members.filter(accepts)) {
+      const key = responseKey(f);
+      if (!coverage.has(key)) coverage.set(key, new Set());
+      coverage.get(key)!.add(c.visit.id);
+    }
+    const keys = pinned.size ? [...pinned] : [...coverage.keys()].sort();
+    const alternatives = pinned.size && !singleExposure ? [keys] : keys.map(key => [key]);
+    return alternatives.map(keys => ({
+      keys, visits:new Set(cycles.filter(c => keys.every(key => coverage.get(key)?.has(c.visit.id))).map(c => c.visit.id)),
+    })).filter(option => option.visits.size);
+  }).sort((a,b) => a.length-b.length);
+
+  const span = (cs: CycleInput[]) => cs.length ? Date.parse(cs.at(-1)!.visit.end_utc) - Date.parse(cs[0].visit.start_utc) : 0;
+  let best: CycleInput[] = [], keys: string[] = [];
+  function search(index: number, remaining: CycleInput[], selected: string[]) {
+    if (remaining.length < best.length || (remaining.length === best.length && span(remaining) <= span(best))) return;
+    if (index === options.length) {
+      best = remaining;
+      keys = selected;
+      return;
+    }
+    const narrowed = options[index].map(option => ({
+      keys:option.keys, visits:remaining.filter(c => option.visits.has(c.visit.id)),
+    })).sort((a,b) => b.visits.length-a.visits.length || span(b.visits)-span(a.visits));
+    const seen = new Set<string>();
+    for (const option of narrowed) {
+      if (!option.visits.length || option.visits.length < best.length) break;
+      const signature = JSON.stringify(option.visits.map(c => c.visit.id));
+      if (seen.has(signature)) continue;
+      seen.add(signature);
+      search(index + 1, option.visits, [...selected, ...option.keys]);
+      if (best.length === remaining.length) break;
+    }
+  }
+  search(0, cycles, []);
+  return {candidates:best, selectedKeys:new Set(keys)};
+}
+
+export function motionSelection(manifest: Manifest | null, display: Display,
+  choices: Record<string, boolean>, query: Query | null) {
+  const reasons = new Map<string, string>();
+  const frameReasons = new Map<string, string>();
+  const allowed = (frame: Frame) => {
+    const detector = frame.detector as Detector;
+    const labels = query?.channels?.[detector];
+    return (!query?.detectors || query.detectors.includes(detector)) &&
+      (!labels?.length || labels.some(label => matchesChannel(label, frame)));
+  };
+  const byId = new Map(manifest?.frames.filter(allowed).map(f => [f.observation_id, f]));
+  const order = new Map(manifest?.processing?.sampling_order?.map((id,i) => [id,i]));
+  const cycles: CycleInput[] = [];
+  for (const visit of manifest?.visits ?? []) {
+    if (visit.kind === "supplemental" || visit.status === "invalid") continue;
+    const members = visit.observation_ids.flatMap(id => {
+      const frame = byId.get(id);
+      return frame && choices[id] !== false ? [frame] : [];
+    }).sort((a,b) => (order.get(a.observation_id) ?? Infinity) - (order.get(b.observation_id) ?? Infinity) ||
+      Date.parse(a.observed_at) - Date.parse(b.observed_at) ||
+      a.observation_id.localeCompare(b.observation_id));
+    reasons.set(visit.id, members.length ? "No comparable exposure" : "No included exposure available");
+    if (members.length) cycles.push({visit, members, source:members[0]});
+  }
+  cycles.sort((a,b) => Date.parse(a.visit.start_utc) - Date.parse(b.visit.start_utc));
+  const chosen = cycles.flatMap(c => c.members.filter(f => choices[f.observation_id]));
+  const mapKeys = [...new Set(display.maps.flatMap(map => Object.keys(map.operands)))];
+  const inMap = (f: Frame) => mapKeys.some(key => matchesChannel(key, f));
+  // For example, a D6-only search can still compare its D6 exposures when the
+  // default D1 map is selected. Keep its image labeled as an individual exposure.
+  const raw = !!chosen.some(f => !inMap(f)) || !cycles.some(c => c.members.some(inMap));
+  const nativeOperands = [...new Set([...Object.values(query?.channels ?? {}).flat(), ...chosen.map(f => f.channel || f.detector)])];
+  const nativeMap = raw && nativeOperands.length > 1 ? {
+    ...newMap("timeline-selection", "Selected wavelengths"),
+    operands:Object.fromEntries(nativeOperands.map(key => [key, 1]))
+  } : null;
+  const keys = raw ? (nativeMap ? nativeOperands : [""]) : mapKeys.flatMap(key => {
+    const labels = query?.channels?.[key as Detector];
+    return labels?.length ? labels : [key];
+  });
+  const operands = keys.map(key => {
+    const accepts = (f: Frame) => !key || matchesChannel(key, f);
+    const pinned = new Set(chosen.filter(accepts).map(responseKey));
+    return {accepts, pinned};
+  });
+  const {candidates, selectedKeys} = commonResponses(cycles, operands, raw && !nativeMap);
+  const available: CycleInput[] = [];
+  const includedIds = new Set<string>();
+  for (const cycle of candidates) {
+    const members: Frame[] = [];
+    for (const key of selectedKeys) {
+      const matches = cycle.members.filter(f => responseKey(f) === key);
+      const manual = matches.filter(f => choices[f.observation_id]);
+      if (matches.length) members.push(...(manual.length ?
+        (raw && !nativeMap ? manual.slice(0,1) : manual) : [matches[0]]));
+    }
+    if (!members.length) continue;
+    available.push({...cycle, members, source:members[0]});
+  }
+  // Explicit choices take precedence. Auto reserves the endpoints, then fills
+  // interior gaps like the download scheduler. Return steps in time order.
+  const steps = spacedSteps(available, choices, query?.min_separation_days);
+  const retained = new Set(steps);
+  for (const c of available) {
+    if (!retained.has(c)) reasons.set(c.visit.id, "Inside the selected sampling interval");
+    else {
+      reasons.delete(c.visit.id);
+      for (const f of c.members) includedIds.add(f.observation_id);
+    }
+  }
+  for (const c of cycles) for (const f of c.members) {
+    if (!includedIds.has(f.observation_id)) frameReasons.set(f.observation_id,
+      reasons.get(c.visit.id) ?? (selectedKeys.has(responseKey(f)) ? "Repeat of this wavelength" : "Different wavelength sequence"));
+  }
+  return {steps, includedIds, reasons, frameReasons, raw:raw && !nativeMap, nativeMap, preview:cycles[0]};
 }
 export function imageTimeline(
   manifest: Manifest | null,
   rendered: RenderedFrame[],
   products: Product[],
   raw: boolean,
-  steps = cycleSteps(manifest),
+  steps: CycleStep[] = motionSelection(manifest, defaults, {}, null).steps,
 ) {
   if (!manifest) return { frames: rendered, result: products };
   const calibrated = new Map(
@@ -288,7 +455,8 @@ export function exportName(
   const begin = stamp(Math.min(...dates)),
     end = stamp(Math.max(...dates));
   const span = begin === end ? begin : begin + "_to_" + end;
-  return `${span}_N-up_E-left_RA${query.ra_deg}_Dec${query.dec_deg}_FOV${query.fov_arcsec ?? 300}arcsec_zoom${magnification}`;
+  const reference = frames[0]?.subtraction?.referenceDate;
+  return `${span}${reference ? "_minus_" + stamp(Date.parse(reference)) : ""}_N-up_E-left_RA${query.ra_deg}_Dec${query.dec_deg}_FOV${query.fov_arcsec ?? 300}arcsec_zoom${magnification}`;
 }
 
 const day = 86400000;
@@ -322,9 +490,11 @@ export function matchesChannel(
     | "wavelength_um"
     | "bandwidth_um"
     | "processing_version"
+    | "nominal_channel"
   > & { observation_id?: string; id?: string },
 ) {
   if (frame.channel === key || frame.detector === key) return true;
+  if (frame.nominal_channel != null && key === frame.detector + "-" + String(frame.nominal_channel).padStart(2,"0")) return true;
   if (key.startsWith("exposure:"))
     return key.slice(9) === (frame.observation_id ?? frame.id);
   // Sequence labels may change as exposures arrive. Compare the field-center wavelength
@@ -478,6 +648,60 @@ export function products(
       });
   }
   return output;
+}
+
+// A fixed reference uses the signed, calibrated map inputs on the common grid.
+// Display-only substitutions (particularly saturated NaN pixels) are not measurements.
+export function cycleDifferences(data: Plane[], steps: CycleInput[], map: SpectralMap | undefined, referenceId: string) {
+  const planes = new Map(data.map(p => [p.frame.observation_id, p]));
+  const samples = steps.flatMap(step => {
+    const members = step.members.flatMap(f => planes.get(f.observation_id) ?? []);
+    if (members.length !== step.members.length) return [];
+    const terms = map ? mapTerms({...map, difference:false}, members, [])?.terms :
+      members.length === 1 ? [{plane:members[0], sign:1}] : undefined;
+    if (!terms?.length || terms.some(({plane:{frame}}) =>
+      !frame.sequence_id || !frame.processing_version || frame.processing_version === "unknown")) return [];
+    const signature = JSON.stringify(terms.map(t => JSON.stringify([responseKey(t.plane.frame), t.sign])).sort());
+    return [{step, terms, signature}];
+  });
+  const reference = referenceId ? samples.find(s => s.step.visit.id === referenceId) : samples[0];
+  const options = samples.map(s => s.step.visit);
+  const products: Product[] = [];
+  const matched: CycleInput[] = [];
+  let peak = 0;
+  function mapValue(terms: MapTerms["terms"], i: number) {
+    let sum = 0;
+    for (const {plane, sign} of terms) {
+      const value = archivedAt(plane, i);
+      if (!Number.isFinite(value) || value < 0) return NaN;
+      sum += sign * value;
+    }
+    return sum;
+  }
+  if (reference) {
+    const base = Float64Array.from(reference.terms[0].plane.values, (_, i) => mapValue(reference.terms, i));
+    const residualMap = {...newMap("cycle-difference", "Δ " + (map?.name ?? reference.step.source.detector)),
+      stretch:"linear", stops:[
+        {at:0, color:"#40bfff"}, {at:127/255, color:"#000000"}, {at:128/255, color:"#000000"}, {at:1, color:"#ff983e"},
+      ]};
+    for (const {step, terms, signature} of samples) {
+      if (signature !== reference.signature) continue;
+      const values = Float32Array.from(base, (baseValue, i) => mapValue(terms, i) - baseValue);
+      let covered = false;
+      for (const v of values) if (Number.isFinite(v)) { peak = Math.max(peak, Math.abs(v)); covered = true; }
+      if (!covered) continue;
+      matched.push(step);
+      const primary = terms.map(t => t.plane), referencePlanes = reference.terms.map(t => t.plane);
+      products.push({
+        frame:{...step.source, visit_id:step.visit.id, observation_id:step.visit.id, observed_at:step.visit.start_utc},
+        layers:[{map:residualMap, values}], sourcePlanes:[...new Set([...primary, ...referencePlanes])],
+        inputs:primary.map(p => p.frame), reference:referencePlanes.map(p => p.frame),
+        subtraction:{referenceId:reference.step.visit.id, referenceDate:reference.step.visit.start_utc},
+      });
+    }
+  }
+  const valid = matched.length >= 2;
+  return {steps:valid ? matched : [], products:valid ? products : [], options, reference:reference?.step.visit, bounds:[-peak, peak]};
 }
 
 const flagNames: Record<number, string> = {
@@ -752,7 +976,7 @@ export function fillComposite(
       alpha = 0;
     for (const { values, scale, colors } of paints) {
       const v = values[i];
-      if (Number.isNaN(v) || v < 0 || scale.bounds[0] > scale.bounds[1])
+      if (Number.isNaN(v) || (v < 0 && !scale.signed) || scale.bounds[0] > scale.bounds[1])
         continue;
       const color =
         colors[
@@ -791,20 +1015,34 @@ export function renderProduct(
 }
 
 // Inverse gnomonic projection on the north-up 6.14 arcsec common grid.
+export type GridHeader = Record<string, string | number>;
+
+/** FITS linear transform from detector pixels to tangent-plane degrees. */
+export function gridMatrix(grid?: GridHeader) {
+  if (grid && [grid.CD1_1, grid.CD1_2, grid.CD2_1, grid.CD2_2].some(v => v !== undefined))
+    return [Number(grid.CD1_1 ?? 0), Number(grid.CD1_2 ?? 0), Number(grid.CD2_1 ?? 0), Number(grid.CD2_2 ?? 0)];
+  const sx = Number(grid?.CDELT1 ?? -6.14 / 3600), sy = Number(grid?.CDELT2 ?? 6.14 / 3600);
+  return [sx * Number(grid?.PC1_1 ?? 1), sx * Number(grid?.PC1_2 ?? 0),
+    sy * Number(grid?.PC2_1 ?? 0), sy * Number(grid?.PC2_2 ?? 1)];
+}
+
 export function skyPosition(
   q: Query,
   x: number,
   y: number,
   width: number,
   height: number,
+  grid?: GridHeader,
 ) {
   const rad = Math.PI / 180,
-    d = q.dec_deg * rad;
-  const xi = ((((width - 1) / 2 - x) * 6.14) / 3600) * rad,
-    eta = ((((height - 1) / 2 - y) * 6.14) / 3600) * rad;
+    d = Number(grid?.CRVAL2 ?? q.dec_deg) * rad;
+  const [a11, a12, a21, a22] = gridMatrix(grid);
+  const dx = x + 1 - Number(grid?.CRPIX1 ?? (width + 1) / 2);
+  const dy = height - y - Number(grid?.CRPIX2 ?? (height + 1) / 2);
+  const xi = (a11 * dx + a12 * dy) * rad, eta = (a21 * dx + a22 * dy) * rad;
   const a = Math.cos(d) - eta * Math.sin(d);
   return {
-    ra_deg: (360 + q.ra_deg + Math.atan2(xi, a) / rad) % 360,
+    ra_deg: (360 + Number(grid?.CRVAL1 ?? q.ra_deg) + Math.atan2(xi, a) / rad) % 360,
     dec_deg:
       Math.atan2(Math.sin(d) + eta * Math.cos(d), Math.hypot(a, xi)) / rad,
   };

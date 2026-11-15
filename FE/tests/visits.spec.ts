@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { defaults } from "../src/lib/imaging";
 
-test("background map loads pass unknown wavelengths through the map subband filter", async ({page}) => {
+test("background map loads pass unknown wavelengths through the map spectrum filter", async ({page}) => {
   const label = "D1 1.020000 µm (v1)";
   const view = {...defaults, maps: [{...defaults.maps[0], operands: {[label]: 1}}]};
   const date = "2026-06-01T00:00:00Z";
@@ -71,6 +71,7 @@ test("cycle navigation and selection preserve the whole spectrum; explicit spect
             .map((o) => ({
               ...o,
               observation_id: o.id,
+              sequence_id: "matched-" + o.detector, processing_version: "v1",
               pixels: o.id + ".bin",
               url: "/api/assets/test/" + o.id + ".png",
             })),
@@ -271,13 +272,13 @@ test("an invalid cycle explains the conflict and preserves access to its raw exp
     r.fulfill({ body: Buffer.from(new Float32Array([7]).buffer) }),
   );
   await page.goto("/explore?ra=4&dec=3");
-  const dialog = page.getByRole("dialog", {
-    name: "Incomplete or conflicting visits",
-  });
-  await expect(dialog).toContainText(
-    "Missing detector coverage in this search: D3.",
-  );
-  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  const bell = page.getByRole("button",{name:/^Notifications,/});
+  await bell.click();
+  const inbox = page.getByRole("region",{name:"Notifications",exact:true});
+  await inbox.locator("summary").filter({hasText:"Incomplete or conflicting visits"}).click();
+  await expect(inbox.getByText("Missing detector coverage in this search: D3.",{exact:true})).toBeVisible();
+  await bell.click();
   await expect(
     page.getByRole("button", { name: "PNG", exact: true }),
   ).toBeDisabled();
@@ -288,30 +289,47 @@ test("an invalid cycle explains the conflict and preserves access to its raw exp
   await expect(page.getByLabel("Visit spectra")).toContainText("7 MJy/sr");
 });
 
-test("the sidebar discovers sub-band inputs on demand and supports transparent color stops", async ({page}) => {
+test("the sidebar offers available field spectra and retains unavailable saved inputs without discovery", async ({page}) => {
   await page.route("**/api/presets", r => r.fulfill({json:{presets:[]}}));
   await page.route("**/api/jobs", r => r.fulfill({json:{job_id:"lookup"}}));
-  await page.route("**/api/jobs/lookup", r => r.fulfill({json:{status:"complete", manifest:{frames:[]}}}));
-  const found = "D6 4.500000 µm (7.0.5)";
+  await page.route("**/api/jobs/lookup", r => r.fulfill({json:{status:"complete", manifest:{
+    frames:[], observations:[{id:"available-D6-17", detector:"D6", nominal_channel:17,
+      observed_at:"2026-01-02T00:00:00Z", release:"DR1", source_url:"https://example.test/D6-17",
+      status:"pending", selection:"matched"}],
+  }}}));
+  const legacy = "D6 4.500000 µm (7.0.5)";
+  const view = {...defaults, maps:[{...defaults.maps[0], operands:{[legacy]:1}}]};
   const requests: string[] = [];
-  await page.route("**/api/jobs/lookup/channels/**", r => {
+  await page.route("**/api/**/channels/**", r => {
     requests.push(new URL(r.request().url()).pathname);
-    return r.fulfill({json:{channels:[found],next_cursor:null,unavailable:0,total:1,catalog_complete:true}});
+    return r.abort();
   });
-  await page.goto("/explore?ra=4&dec=3");
-  await expect(page.getByText("No comparable observations were found", {exact:false})).toBeVisible();
+  await page.goto("/explore?ra=4&dec=3&view=" + encodeURIComponent(JSON.stringify(view)));
+  await expect(page.getByText("No image in this batch could be loaded.", {exact:false})).toBeAttached();
   await page.getByRole("button",{name:"Inputs",exact:true}).click();
   const inputs = page.getByRole("dialog",{name:"Inputs for Map 1",exact:true});
   const box=(await inputs.boundingBox())!;
   const sidebar=(await page.locator("aside.sidebar").boundingBox())!;
   expect(box.x+box.width).toBeLessThanOrEqual(sidebar.x+sidebar.width);
   const d6=inputs.locator(".map-detector").filter({hasText:"D6 · whole detector"});
+  await expect(d6.locator("summary")).toHaveText("Spectra (1)");
   await d6.locator("summary").click();
   expect(requests).toEqual([]);
-  await d6.getByRole("button",{name:"Discover channels"}).click();
-  await d6.getByRole("button",{name:"Subtract "+found,exact:true}).click();
-  await expect(inputs.locator("output")).toContainText("− "+found);
-  expect(requests).toEqual(["/api/jobs/lookup/channels/D6"]);
+  const unavailable=inputs.getByRole("region",{name:"Unavailable selected inputs",exact:true});
+  await expect(unavailable.getByText(legacy,{exact:true})).toBeVisible();
+  await expect(unavailable.getByRole("button",{name:"Remove unavailable input " + legacy,exact:true})).toBeVisible();
+  await expect(unavailable.getByRole("button")).toHaveCount(1);
+  await expect(inputs.getByRole("button",{name:"Add " + legacy,exact:true})).toHaveCount(0);
+  await expect(inputs.getByRole("button",{name:"Subtract " + legacy,exact:true})).toHaveCount(0);
+  await expect(d6.getByRole("button",{name:/^Subtract D6-\d\d$/})).toHaveCount(1);
+  await d6.getByRole("button",{name:"Subtract D6-17",exact:true}).click();
+  await expect(inputs.locator("output")).toContainText("− D6-17");
+  await expect(inputs.locator("output")).toContainText("+ " + legacy);
+  await expect(d6.getByText("D6-17 · 4.988 µm")).toBeVisible();
+  await d6.getByRole("button",{name:"Add D6",exact:true}).click();
+  await expect(inputs.locator("output")).toHaveText("+ D6");
+  await expect(unavailable).toHaveCount(0);
+  expect(requests).toEqual([]);
   await inputs.getByRole("button",{name:"Close editor"}).click();
   await page.getByRole("button",{name:"Colors",exact:true}).click();
   const colors=page.getByRole("dialog",{name:"Colors for Map 1"});

@@ -1,16 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { Plus, Trash2, X } from "./icons";
-import { request } from "@/lib/api";
+import { spectraTable, nominalLabel, spectrumId, isNominalSpectrum } from "@/lib/nominal-spectra";
+import type { Manifest } from "@/lib/types";
 import {
   detectors,
   grey,
+  matchesChannel,
   newMap,
+  stretches,
   thermal,
   type Display,
   type SpectralMap,
   type Stop,
 } from "@/lib/imaging";
-import type { Frame, Observation } from "@/lib/types";
 
 const swatches = [
   ["Transparent", "#00000000"],
@@ -22,52 +24,6 @@ const swatches = [
 ];
 type Tool = "Inputs" | "Colors" | "Function";
 type Editor = { id: string; tool: Tool };
-type ChannelPage = {
-  channels: string[];
-  next_cursor: number | null;
-  unavailable: number;
-  total: number;
-  catalog_complete: boolean;
-};
-type Lookup = { page?: ChannelPage; loading?: boolean; error?: string };
-function ChannelDiscovery({
-  lookup,
-  discover,
-}: {
-  lookup?: Lookup;
-  discover: () => void;
-}) {
-  const page = lookup?.page;
-  let action = "Discover channels";
-  if (lookup?.loading) action = "Checking wavelengths…";
-  else if (page?.next_cursor != null) action = "Find more channels";
-  else if (lookup?.error || page?.unavailable) action = "Retry wavelength lookup";
-  else if (page) action = "Refresh channels";
-
-  return (
-    <>
-      <button type="button" disabled={lookup?.loading} onClick={discover}>
-        {action}
-      </button>
-      <div role="status">
-        {lookup?.loading && <p>Reading calibration metadata…</p>}
-        {lookup?.error && <p>{lookup.error}</p>}
-        {page && !lookup?.loading && !lookup?.error && (
-          <>
-            {page.unavailable > 0 && (
-              <p>
-                Wavelength unavailable for {page.unavailable} exposure(s).
-                You can select the whole detector.
-              </p>
-            )}
-            {page.total === 0 && <p>No exposures in the current catalog.</p>}
-            {!page.catalog_complete && <p>The field catalog is partial.</p>}
-          </>
-        )}
-      </div>
-    </>
-  );
-}
 function gradient(stops: Stop[]) {
   return (
     "linear-gradient(to right," +
@@ -80,65 +36,38 @@ function gradient(stops: Stop[]) {
 }
 export default function ImageControls({
   s,
+  manifest,
   update,
-  frames,
-  observations = [],
-  fieldJobId,
 }: {
   s: Display;
-  update: (p: Partial<Display>) => void;
-  frames: Frame[];
-  bounds?: number[];
-  observations?: Observation[];
-  fieldJobId?: string;
+  manifest: Manifest | null;
+  update: (p: Partial<Display>, keepView?: boolean) => void;
 }) {
   const [editor, setEditor] = useState<Editor | null>(null);
   const dialog = useRef<HTMLDialogElement>(null);
-  const [lookups, setLookups] = useState<Record<string, Lookup>>({});
-  const channelRequests = useRef(new Map<string, AbortController>());
-  useEffect(() => {
-    const requests = channelRequests.current;
-    setLookups({});
-    return () => {
-      for (const pending of requests.values()) pending.abort();
-      requests.clear();
-    };
-  }, [fieldJobId]);
-
-  async function discover(det: string) {
-    if (!fieldJobId || channelRequests.current.has(det)) return;
-    const controller = new AbortController();
-    channelRequests.current.set(det, controller);
-    const previous = lookups[det]?.page;
-    const cursor = previous?.next_cursor ?? 0;
-    setLookups((all) => ({ ...all, [det]: { page: previous, loading: true } }));
-    try {
-      const page = await request<ChannelPage>(
-        `/api/jobs/${encodeURIComponent(fieldJobId)}/channels/${det}?cursor=${cursor}`,
-        controller.signal,
-        undefined,
-        45000,
-      );
-      if (controller.signal.aborted) return;
-      if (cursor && previous)
-        page.channels = [...new Set([...previous.channels, ...page.channels])];
-      setLookups((all) => ({ ...all, [det]: { page } }));
-    } catch {
-      if (!controller.signal.aborted)
-        setLookups((all) => ({
-          ...all,
-          [det]: {
-            page: previous,
-            error:
-              "Wavelength lookup failed. Retry or select the whole detector.",
-          },
-        }));
-    } finally {
-      if (channelRequests.current.get(det) === controller)
-        channelRequests.current.delete(det);
-    }
-  }
   const current = s.maps.find((m) => m.id === editor?.id);
+  const availableInputs = new Set<string>();
+  const availableRows = [
+    ...(manifest?.frames ?? []),
+    ...(manifest?.observations ?? []).filter(o => o.selection !== "unavailable"),
+  ];
+  for (const input of availableRows) {
+    const det = detectors.find(d => d === input.detector);
+    if (!det) continue;
+    const channel = input.nominal_channel;
+    if (channel != null && spectraTable[det].some(row => row.channel === channel))
+      availableInputs.add(spectrumId(det, channel));
+    else if (input.nominal_channel == null && input.channel?.startsWith(det + " "))
+      availableInputs.add(input.channel);
+  }
+  for (const key of Object.keys(current?.operands ?? {}))
+    if (detectors.some(det => key.startsWith(det + " ")) &&
+        availableRows.some(row => matchesChannel(key, row)))
+      availableInputs.add(key);
+  const unavailableInputs = Object.keys(current?.operands ?? {}).filter(key =>
+    (isNominalSpectrum(key) || detectors.some(det => key.startsWith(det + " "))) &&
+    !availableInputs.has(key),
+  );
   useEffect(() => {
     const d = dialog.current;
     if (editor && current && d && !d.open) d.showModal();
@@ -146,7 +75,7 @@ export default function ImageControls({
   function patch(id: string, change: Partial<SpectralMap>) {
     update({
       maps: s.maps.map((m) => (m.id === id ? { ...m, ...change } : m)),
-    });
+    }, "stretch" in change);
   }
   function operand(key: string, sign: number, detector: string) {
     if (!current) return;
@@ -157,7 +86,7 @@ export default function ImageControls({
       for (const other of Object.keys(next))
         if (
           key === detector
-            ? other.startsWith(detector + " ")
+            ? other.startsWith(detector + " ") || (isNominalSpectrum(other) && other.startsWith(detector + "-"))
             : other === detector
         )
           delete next[other];
@@ -190,14 +119,6 @@ export default function ImageControls({
       </span>
     );
   }
-  const channels = [
-    ...new Set([
-      ...frames.map((f) => f.channel ?? ""),
-      ...observations.map((o) => o.channel ?? ""),
-      ...Object.values(lookups).flatMap((l) => l.page?.channels ?? []),
-      ...s.maps.flatMap((m) => Object.keys(m.operands)),
-    ]),
-  ];
   return (
     <section className="science-controls map-rows" aria-label="Spectrum maps">
       {s.maps.map((map, i) => (
@@ -224,6 +145,13 @@ export default function ImageControls({
               <Trash2 size={15} />
             </button>
           </div>
+          <label className="map-stretch">
+            Intensity stretch
+            <select aria-label={"Intensity stretch for " + (map.name || "Map " + (i + 1))}
+              value={map.stretch} onChange={e => patch(map.id, {stretch:e.target.value})}>
+              {stretches.map(f => <option key={f}>{f}</option>)}
+            </select>
+          </label>
           <div className="map-actions">
             {(["Inputs", "Colors", "Function"] as const).map((tool) => (
               <button
@@ -277,15 +205,15 @@ export default function ImageControls({
             {editor.tool === "Inputs" && (
               <>
                 <p>
-                  Select + or − for a detector or any of its measured channels.
+                  Select + or − for a whole detector or a spectrum available in this field.
                   Select the same sign again to remove it.
                 </p>
+                {!manifest && <p>Search a field to see its available spectra.</p>}
                 {detectors.map((det) => {
-                  const options = channels
-                    .filter((c) => c.startsWith(det + " "))
-                    .sort(
-                      (a, b) => parseFloat(a.slice(3)) - parseFloat(b.slice(3)),
-                    );
+                  const nominal = spectraTable[det].filter(({ channel }) =>
+                    availableInputs.has(spectrumId(det, channel)),
+                  );
+                  const legacy = [...availableInputs].filter(key => key.startsWith(det + " ")).sort();
                   return (
                     <div key={det} className="map-detector">
                       <div className="map-detector-heading">
@@ -293,30 +221,33 @@ export default function ImageControls({
                         {signButtons(det, det)}
                       </div>
                       <details>
-                        <summary>Channels ({options.length})</summary>
-                        {fieldJobId ? (
-                          <ChannelDiscovery
-                            lookup={lookups[det]}
-                            discover={() => discover(det)}
-                          />
-                        ) : (
-                          !options.length && (
-                            <p>
-                              Search this field to look up wavelengths, or
-                              select the whole detector.
-                            </p>
-                          )
-                        )}
-                        {options.map((key) => (
-                          <div className="map-channel" key={key}>
-                            <span>{key}</span>
-                            {signButtons(key, det)}
-                          </div>
-                        ))}
+                        <summary>Spectra ({nominal.length + legacy.length})</summary>
+                        {!nominal.length && !legacy.length &&
+                          <p>{manifest ? "No spectra available." : "Search a field first."}</p>}
+                        {nominal.map(({channel}) => {
+                          const id = spectrumId(det, channel);
+                          return <div className="map-channel" key={id}>
+                            <span>{nominalLabel(det, channel)}</span>{signButtons(id, det)}
+                          </div>;
+                        })}
+                        {legacy.map(key => <div className="map-channel" key={key}>
+                          <span>Field calibration · {key}</span>{signButtons(key, det)}
+                        </div>)}
                       </details>
                     </div>
                   );
                 })}
+                {unavailableInputs.length > 0 && (
+                  <section aria-label="Unavailable selected inputs">
+                    <h4>Unavailable selected inputs</h4>
+                    <p>These saved inputs are not available in this field. They remain selected until removed.</p>
+                    {unavailableInputs.map(key => <div className="map-channel" key={key}>
+                      <span>{key}</span>
+                      <button type="button" aria-label={"Remove unavailable input " + key}
+                        onClick={() => operand(key, 0, "")}>Remove</button>
+                    </div>)}
+                  </section>
+                )}
                 {Object.keys(current.operands)
                   .filter((k) => k.startsWith("exposure:"))
                   .map((key) => (
@@ -435,7 +366,7 @@ export default function ImageControls({
                       patch(current.id, { stretch: e.target.value })
                     }
                   >
-                    {["linear", "sqrt", "log", "asinh"].map((f) => (
+                    {stretches.map((f) => (
                       <option key={f}>{f}</option>
                     ))}
                   </select>

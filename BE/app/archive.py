@@ -20,7 +20,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlsplit
@@ -32,8 +32,8 @@ from astropy.time import Time
 from astropy.io.votable import parse_single_table
 
 from .config import Settings
-from .schemas import ObservationRecord, Query
-from .spectral import spectral_header_index
+from .schemas import ObservationRecord, Query, nominal_parameters
+from .spectral import geometry_header_index, spectral_header_index
 
 
 ORIGIN = "https://irsa.ipac.caltech.edu"
@@ -153,6 +153,8 @@ class Archive:
         self.discovery_note = ""
         self.spectral_lock = threading.Lock()
         self.spectral_index = OrderedDict()
+        self.spectral_products = OrderedDict()
+        self.spectral_reads = {}
         # One cutout allowance for this IRSA client, shared by all search jobs.
         self.cutout_slots = threading.BoundedSemaphore(min(2, settings.cutout_workers))
         self.cutout_lock = threading.Lock()
@@ -171,6 +173,9 @@ class Archive:
         self.client.close()
 
     def probe_spectral(self, obs: Observation, query: Query, deadline: float):
+        labels = query.channels.get(obs.detector)
+        if labels and all(nominal_parameters(s) for s in labels):
+            return self._calibration_at(obs.uri, query, deadline, geometry_only=True)
         return self.spectral_at(obs.uri, query, deadline)
 
     def cached_spectral(self, uri: str, query: Query):
@@ -182,8 +187,12 @@ class Archive:
         return None
 
     def spectral_at(self, uri: str, query: Query, deadline: float):
+        return self._calibration_at(uri, query, deadline, geometry_only=False)
+
+    def _calibration_at(self, uri, query, deadline, *, geometry_only):
         """Inspect bounded calibration metadata, never a full-size science image."""
-        if info := self.cached_spectral(uri, query):
+        info = self.cached_spectral(uri, query)
+        if info and info.get("nominal_channel" if geometry_only else "wavelength_um") is not None:
             return info
 
         prefix_bytes, tail_bytes = 92160, 28800
@@ -217,15 +226,49 @@ class Archive:
                 if len(data) != byte_limit:
                     raise ArchiveError("Incomplete spectral metadata range")
                 return bytes(data)
+        # FITS calibration bytes belong to the versioned archive product. The
+        # wavelength derived from those bytes belongs to the precise sky position.
+        def cached_range(byte_limit, *, tail=False):
+            key = (uri, tail)
+            with self.spectral_lock:
+                if key in self.spectral_products:
+                    self.spectral_products.move_to_end(key)
+                    return self.spectral_products[key]
+                reading = self.spectral_reads.get(key)
+                owner = reading is None
+                if owner:
+                    self.spectral_reads[key] = reading = Future()
+            if not owner:
+                return reading.result(timeout=max(0, deadline - time.monotonic()))
+            try:
+                data = read_range(byte_limit, tail=tail)
+                with self.spectral_lock:
+                    self.spectral_products[key] = data
+                    if len(self.spectral_products) > 128:
+                        self.spectral_products.popitem(last=False)
+                reading.set_result(data)
+                return data
+            except Exception as exc:
+                reading.set_exception(exc)
+                raise
+            finally:
+                with self.spectral_lock:
+                    self.spectral_reads.pop(key, None)
         try:
-            info = spectral_header_index(read_range(prefix_bytes), read_range(tail_bytes, tail=True), query)
+            prefix = cached_range(prefix_bytes)
+            info = (geometry_header_index(prefix, query) if geometry_only else
+                    spectral_header_index(prefix, cached_range(tail_bytes, tail=True), query))
+            if info is None:
+                return None
+            with self.spectral_lock:
+                key = (uri, query.ra_deg, query.dec_deg)
+                info = {**self.spectral_index.get(key, {}), **info}
+                self.spectral_index[key] = info
+                if len(self.spectral_index) > 2048:
+                    self.spectral_index.popitem(last=False)
+            return info
         except (ArchiveError, httpx.HTTPError, ValueError, TypeError, IndexError, KeyError, OSError):
             return None
-        with self.spectral_lock:
-            self.spectral_index[(uri, query.ra_deg, query.dec_deg)] = info
-            if len(self.spectral_index) > 2048:
-                self.spectral_index.popitem(last=False)
-        return info
 
     def discovery(self) -> str:
         with self.discovery_lock:
@@ -271,8 +314,8 @@ class Archive:
                 if obs in offered or query.band_match(obs.detector) == "excluded":
                     continue
                 info = self.cached_spectral(obs.uri, query) if obs.detector in query.channels else None
-                match = query.band_match(obs.detector, info["wavelength_um"], info["bandwidth_um"],
-                                         info["processing_version"]) if info else query.band_match(obs.detector)
+                match = query.band_match(obs.detector, info.get("wavelength_um"), info.get("bandwidth_um"),
+                                         info.get("processing_version"), info.get("nominal_channel")) if info else query.band_match(obs.detector)
                 if match != "excluded":
                     candidates.append((match, obs))
             # Existing target-local calibration can establish an immediate match. Unknowns

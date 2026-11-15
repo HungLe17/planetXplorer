@@ -94,7 +94,7 @@ def create_app(settings: Settings | None = None, pipeline=None):
         try:
             return Submitted(
                 job_id=request.app.state.jobs.load_more(
-                    job_id, body.observation_ids, body.detector, body.channels
+                    job_id, body.observation_ids, body.detector, body.channels, metadata_only=body.metadata_only
                 )
             )
         except KeyError as exc:
@@ -133,13 +133,13 @@ def create_app(settings: Settings | None = None, pipeline=None):
             raise HTTPException(429, str(exc), headers={"Retry-After": "2"}) from exc
 
     @app.post("/api/archive/channels/{detector}")
-    def field_channels(query: Query, detector: Detector, request: Request, cursor: int = 0):
+    def field_channels(query: Query, detector: Detector, request: Request, cursor: int = 0, progressive: bool = False):
         if cursor < 0:
             raise HTTPException(422, "Invalid channel cursor")
         if request.app.state.archive is None:
             raise HTTPException(503, "Archive metadata service unavailable")
         try:
-            return request.app.state.jobs.field_channels(query, detector, cursor)
+            return request.app.state.jobs.field_channels(query, detector, cursor, progressive=progressive)
         except ArchiveError as exc:
             raise HTTPException(502, str(exc)) from exc
         except CapacityError as exc:

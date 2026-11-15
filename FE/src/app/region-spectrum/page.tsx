@@ -139,7 +139,7 @@ export default function RegionSpectrumPage() {
 
   return <main className="region-page">
     <header>
-      <a href="/explore">PlanetXplorer</a>
+      <a href="/explore">planetXplorer</a>
       <h1>Region spectrum</h1>
       {aperture && <p>Field {format(aperture.ra_deg)}°, {format(aperture.dec_deg)}° ·
         {" "}Pixels ({aperture.box[0]+1}, {aperture.box[1]+1}) – ({aperture.box[2]+1}, {aperture.box[3]+1}) ·

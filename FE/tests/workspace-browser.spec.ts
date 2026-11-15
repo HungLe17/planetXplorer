@@ -35,6 +35,58 @@ function jsonFile(parts: Partial<Backup>) {
   };
 }
 
+test("save the Details rectangle or full frame, reuse field names and update flags immediately", async ({page}) => {
+  const id = "saved-frame", date = "2025-06-01T00:00:00Z";
+  const frame = {id, observation_id:id, observed_at:date, detector:"D1", pixels:"frame.bin",
+    url:"/api/assets/saved/frame.png", wavelength_um:1, channel:"D1 1 µm (v1)", processing_version:"v1", sequence_id:"one"};
+  await page.route("**/api/presets", r=>r.fulfill({json:{presets:[]}}));
+  await page.route("**/api/jobs", r=>r.fulfill({json:{job_id:"saved"}}));
+  await page.route("**/api/jobs/saved", r=>r.fulfill({json:{status:"complete",manifest:{
+    processing:{output_shape:[5,5]},frames:[frame],
+  }}}));
+  await page.route("**/api/assets/saved/frame.bin", r=>r.fulfill({body:Buffer.from(new Float32Array(25).fill(3).buffer)}));
+  await Promise.all([page.waitForResponse("**/api/jobs/saved"),
+    page.goto("/explore?ra=7&dec=2&fov=30", {waitUntil:"domcontentloaded"})]);
+  await expect(page.getByLabel("Displayed image")).toContainText("Calibrated exposure");
+  const canvas = page.locator("canvas"), rect = (await canvas.boundingBox())!;
+  const s = Math.min(rect.width,rect.height) * 0.94 / 5;
+  const center = {x:rect.x+rect.width/2,y:rect.y+rect.height/2};
+  await page.mouse.move(center.x-s, center.y-s);
+  await page.mouse.down();
+  await page.mouse.move(center.x+s, center.y, {steps:4});
+  await page.mouse.up();
+  const area = page.getByText(/Region \(2, 2\).*\(4, 3\)/);
+  await expect(area).toBeVisible();
+  await page.getByText("Saved locations", {exact:true}).click();
+  await page.getByText("Default fields for new locations").click();
+  await page.getByLabel("Field names (one per line)").fill("Candidate class\nReview");
+  await page.getByRole("button",{name:"Save default fields"}).click();
+  await page.getByRole("button",{name:"Save on this device"}).click();
+  const add = page.getByRole("button",{name:"Add location",exact:true});
+  await add.click();
+  await expect(page.getByLabel("Field name 1", {exact:true})).toHaveValue("Candidate class");
+  await expect(page.getByLabel("Color flag", {exact:true})).toHaveValue("");
+  await page.getByLabel("Location name").fill("Region candidate");
+  await page.getByRole("button",{name:"Save entry"}).click();
+  await page.getByLabel("Color flag for Region candidate").selectOption("cyan");
+  await page.getByLabel("Save area").selectOption("frame");
+  await add.click();
+  await expect(page.getByLabel("Field name 2", {exact:true})).toHaveValue("Review");
+  await expect(page.getByLabel("Color flag", {exact:true})).toHaveValue("");
+  await page.getByLabel("Location name").fill("Entire field");
+  await page.getByRole("button",{name:"Save entry"}).click();
+  await page.getByRole("button",{name:"Open view"}).click();
+  await expect(page.getByLabel("Selected region spectrum",{exact:true})).toHaveCount(0);
+  await page.getByRole("button",{name:/Region candidate/}).click();
+  await page.getByRole("button",{name:"Open view"}).click();
+  await expect(page.getByLabel("Selected region spectrum",{exact:true})).toBeVisible();
+  await expect(page.getByText(/Region \(2, 2\).*\(4, 3\)/).last()).toBeVisible();
+  const saved = await page.evaluate(key => JSON.parse(localStorage.getItem(key)!), storageKey);
+  expect(saved.locations.map((e:Entry) => [e.scope,e.color])).toEqual([
+    [{kind:"region",box:[1,1,3,2],width:5,height:5},"cyan"], [{kind:"frame"},null],
+  ]);
+});
+
 test("locations-only import preserves the current view, reports new data, and stores the workspace only on consent", async ({
   page,
 }) => {
@@ -76,7 +128,7 @@ test("locations-only import preserves the current view, reports new data, and st
   await page
     .getByLabel("Import JSON", { exact: true })
     .setInputFiles(jsonFile({ locations: [entry] }));
-  await expect(page.getByText(/East field.*1 additional/)).toBeVisible();
+  await expect(page.getByText(/East field.*1 additional/)).toBeAttached();
   await expect(ra).toHaveValue("22");
   await expect(
     page.getByRole("dialog", { name: "Save your work" }),

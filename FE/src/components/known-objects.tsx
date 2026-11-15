@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import PanelResizer from "./panel-resizer";
 import { request } from "@/lib/api";
 import type { Frame, Manifest, Query } from "@/lib/types";
 import { catalogPosition, projectMarker, type CatalogResult, type Marker, type MovingResult } from "@/lib/known-objects";
@@ -151,7 +152,9 @@ export function ObjectPanel({query, data, chosen, select, moving, toggleMoving, 
   atlas.searchParams.set("dec",String(query.dec_deg));
   atlas.searchParams.set("fov",String((query.fov_arcsec ?? 300)/3600));
   atlas.searchParams.set("theme","dark");
-  return <aside className="catalog-window" aria-label="Aladin and known objects">
+  return <aside className="catalog-window" id="catalog-panel" aria-label="Aladin and known objects">
+    <PanelResizer panel="catalog" />
+    <div className="catalog-scroll">
     <div className="catalog-window-title"><h2>Known objects</h2><button type="button" aria-label="Close known objects" onClick={close}>×</button></div>
     <iframe title="Aladin Lite sky atlas" src={atlas.href} loading="lazy" referrerPolicy="no-referrer" />
     <a href={atlas.href} target="_blank" rel="noreferrer">Open Aladin Lite ↗</a>
@@ -168,5 +171,6 @@ export function ObjectPanel({query, data, chosen, select, moving, toggleMoving, 
       <button className="button" onClick={data.retry}>Retry lookup</button></div>}
     {data.fetched && <small>Catalog lookup · {data.fetched}</small>}
     {data.solarFetched && <small>JPL lookup · {data.solarFetched}</small>}
+    </div>
   </aside>;
 }

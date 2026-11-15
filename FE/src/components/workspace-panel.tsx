@@ -8,11 +8,17 @@ import {
   checkImportedFields,
   download,
   readBackup,
+  defaultFieldNames,
+  flagColors,
+  type FlagColor,
 } from "@/lib/workspace";
+
+import Notification from "./notification";
 
 type Props = {
   backup: Backup;
   saveEntries: (e: Entry[]) => void;
+  saveFieldNames: (names: string[]) => void;
   reopen: (e: Entry) => void;
   restore: (b: Backup) => void;
   selected: Omit<Entry, "id" | "name" | "note" | "fields"> | null;
@@ -20,9 +26,15 @@ type Props = {
   setConsent: (v: boolean) => void;
   onError: (s: string) => void;
 };
+function locationArea(target: NonNullable<Props["selected"]>, kind: "frame" | "region"): Pick<Entry,"scope" | "position"> {
+  if (kind === "region" && target.scope?.kind === "region") return {scope:target.scope, position:target.position};
+  const center = target.config.query ?? target.position;
+  return {scope:{kind:"frame"}, position:{ra_deg:center.ra_deg, dec_deg:center.dec_deg}};
+}
 export default function WorkspacePanel({
   backup,
   saveEntries,
+  saveFieldNames,
   reopen,
   restore,
   selected,
@@ -31,6 +43,9 @@ export default function WorkspacePanel({
   onError,
 }: Props) {
   const entries = backup.locations ?? [];
+  const fieldNames = backup.fieldNames ?? defaultFieldNames;
+  const [area, setArea] = useState<"frame" | "region">("region");
+  const captured = useRef<Props["selected"]>(null);
   const [find, setFind] = useState(""),
     [draft, setDraft] = useState<Entry | null>(null);
   const [section, setSection] = useState("both"),
@@ -41,14 +56,18 @@ export default function WorkspacePanel({
   const pending = useRef<AbortController | null>(null);
   useEffect(() => () => pending.current?.abort(), []);
   function add() {
-    if (selected)
+    if (selected) {
+      captured.current = selected;
       setDraft({
         ...selected,
+        ...locationArea(selected, area),
+        color:null,
         id: crypto.randomUUID(),
         name: "",
         note: "",
-        fields: [],
+        fields: fieldNames.map(name => ({name, value:""})),
       });
+    }
   }
   function saveEntry() {
     if (!draft) return;
@@ -68,7 +87,7 @@ export default function WorkspacePanel({
       data.snapshot = backup.snapshot;
       data.snapshotComplete = backup.snapshotComplete;
     }
-    if (section !== "config") data.locations = entries;
+    if (section !== "config") { data.locations = entries; data.fieldNames = fieldNames; }
     download(
       new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }),
       "planetXplorer-workspace.json",
@@ -111,12 +130,20 @@ export default function WorkspacePanel({
     [
       entry.name,
       entry.note,
+      entry.color ?? "",
       String(entry.position.ra_deg),
       String(entry.position.dec_deg),
       ...entry.fields.flatMap(({ name, value }) => [name, value]),
     ].some((text) => text.toLowerCase().includes(search)),
   );
   const saved = entries.find((entry) => entry.id === draft?.id);
+  function flag(entry: Entry, value: string) {
+    const color = value ? value as FlagColor : null;
+    saveEntries(entries.map(e => e.id === entry.id ? {...e,color} : e));
+    setDraft(d => d?.id === entry.id ? {...d, color} : d);
+  }
+  const colorOptions = [<option key="" value="">No color</option>,
+    ...flagColors.map(c => <option key={c} value={c}>{c[0].toUpperCase() + c.slice(1)}</option>)];
   function updateField(index: number, key: "name" | "value", text: string) {
     if (!draft) return;
     setDraft({
@@ -129,10 +156,35 @@ export default function WorkspacePanel({
   return (
     <section className="science-controls saved-workspace">
       <div className="saved-actions">
+        <label>Save area
+          <select aria-label="Save area" value={selected?.scope?.kind === "region" ? area : "frame"}
+            onChange={e => {
+              const kind = e.target.value as "frame" | "region";
+              setArea(kind);
+              if (draft && !saved && captured.current) setDraft({...draft, ...locationArea(captured.current, kind)});
+            }}>
+            <option value="frame">Whole frame</option>
+            <option value="region" disabled={selected?.scope?.kind !== "region"}>Selected region in Details</option>
+          </select>
+        </label>
         <button type="button" onClick={add} disabled={!selected}>
           Add location
         </button>
       </div>
+      <details>
+        <summary>Default fields for new locations</summary>
+        <form key={JSON.stringify(fieldNames)} onSubmit={e => {
+          e.preventDefault();
+          const names = String(new FormData(e.currentTarget).get("fieldNames") ?? "");
+          saveFieldNames([...new Set(names.split(/\r?\n/).map(s => s.trim()).filter(Boolean))]);
+          if (consent === null) setShowPrompt(true);
+        }}>
+          <label>Field names (one per line)
+            <textarea name="fieldNames" rows={3} defaultValue={fieldNames.join("\n")} />
+          </label>
+          <button type="submit">Save default fields</button>
+        </form>
+      </details>
       <div className="saved-split">
         <div className="saved-list">
           <label>
@@ -158,6 +210,11 @@ export default function WorkspacePanel({
                     {entry.position.dec_deg.toFixed(5)}°
                   </small>
                 </button>
+                <label className="saved-flag">
+                  {entry.color && <span aria-hidden="true" style={{backgroundColor:entry.color}} />}
+                  <select aria-label={`Color flag for ${entry.name || "Sky location"}`}
+                    value={entry.color ?? ""} onChange={e => flag(entry, e.target.value)}>{colorOptions}</select>
+                </label>
               </li>
             ))}
           </ul>
@@ -185,9 +242,18 @@ export default function WorkspacePanel({
               />
             </label>
             <p>
+              {draft.scope?.kind === "region"
+                ? `Region (${draft.scope.box[0]+1}, ${draft.scope.box[1]+1})–(${draft.scope.box[2]+1}, ${draft.scope.box[3]+1}) · `
+                : draft.scope?.kind === "frame" ? "Whole frame · " : ""}
               RA {draft.position.ra_deg.toFixed(6)}° · Dec{" "}
               {draft.position.dec_deg.toFixed(6)}°
             </p>
+            <label>Color flag
+              <select aria-label="Color flag" value={draft.color ?? ""} onChange={e => {
+                if (saved) flag(saved, e.target.value);
+                else setDraft({...draft, color:e.target.value ? e.target.value as FlagColor : null});
+              }}>{colorOptions}</select>
+            </label>
             {draft.fields.map((field, i) => (
               <div className="saved-field-row" key={i}>
                 <label>
@@ -318,6 +384,7 @@ export default function WorkspacePanel({
           />
         </label>
         {importDate && (
+          <Notification key={importDate} label="workspace import notice" onDismiss={() => setImportDate("")}>
           <div role="status">
             <p>
               Imported workspace exported{" "}
@@ -334,6 +401,7 @@ export default function WorkspacePanel({
               </ul>
             )}
           </div>
+          </Notification>
         )}
       </details>
     </section>

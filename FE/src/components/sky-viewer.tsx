@@ -8,18 +8,21 @@ import {
   useRef,
   useState,
 } from "react";
-import { Expand, Maximize2, Minimize2, Minus, Plus, RotateCcw } from "./icons";
+import { Crosshair, Download, Expand, Maximize2, Minimize2, Minus, Move, Plus, RotateCcw } from "./icons";
 import { download } from "@/lib/workspace";
 import {
   exportName,
   intensityByte,
   palette,
+  skyPosition,
+  type GridHeader,
   type Display,
   type RenderedFrame,
 } from "@/lib/imaging";
 import type { Query } from "@/lib/types";
 import type { Marker } from "@/lib/known-objects";
 import { ObjectInfo } from "./known-objects";
+import Notification from "./notification";
 import { useAssets } from "@/lib/use-assets";
 import {
   zoomAt,
@@ -31,6 +34,26 @@ import {
 
 type FrameImage = HTMLCanvasElement | HTMLImageElement;
 export type PixelBox = [number, number, number, number];
+
+function frameLegend(frame: RenderedFrame, bounds: number[], stretch: string, colors: number[][], invert: boolean) {
+  const scales = frame.mapScales?.length ? frame.mapScales : [{
+    name: "Intensity", bounds: frame.previewScale?.bounds ?? bounds,
+    stretch: frame.previewScale?.stretch ?? stretch, stops: undefined,
+  }];
+  return scales.map(scale => {
+    const [lo, hi] = scale.bounds;
+    const lut = scale.stops ? palette(scale.stops) : frame.canvas ? colors : null;
+    const stops = Array.from({length:256}, (_, i) => {
+      const byte = intensityByte(lo + i / 255 * (hi - lo), scale.bounds, scale.stretch);
+      const rgba = lut?.[byte] ?? [byte, byte, byte, 255];
+      const rgb = rgba.slice(0, 3).map(v => invert ? 255 - v : v);
+      return `rgba(${rgb.join(",")},${(rgba[3] ?? 255) / 255})`;
+    });
+    const units = frame.previewScale?.units ?? "MJy/sr";
+    return {stops, label:`${scale.name} · ${lo.toPrecision(4)} … ${hi.toPrecision(4)} ${units} · ${scale.stretch}`};
+  });
+}
+
 function loadPreview(url: string, signal: AbortSignal, retry = false) {
   return new Promise<HTMLImageElement>((resolve, reject) => {
     const image = new Image();
@@ -63,6 +86,7 @@ export default function SkyViewer({
   zoom: magnification,
   invert,
   grid,
+  gridHeader,
   display,
   update,
   query,
@@ -80,6 +104,7 @@ export default function SkyViewer({
   zoom: number;
   invert: boolean;
   grid?: string;
+  gridHeader?: GridHeader;
   display: Display;
   update: (p: Partial<Display>) => void;
   query: Query | null;
@@ -102,10 +127,13 @@ export default function SkyViewer({
     box = useRef<HTMLDivElement>(null),
     shell = useRef<HTMLDivElement>(null);
   const pointers = useRef(new Map<number, Point>());
+  const skyReadout = useRef<HTMLDivElement>(null);
+  const cursor = useRef<Point | null>(null);
   const lastPointerType = useRef("");
   const panGesture = useRef(false);
   const rightDrag = useRef(false);
   const [regionMenu, setRegionMenu] = useState<Point | null>(null);
+  const [tool, setTool] = useState<"select" | "pan">("select");
   const regionMenuRef = useRef<HTMLDivElement>(null);
   useEffect(() => { setRegionMenu(null); }, [query, selection, index]);
   useEffect(() => {
@@ -146,6 +174,9 @@ export default function SkyViewer({
   const exportController = useRef<AbortController | null>(null);
   useEffect(() => () => exportController.current?.abort(), []);
   const current = frames[index];
+  const legend = useMemo(() => display.legend && current
+    ? frameLegend(current, bounds, display.stretch, colors, invert) : [],
+    [current, bounds, display.legend, display.stretch, colors, invert]);
   const urls = useMemo(() => {
     const neighbors = frames.slice(Math.max(0, index - 2), index + 3);
     return [current, ...neighbors.filter(f => f !== current)]
@@ -307,6 +338,22 @@ export default function SkyViewer({
     ];
     return area[0] <= area[2] && area[1] <= area[3] ? area : null;
   }
+  function updateCoordinates() {
+    if (!skyReadout.current || !query) return;
+    const cell = currentImage && cursor.current && pixelBox(cursor.current, cursor.current);
+    const area = cell || (currentImage && selection);
+    let position: Pick<Query, "ra_deg" | "dec_deg"> = query;
+    let label = "Field center";
+    if (currentImage) {
+      const x = area ? (area[0] + area[2]) / 2 : (currentImage.width - 1) / 2;
+      const y = area ? (area[1] + area[3]) / 2 : (currentImage.height - 1) / 2;
+      position = skyPosition(query, x, y, currentImage.width, currentImage.height, gridHeader);
+      if (area) label = area[0] === area[2] && area[1] === area[3]
+        ? `Pixel (${x + 1}, ${y + 1})` : "Selected region center";
+    }
+    const value = `${label} · RA ${position.ra_deg.toFixed(6)}° · Dec ${position.dec_deg.toFixed(6)}° (ICRS)`;
+    if (skyReadout.current.textContent !== value) skyReadout.current.textContent = value;
+  }
   async function exportImage(animated: boolean) {
     if (!query || !box.current || !current || exportController.current) return;
     const controller = new AbortController();
@@ -367,48 +414,14 @@ export default function SkyViewer({
             18,
           );
         if (display.legend) {
-          const scales = frame.mapScales?.length
-            ? frame.mapScales
-            : [
-                {
-                  name: "Intensity",
-                  bounds: frame.previewScale?.bounds ?? bounds,
-                  stretch: frame.previewScale?.stretch ?? display.stretch,
-                  stops: undefined,
-                },
-              ];
-          for (const [row, scale] of scales.entries()) {
-            const legendBounds = scale.bounds;
-            const lut = scale.stops
-              ? palette(scale.stops)
-              : frame.canvas
-                ? colors
-                : null;
+          for (const [row, scale] of frameLegend(frame, bounds, display.stretch, colors, invert).entries()) {
             const gradient = ctx.createLinearGradient(8, 0, width - 8, 0);
-            for (let i = 0; i < 256; i++) {
-              const intensity =
-                legendBounds[0] +
-                (i / 255) * (legendBounds[1] - legendBounds[0]);
-              const byte = intensityByte(
-                intensity,
-                legendBounds,
-                scale.stretch,
-              );
-              const color = lut?.[byte] ?? [byte, byte, byte, 255];
-              gradient.addColorStop(
-                i / 255,
-                `rgba(${color
-                  .slice(0, 3)
-                  .map((v) => (invert ? 255 - v : v))
-                  .join(",")},${(color[3] ?? 255) / 255})`,
-              );
-            }
+            scale.stops.forEach((color, index) => gradient.addColorStop(index / 255, color));
             ctx.fillStyle = gradient;
             ctx.fillRect(8, height + 4 + row * 38, width - 16, 11);
             ctx.fillStyle = "white";
-            const units = frame.previewScale?.units ?? "MJy/sr";
             ctx.fillText(
-              `${scale.name} · ${legendBounds.map((v) => v.toPrecision(4)).join(" … ")} ${units} · ${scale.stretch}`,
+              scale.label,
               8,
               height + 30 + row * 38,
               width - 16,
@@ -458,6 +471,7 @@ export default function SkyViewer({
       if (!c || !b) return;
       const rect = b.getBoundingClientRect(),
         ratio = window.devicePixelRatio || 1;
+      updateCoordinates();
       const width = Math.round(rect.width * ratio),
         height = Math.round(rect.height * ratio);
       if (c.width !== width) c.width = width;
@@ -529,6 +543,8 @@ export default function SkyViewer({
     selection,
     markers,
     chosenObject,
+    gridHeader,
+    display.coords,
   ]);
   function endPointer(
     event: React.PointerEvent<HTMLCanvasElement>,
@@ -561,7 +577,7 @@ export default function SkyViewer({
         return;
       }
     }
-    if (!cancelled && !multiTouch.current && panGesture.current && !rightDrag.current && selection && query) {
+    if (!cancelled && !multiTouch.current && event.button === 2 && !rightDrag.current && selection && query) {
       const here = { x: event.clientX, y: event.clientY };
       const cell = pixelBox(here, here);
       if (cell && cell[0] >= selection[0] && cell[0] <= selection[2] &&
@@ -579,7 +595,7 @@ export default function SkyViewer({
         : null;
     if (
       !cancelled &&
-      !multiTouch.current &&
+      !multiTouch.current && !panGesture.current &&
       point &&
       event.pointerType === "touch" &&
       start.current &&
@@ -612,15 +628,34 @@ export default function SkyViewer({
   }
   return (
     <div className="sky-shell" ref={shell}>
+      <div className="canvas-toolbar">
+        <div className="canvas-tool-group" role="group" aria-label="Canvas interaction">
+          <button aria-label="Select region" aria-pressed={tool === "select"}
+            title="Select pixels or drag a region (V)" disabled={!loaded}
+            onClick={() => { setTool("select"); setRegionMenu(null); }}>
+            <Crosshair size={14} /><span>Select</span>
+          </button>
+          <button aria-label="Pan image" aria-pressed={tool === "pan"}
+            title="Drag to pan the image (H)" disabled={!loaded}
+            onClick={() => { setTool("pan"); setRegionMenu(null); }}>
+            <Move size={14} /><span>Pan</span>
+          </button>
+        </div>
+        <span className="canvas-tool-hint">
+          {tool === "pan" ? "Drag to pan the image" : "Click a pixel or drag a region"}
+        </span>
+      </div>
       <div
-        className={"sky-canvas " + (frames.length ? "has-image" : "")}
+        className={"sky-canvas " + (frames.length ? "has-image" : "") + (tool === "pan" ? " pan-tool" : "")}
         ref={box}
       >
         <canvas
           ref={canvas}
           tabIndex={0}
           role="img"
-          aria-description="Click to inspect a pixel or left-drag a region. Right-click the selection for its full spectrum. Right-drag to pan. Use two fingers or scroll to pan and zoom."
+          aria-description={tool === "pan"
+            ? "Drag to pan. Press V to select pixels or regions. Scroll to zoom."
+            : "Click to inspect a pixel or left-drag a region. Press H to pan. Right-click the selection for its full spectrum. Right-drag to pan. Use two fingers or scroll to pan and zoom."}
           onContextMenu={(event) => {
             if (loaded) event.preventDefault();
           }}
@@ -648,7 +683,7 @@ export default function SkyViewer({
               y: event.clientY,
             });
             if (pointers.current.size === 1) {
-              panGesture.current = event.button === 2;
+              panGesture.current = event.button === 2 || tool === "pan";
               rightDrag.current = false;
               start.current = { x: event.clientX, y: event.clientY };
             }
@@ -661,6 +696,10 @@ export default function SkyViewer({
             }
           }}
           onPointerMove={(event) => {
+            if (display.coords) {
+              cursor.current = {x:event.clientX, y:event.clientY};
+              updateCoordinates();
+            }
             const before = pointers.current.get(event.pointerId);
             if (!before) return;
             const old = [...pointers.current.values()];
@@ -699,7 +738,11 @@ export default function SkyViewer({
                 pixelBox(start.current, { x: event.clientX, y: event.clientY }),
               );
           }}
-          onPointerUp={(event) => endPointer(event)}
+          onPointerLeave={() => { cursor.current = null; updateCoordinates(); }}
+          onPointerUp={(event) => {
+            if (event.pointerType === "touch") { cursor.current = null; updateCoordinates(); }
+            endPointer(event);
+          }}
           onPointerCancel={(event) => endPointer(event, true)}
           onLostPointerCapture={(event) =>
             pointers.current.delete(event.pointerId)
@@ -716,6 +759,13 @@ export default function SkyViewer({
           }}
           onKeyDown={(event) => {
             if (!loaded || event.ctrlKey || event.metaKey) return;
+            if (event.key.toLowerCase() === "v" || event.key.toLowerCase() === "h") {
+              event.preventDefault();
+              event.stopPropagation();
+              setTool(event.key.toLowerCase() === "h" ? "pan" : "select");
+              setRegionMenu(null);
+              return;
+            }
             if (["+", "=", "-", "0", "f", "1"].includes(event.key)) {
               event.preventDefault();
               event.stopPropagation();
@@ -750,7 +800,9 @@ export default function SkyViewer({
             )}
 
             <span>
-              {current.visit_id && current.observation_id === current.visit_id
+              {current.subtraction
+                ? `Cycle difference · reference ${current.subtraction.referenceDate.slice(0, 10)}`
+                : current.visit_id && current.observation_id === current.visit_id
                 ? "Visit composite"
                 : (current.previewScale ? "Exposure PNG preview" : "Calibrated exposure") + " · " + current.detector}
               {current.observation_id !== current.visit_id &&
@@ -770,6 +822,11 @@ export default function SkyViewer({
           <div className="sky-empty">
             <h2>No observation loaded</h2>
             <p>{message || "Enter coordinates to load observations."}</p>
+            {!message && <ol className="empty-workflow">
+              <li>Choose a sky position</li>
+              <li>Search observations</li>
+              <li>Inspect pixels and compare cycles</li>
+            </ol>}
           </div>
         )}
         {current && !loaded && !entry?.error && (
@@ -778,7 +835,7 @@ export default function SkyViewer({
           </div>
         )}
         {entry?.error && (
-          <div className="image-error" role="alert">
+          <Notification key={current?.observation_id} label="image download error"><div role="alert">
             <p>This image could not be loaded.</p>
             <button
               className="button"
@@ -788,8 +845,9 @@ export default function SkyViewer({
               Retry image
             </button>
             <span>You can also step to another frame.</span>
-          </div>
+          </div></Notification>
         )}
+        {display.coords && query && <div className="sky-coordinate-readout" role="group" aria-label="Sky coordinates" ref={skyReadout} />}
         {!!frames.length && grid?.includes("north up") && (
           <div className="orientation" aria-label="North up, east left">
             <span>N</span>
@@ -798,19 +856,32 @@ export default function SkyViewer({
           </div>
         )}
       </div>
+      {loaded && legend.length > 0 && <div className="live-color-scale" role="group" aria-label="Displayed color scale">
+        {legend.map((scale, i) => <div key={i}>
+          <div className="scale-ramp" style={{backgroundImage:`linear-gradient(to right,${scale.stops.join(",")})`}} />
+          <span>{scale.label}</span>
+        </div>)}
+      </div>}
       <div className="export-tools">
+        <div className="canvas-tool-group" role="group" aria-label="Image export">
+        <span className="canvas-tool-label"><Download size={12} />Export</span>
         <button
           disabled={!loaded || exporting}
+          title="Download the displayed image as PNG"
           onClick={() => void exportImage(false)}
         >
           PNG
         </button>
         <button
           disabled={!loaded || exporting || !cycleView || frames.length < 2}
+          title={cycleView && frames.length >= 2 ? "Export the observing cycles as an animated GIF" : "GIF export needs two cycles in Visits or Matched view"}
           onClick={() => void exportImage(true)}
         >
           GIF
         </button>
+        </div>
+        <div className="canvas-tool-group" role="group" aria-label="Image overlays">
+        <span className="canvas-tool-label">Overlays</span>
         <label>
           <input
             type="checkbox"
@@ -837,12 +908,15 @@ export default function SkyViewer({
             Mark flagged pixels ({currentWarnings.length})
           </label>
         )}
+        </div>
         {exporting && <span role="status">Preparing export…</span>}
-        {exportError && <span role="alert">{exportError}</span>}
+        {exportError && <Notification label="export error" onDismiss={() => setExportError("")}>
+          <span role="alert">{exportError}</span>
+        </Notification>}
       </div>
       <div className="sky-bottom">
         <span className="gesture-hint">
-          Left-drag to select · Right-drag to pan · Scroll to zoom
+          {tool === "pan" ? "Pan · Drag to move · V to select" : "Select · Drag a region · H to pan"} · Scroll to zoom
         </span>
         <div className="zoom-buttons">
           <button

@@ -119,6 +119,18 @@ test("renders and inspects Barnard-like flagged bands and exports their display 
       .locator("circle"),
   ).toHaveCount(3);
   await expect(page.getByLabel("Mark flagged pixels (1)")).toBeChecked();
+  const legend = page.getByRole("group", {name:"Displayed color scale"});
+  await page.getByRole("checkbox", {name:"Color scale", exact:true}).check();
+  await expect(legend.locator(".scale-ramp")).toHaveCount(3);
+  await expect(legend).toContainText("red · 0.000 … 100.0 MJy/sr · linear");
+  const ramp = legend.locator(".scale-ramp").first();
+  const before = await ramp.evaluate(el => getComputedStyle(el).backgroundImage);
+  await page.getByText("Playback and appearance", {exact:true}).click();
+  await page.getByLabel("Invert colors", {exact:true}).check();
+  await expect.poll(() => ramp.evaluate(el => getComputedStyle(el).backgroundImage)).not.toBe(before);
+  await page.getByLabel("Invert colors", {exact:true}).uncheck();
+  await page.getByRole("checkbox", {name:"Color scale", exact:true}).uncheck();
+  await expect(legend).toHaveCount(0);
 
   const canvas = page.locator("canvas");
   const expected = [255, 128, 0, 255];
@@ -171,12 +183,22 @@ test("validates coordinates and handles an unavailable backend", async ({
   await page.route("**/api/jobs", (r) => r.abort());
   await page.goto("/");
   await expect(
-    page.getByRole("link", { name: "Planet X home", exact: true }),
+    page.getByRole("link", { name: "planetXplorer home", exact: true }),
   ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Play", exact: true }),
   ).toBeDisabled();
   await page.getByRole("button", { name: "Search observations" }).click();
+  await expect(page.locator(".error[role=alert]")).toContainText("Enter both");
+  const bell = page.getByRole("button",{name:/^Notifications,/});
+  await expect(bell).toHaveAttribute("aria-expanded","false");
+  await expect(bell).toHaveAccessibleName(/Notifications, [1-9]\d* unread/);
+  await expect(page.locator(".error[role=alert]")).toBeHidden();
+  await bell.click();
+  await expect(bell).toHaveAccessibleName("Notifications, 0 unread");
+  await page.getByRole("button", {name:"Dismiss search error"}).click();
+  await expect(page.locator(".error[role=alert]")).toHaveCount(0);
+  await page.getByRole("button", {name:"Search observations"}).click();
   await expect(page.locator(".error[role=alert]")).toContainText("Enter both");
   await page.getByRole("textbox", { name: "Right ascension" }).fill("360");
   await page.getByRole("textbox", { name: "Declination" }).fill("0");
@@ -379,6 +401,7 @@ test("shows cached pixels during refresh and replaces a revised exposure in plac
   });
   await page.goto("/explore?ra=20&dec=2");
   const status = page.getByText(/Showing cached observations while checking/);
+  await page.getByRole("button",{name:/^Notifications,/}).click();
   await expect(status).toBeVisible();
   await expect(
     page.getByRole("button", { name: "PNG", exact: true }),
@@ -476,6 +499,7 @@ test("loads legacy exposures for direct inspection without inventing cycles and 
     .click();
   await expect(page.locator(".zoom-buttons")).toContainText("100%");
   await page.getByRole("textbox", { name: "Right ascension" }).fill("12");
+  await page.getByRole("button",{name:/^Notifications,/}).click();
   await expect(page.getByText("Query edited.", { exact: false })).toBeVisible();
   await page.reload();
   await expect(
@@ -598,6 +622,7 @@ test("no coverage keeps playback disabled and explains the result", async ({
     r.fulfill({ json: { status: "complete", manifest: { frames: [] } } }),
   );
   await page.goto("/explore?ra=1&dec=2");
+  await page.getByRole("button",{name:/^Notifications,/}).click();
   await expect(
     page.getByText("No comparable observations were found", { exact: false }),
   ).toBeVisible();
@@ -624,7 +649,7 @@ test("settings tabs expose resources and preserve the query", async ({
   ).toBeVisible();
   await page.getByRole("button", { name: "About", exact: true }).click();
   await expect(
-    page.getByRole("heading", { name: "Planet X", exact: true, level: 2 }),
+    page.getByRole("heading", { name: "planetXplorer", exact: true, level: 2 }),
   ).toBeVisible();
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await expect(
@@ -780,6 +805,7 @@ test("search progress is cancellable and preserves the previous field", async ({
   await page
     .getByRole("button", { name: "Search observations", exact: true })
     .click();
+  await page.getByRole("button",{name:/^Notifications,/}).click();
   await expect(
     page.getByText("Checked 4 of 24 cutouts.", { exact: false }),
   ).toBeVisible();
@@ -790,7 +816,7 @@ test("search progress is cancellable and preserves the previous field", async ({
     "aria-label",
     /Observation 1 of 1/,
   );
-  await expect(page.locator(".field-readout")).toHaveText("1.000000, 2.000000");
+  await expect(page.locator(".field-readout")).toHaveText("RA 1.000000° · Dec 2.000000°");
   await page
     .getByRole("button", { name: "Cancel search", exact: true })
     .click();
@@ -798,6 +824,7 @@ test("search progress is cancellable and preserves the previous field", async ({
     page.getByRole("button", { name: "Search observations", exact: true }),
   ).toBeEnabled();
   await expect.poll(() => cancellations).toBe(1);
+  await page.getByRole("button",{name:/^Notifications,/}).click();
   await expect(
     page.getByText("Showing the previous field.", { exact: false }),
   ).toBeVisible();
@@ -924,7 +951,15 @@ test("streams the catalog, separates wavelengths, and loads another detector", a
     page.getByRole("button", { name: "Play", exact: true }),
   ).toBeDisabled();
   await page.getByRole("button", { name: "Matched", exact: true }).click();
-  await page.getByLabel("Wavelength sequence").selectOption("s2");
+  const chooseSpectrum = async (detector: string) => {
+    await page.getByLabel("Matched spectra", {exact:true}).click();
+    const band = page.locator(".matched-options").getByLabel(detector + " spectra", {exact:true});
+    if (!await band.evaluate(el => el.parentElement!.hasAttribute("open"))) await band.click();
+    const spectrum = band.locator("..").locator("details > summary").first();
+    if (!await spectrum.evaluate(el => el.parentElement!.hasAttribute("open"))) await spectrum.click();
+    await spectrum.locator("..").getByRole("button").first().click();
+  };
+  await chooseSpectrum("D2");
   await expect(
     page.getByRole("button", { name: "Play", exact: true }),
   ).toBeDisabled();
@@ -934,7 +969,7 @@ test("streams the catalog, separates wavelengths, and loads another detector", a
   await page.getByLabel("Detector", { exact: true }).selectOption("D6");
   await page.getByRole("button", { name: "Load", exact: true }).click();
   await page.getByRole("button", { name: "Matched", exact: true }).click();
-  await page.getByLabel("Wavelength sequence").selectOption("s6");
+  await chooseSpectrum("D6");
   expect(requested).toBe("d6");
   await expect(page.getByLabel("Frame details", { exact: true })).toContainText(
     "D6",
@@ -942,7 +977,7 @@ test("streams the catalog, separates wavelengths, and loads another detector", a
   await expect(
     page.getByRole("button", { name: "Play", exact: true }),
   ).toBeDisabled();
-  await page.getByLabel("Wavelength sequence").selectOption("s1");
+  await chooseSpectrum("D1");
   await expect(
     page.getByRole("button", { name: "Play", exact: true }),
   ).toBeDisabled();

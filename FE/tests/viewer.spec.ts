@@ -10,9 +10,10 @@ const frames = Array.from({ length: 3 }, (_, i) => ({
   url: `http://127.0.0.1:${process.env.PLAYWRIGHT_PORT ?? 3000}/test-frames/f${i}.png`,
   observation_id: `obs${i}`,
   observed_at: ["2025-07-01", "2026-01-02", "2026-07-03"][i] + "T00:00:00Z",
-  detector: `D${i + 1}`,
-  wavelength_um: i + 1,
-  sequence_id: `s${i}`,
+  detector: "D1",
+  wavelength_um: 0.98,
+  sequence_id: "D1-matched",
+  processing_version: "v1",
 }));
 function visitsFor(catalog: typeof frames) {
   return catalog.map(f => ({
@@ -20,7 +21,7 @@ function visitsFor(catalog: typeof frames) {
     observation_ids: [f.observation_id], status: "pending", issues: [],
   }));
 }
-async function setup(page: Page) {
+async function setup(page: Page, gridHeader?: Record<string, number>) {
   await page.route("**/api/presets", (r) =>
     r.fulfill({ json: { presets: [] } }),
   );
@@ -33,14 +34,10 @@ async function setup(page: Page) {
         status: "complete",
         manifest: {
           frames,
+          processing: {grid_header: gridHeader},
           visits: visitsFor(frames),
-          sequences: frames.map((f, i) => ({
-            id: f.sequence_id,
-            detector: f.detector,
-            wavelength_um: i + 1,
-            frame_ids: [f.id],
-            stretch: {},
-          })),
+          sequences: [{id:"D1-matched", detector:"D1", wavelength_um:0.98,
+            processing_version:"v1", frame_ids:frames.map(f => f.id), stretch:{}}],
         },
       },
     }),
@@ -58,6 +55,33 @@ const zoomValue = (page: Page) =>
     .getByLabel("Viewport zoom", { exact: true })
     .innerText()
     .then((v) => Number.parseInt(v));
+
+test("Coordinates shows the saved sky grid at the cursor, selected pixel, and field center", async ({page}) => {
+  await page.setViewportSize({width:1440,height:900});
+  await setup(page, {CRVAL1:12, CRVAL2:0, CRPIX1:8, CRPIX2:8, CD1_1:0, CD1_2:-0.01, CD2_1:0.01, CD2_2:0});
+  const readout = page.getByRole("group", {name:"Sky coordinates"});
+  const toggle = page.getByRole("checkbox", {name:"Coordinates",exact:true});
+  await toggle.check();
+  await expect(readout).toHaveText("Field center · RA 11.995000° · Dec 0.005000° (ICRS)");
+  const canvas = page.locator(".sky-canvas canvas");
+  const box = (await canvas.boundingBox())!;
+  const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
+  const scale = Math.min(box.width, box.height) * 0.94 / 16;
+  const pixel = "Pixel (10, 9) · RA 12.000000° · Dec 0.020000° (ICRS)";
+  await page.mouse.move(cx + 1.5*scale, cy + 0.5*scale);
+  await expect(readout).toHaveText(pixel);
+  await page.getByRole("button",{name:"Zoom in",exact:true}).click();
+  const dx = box.width <= box.height ? 12 : 0, dy = box.height < box.width ? 12 : 0;
+  await page.mouse.move(cx,cy);
+  await page.mouse.down({button:"right"});
+  await page.mouse.move(cx+dx,cy+dy,{steps:3});
+  await page.mouse.up({button:"right"});
+  await page.mouse.click(cx + dx + 1.5*scale*1.25, cy + dy + 0.5*scale*1.25);
+  await toggle.hover();
+  await expect(readout).toHaveText(pixel);
+  await toggle.uncheck();
+  await expect(readout).toHaveCount(0);
+});
 
 test("only a confirmed right-click on the selection retrieves its spectrum for all dates in a new tab", async ({page, context}) => {
   await page.setViewportSize({width: 1440, height: 900});
@@ -169,6 +193,24 @@ test("cycle playback advances from a raw selection and stops at the last cycle w
     page.getByRole("button", { name: "Play", exact: true }),
   ).toBeVisible();
   await expect(page.locator(".frame-counter")).toContainText("03 / 03");
+});
+
+test("keyboard resizing and sidebar disclosure keep the current cycle and playback state", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await setup(page);
+  const counter = page.getByLabel("Current cycle", { exact: true });
+  const cycle = await counter.innerText();
+  const sidebar = page.locator("aside.sidebar");
+  const width = (await sidebar.boundingBox())!.width;
+  await page.getByRole("separator", { name: "Resize Query and display settings", exact: true })
+    .press("ArrowRight");
+  await expect.poll(async () => (await sidebar.boundingBox())!.width).toBeGreaterThan(width);
+  await expect(counter).toHaveText(cycle);
+  const appearance = page.locator(".sidebar-section > summary").filter({ hasText: "Playback and appearance" });
+  await appearance.press("Space");
+  await expect(appearance.locator("..")).toHaveAttribute("open", "");
+  await expect(page.getByRole("button", { name: "Play", exact: true })).toBeVisible();
+  await expect(counter).toHaveText(cycle);
 });
 
 test("wheel, drag, native scale, fit, and fullscreen work without changing frame selection", async ({
@@ -309,7 +351,9 @@ test("one failed image does not block other frames, and can be retried", async (
     page.getByRole("button", { name: "Next cycle", exact: true }),
   ).toBeEnabled();
   await page.getByRole("button", { name: "Next cycle", exact: true }).click();
-  await expect(page.getByText("This image could not be loaded.")).toBeVisible();
+  const bell = page.getByRole("button",{name:/^Notifications,/});
+  await bell.click();
+  await expect(page.getByText("This image could not be loaded.",{exact:true})).toBeVisible();
   await page.getByRole("button", { name: "Next cycle", exact: true }).click();
   await expect(
     page.getByRole("button", { name: "Zoom in", exact: true }),
@@ -317,6 +361,7 @@ test("one failed image does not block other frames, and can be retried", async (
   await page
     .getByRole("button", { name: "Previous cycle", exact: true })
     .click();
+  await bell.click();
   await expect(
     page.getByRole("button", { name: "Retry image", exact: true }),
   ).toBeVisible();
@@ -451,7 +496,7 @@ test("catalog filters govern bulk loading, CSV export, and mobile record managem
   await page
     .getByRole("button", { name: "Toggle field settings", exact: true })
     .click();
-  await expect(page.getByLabel("Query and display settings")).not.toBeVisible();
+  await expect(page.getByRole("complementary", {name:"Query and display settings", exact:true})).not.toBeVisible();
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= innerWidth,

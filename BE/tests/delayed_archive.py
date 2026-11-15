@@ -29,9 +29,11 @@ class DelayedArchive(Archive):
                                       "match-f", "other-subband", "other-detector", "unknown"])
         ]
         calibrated = decode(fixture, self.records[0], Query(ra_deg=133.795129, dec_deg=-7.245147), "fixture")
-        self.calibration = dict(wavelength_um=calibrated.wavelengths[0], bandwidth_um=calibrated.bandwidths[0],
+        assert calibrated.nominal_channel == 16
+        self.calibration = dict(nominal_channel=calibrated.nominal_channel, wavelength_um=calibrated.wavelengths[0], bandwidth_um=calibrated.bandwidths[0],
                                 processing_version=calibrated.version)
         self.lock = Lock()
+        self.probes = []
         self.requests = []
         self.active = self.peak = 0
         self.release = Event()
@@ -49,16 +51,23 @@ class DelayedArchive(Archive):
             self.catalog_done = True
         return self.records, []
 
+    def probe_spectral(self, obs, query, deadline):
+        return self.spectral_at(obs.uri, query, deadline)
+
     def spectral_at(self, uri, query, deadline):
         info = self.cached_spectral(uri, query)
         if info:
             return info
+        with self.lock:
+            self.probes.append(Path(uri).stem)
         time.sleep(.03)
         if uri.endswith("unknown.fits"):
             return None
         info = dict(self.calibration)
         if uri.endswith("other-subband.fits"):
-            info["wavelength_um"] += 1
+            # Same measured wavelength in the D6-16/17 overlap, on a different
+            # nominal detector stripe. A wavelength-only filter would leak it.
+            info["nominal_channel"] = 17
         with self.spectral_lock:
             self.spectral_index[(uri, query.ra_deg, query.dec_deg)] = info
         return info
@@ -92,7 +101,7 @@ def main():
         @app.get("/fixture")
         def state():
             with archive.lock:
-                return dict(requests=list(archive.requests), active=archive.active, peak=archive.peak,
+                return dict(requests=list(archive.requests), probes=list(archive.probes), active=archive.active, peak=archive.peak,
                             catalog_done=archive.catalog_done, wavelength=archive.calibration["wavelength_um"])
 
         @app.post("/fixture/release")

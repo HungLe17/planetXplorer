@@ -6,6 +6,7 @@ import {
   activeChannels,
   activeDetectors,
   archivedAt,
+  cycleDifferences,
   defaults,
   exportName,
   fillComposite,
@@ -16,6 +17,7 @@ import {
   intensityByte,
   mapBounds,
   measureSpectrum,
+  motionSelection,
   newMap,
   palette,
   previewScale,
@@ -56,6 +58,93 @@ function visit(id, planes, status = "complete") {
     issues: [],
   };
 }
+test("fixed-cycle subtraction preserves both residual signs and uses measured pixels on a common response", () => {
+  const fields = [
+    ["reference", "2025-05-01", "same", [9, 1, 4, NaN, 4], [0,0,0,2,0]],
+    ["science", "2025-11-01", "same", [2, 8, 4, 3, -1], [0,0,0,0,0]],
+    ["later", "2026-05-01", "same", [19, 1, 4, 2, 4], [0,0,0,0,0]],
+    ["unmatched", "2026-06-01", "other", [200, 1, 4, 2, 4], [0,0,0,0,0]],
+  ];
+  const planes = fields.map(([, date, sequence, values, flags]) => {
+    const p = exposure("D1", 1, date, values, {archived:Float32Array.from(values),
+      status:Uint8Array.from(values, () => 1), flags:Uint32Array.from(flags)});
+    Object.assign(p.frame,{sequence_id:sequence, processing_version:"v1"});
+    return p;
+  });
+  const steps = planes.map((p,i) => ({visit:visit(fields[i][0],[p]), source:p.frame, members:[p.frame]}));
+  const diff = cycleDifferences(planes, steps, defaults.maps[0], "reference");
+  assert.deepEqual(diff.steps.map(s=>s.visit.id), ["reference", "science", "later"]);
+  assert.deepEqual([...diff.products[1].layers[0].values], [-7, 7, 0, NaN, NaN]);
+  assert.deepEqual(diff.bounds, [-10, 10]);
+  const colors = new Uint8ClampedArray(20);
+  const [layer] = diff.products[1].layers;
+  fillComposite(colors, [layer], [{...layer.map, bounds:diff.bounds, signed:true}]);
+  assert.ok(colors[2] > colors[0] && colors[4] > colors[6]);
+  assert.deepEqual([...colors.slice(8,16)], [0,0,0,255,0,0,0,0]);
+  assert.equal(cycleDifferences(planes, steps, undefined, "unmatched").products.length, 0);
+  assert.equal(cycleDifferences(planes, steps, undefined, "missing").products.length, 0);
+});
+test("motion representatives maximize distinct comparable cycles before repeat D1 frames", () => {
+  const make = (id, cycle, seq, date) => ({id, observation_id:id, visit_id:cycle,
+    observed_at:date + "T00:00:00Z", detector:"D1", sequence_id:seq, processing_version:"v1"});
+  const frames = [
+    make("a", "may", "rare", "2025-05-01"), make("b", "may", "rare", "2025-05-02"),
+    make("c", "may", "rare", "2025-05-03"), make("d", "may", "repeatable", "2025-05-04"),
+    make("d2", "may", "repeatable", "2025-05-05"), make("e", "nov", "repeatable", "2025-11-01"),
+    make("f", "spring", "unmatched", "2026-05-01"),
+  ];
+  const visits = ["may","nov","spring"].map(id =>
+    visit(id, frames.filter(f => f.visit_id === id).map(frame => ({frame}))));
+  const manifest = {frames, visits, processing:{sampling_order:["d2","e","a"]}};
+  const get = (choices, options) => motionSelection(manifest, defaults, choices, options ?? {detectors:["D1"]});
+  assert.deepEqual([...get({}).includedIds], ["d2","e"]);
+  assert.equal(get({}).reasons.get("spring"), "No comparable exposure");
+  assert.deepEqual([...get({d2:false}).includedIds], ["d","e"]);
+  assert.deepEqual([...get({a:true}).includedIds], ["a"]);
+  assert.equal(get({}, {detectors:["D6"]}).steps.length, 0);
+  const legacy = {...manifest, frames:frames.map(({sequence_id,...f}) => f)};
+  assert.equal(motionSelection(legacy, defaults, {}, null).steps.length, 1);
+});
+test("time sampling reserves the longest baseline and manual choices override the interval", () => {
+  const dates = ["2025-05-01","2025-05-09","2025-05-16"];
+  const frames = dates.map((observed_at, i) => ({id:String(i), observation_id:String(i), observed_at,
+    detector:"D6", sequence_id:"matching", processing_version:"v1"}));
+  const manifest = {frames, visits:frames.map(frame => visit(frame.id, [{frame}]))};
+  const query = {detectors:["D6"], min_separation_days:8};
+  const series = motionSelection(manifest, defaults, {}, query);
+  assert.equal(series.raw, true);
+  assert.deepEqual([...series.includedIds], ["0","2"]);
+  assert.match(series.reasons.get("1"), /sampling interval/);
+  assert.deepEqual([...motionSelection(manifest, defaults, {"1":true}, query).includedIds], ["0","1"]);
+});
+test("multi-input motion maps require every calibrated wavelength in each compared cycle", () => {
+  const channels = ["D6 4.500000 µm (v1)", "D6 4.800000 µm (v1)"];
+  const frames = ["a","b","c"].flatMap((visit_id, i) => channels.slice(0, i === 1 ? 1 : 2)
+    .map((channel, j) => ({id:visit_id+j, observation_id:visit_id+j, visit_id, detector:"D6",
+      sequence_id:"seq"+j, processing_version:"v1", wavelength_um:j ? 4.8 : 4.5, channel,
+      observed_at:`202${5+i}-07-01T00:00:00Z`})));
+  const manifest = {frames, visits:["a","b","c"].map(id => visit(id, frames.filter(f => f.visit_id === id).map(frame => ({frame}))))};
+  const query = {detectors:["D6"], channels:{D6:channels}};
+  for (const maps of [defaults.maps, [map("D6 map", {D6:1})]]) {
+    const series = motionSelection(manifest, {...defaults, maps}, {}, query);
+    assert.deepEqual(series.steps.map(s => s.visit.id), ["a","c"]);
+    assert.deepEqual([...series.includedIds], ["a0","a1","c0","c1"]);
+    assert.equal(series.reasons.get("b"), "No comparable exposure");
+  }
+});
+
+test("motion maps choose the wavelength combination with the most shared dates", () => {
+  // A is the most frequent D1 response. D2 differs in all three A cycles.
+  // The B and Y combination provides two genuinely comparable images.
+  const bands = [["A","U"], ["A","V"], ["A","W"], ["B","Y"], ["B","Y"]];
+  const frames = bands.flatMap(([first,second], i) => [first,second].map((seq,j) => ({
+    id:seq+i, observation_id:seq+i, visit_id:"v"+i, detector:j ? "D2" : "D1",
+    observed_at:`2025-0${i+1}-01T00:00:00Z`, sequence_id:seq, processing_version:"v1",
+  })));
+  const manifest = {frames, visits:bands.map((_,i) => visit("v"+i, frames.slice(2*i,2*i+2).map(frame => ({frame}))))};
+  const style = {...defaults, maps:[map("Two bands",{D1:1,D2:1})]};
+  assert.deepEqual(motionSelection(manifest,style,{},null).steps.map(s => s.visit.id), ["v3","v4"]);
+});
 function map(name, operands, extra = {}) {
   return { ...newMap(name, name), operands, ...extra };
 }

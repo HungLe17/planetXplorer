@@ -100,6 +100,7 @@ export const loadObservations = async (
   observation_ids: string[] = [],
   detector?: string,
   channels?: Query["channels"],
+  metadataOnly?: boolean,
 ) => {
   const data = await request<{ job_id: string }>(
     "/api/jobs/" + encodeURIComponent(id) + "/load",
@@ -108,6 +109,7 @@ export const loadObservations = async (
       observation_ids,
       ...(detector ? { detector } : {}),
       ...(channels ? { channels } : {}),
+      ...(metadataOnly ? { metadata_only: true } : {}),
     },
   );
   return data.job_id;

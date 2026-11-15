@@ -40,10 +40,18 @@ export function angularWidth(input: string): number {
     throw Error("Field of view must be between 30 and 1800 arcseconds.");
   return value;
 }
+export function separationDays(input: unknown): number {
+  const value = typeof input === "string" || typeof input === "number" ? Number(input) : NaN;
+  if (!Number.isFinite(value) || value <= 0)
+    throw Error("Enter a minimum separation greater than zero days.");
+  return value;
+}
 export function queryUrl(query: Query, view?: unknown, frame?: string) {
   const url = new URL("/explore", window.location.origin);
   url.searchParams.set("ra", String(query.ra_deg));
   url.searchParams.set("dec", String(query.dec_deg));
+  if (query.min_separation_days !== undefined)
+    url.searchParams.set("min_days", String(query.min_separation_days));
   if (query.detectors?.length)
     url.searchParams.set("bands", JSON.stringify({ detectors: query.detectors, channels: query.channels ?? {} }));
   if (query.fov_arcsec && query.fov_arcsec !== 300)

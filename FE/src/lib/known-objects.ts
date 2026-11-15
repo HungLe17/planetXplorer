@@ -1,4 +1,5 @@
 import type { Query } from "./types";
+import { gridMatrix } from "./imaging";
 
 export type CatalogObject = {
   id: string; name: string; type: string; source: string; source_url?: string;
@@ -29,11 +30,7 @@ export function projectMarker(query: Query, grid: Grid | undefined, width: numbe
   if (!(divisor > 0)) return null;
   const xi = Math.cos(d) * Math.sin(delta) / (divisor * rad);
   const eta = (Math.cos(center) * Math.sin(d) - Math.sin(center) * Math.cos(d) * Math.cos(delta)) / (divisor * rad);
-  const scaleX = Number(grid?.CDELT1 ?? -6.14 / 3600), scaleY = Number(grid?.CDELT2 ?? 6.14 / 3600);
-  const a = Number(grid?.CD1_1 ?? scaleX * Number(grid?.PC1_1 ?? 1));
-  const b = Number(grid?.CD1_2 ?? scaleX * Number(grid?.PC1_2 ?? 0));
-  const c = Number(grid?.CD2_1 ?? scaleY * Number(grid?.PC2_1 ?? 0));
-  const d2 = Number(grid?.CD2_2 ?? scaleY * Number(grid?.PC2_2 ?? 1));
+  const [a, b, c, d2] = gridMatrix(grid);
   const det = a * d2 - b * c;
   const x = Number(grid?.CRPIX1 ?? (width + 1) / 2) + (d2 * xi - b * eta) / det;
   const y = Number(grid?.CRPIX2 ?? (height + 1) / 2) + (a * eta - c * xi) / det;

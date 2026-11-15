@@ -6,7 +6,7 @@ import shutil
 import threading
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -75,6 +75,9 @@ class Jobs:
         self.lock = threading.RLock()
         self.channel_lookups = threading.BoundedSemaphore(2)
         self.channel_catalogs = OrderedDict()
+        self.catalog_reads = {}
+        self.header_pool = ThreadPoolExecutor(max_workers=min(settings.cutout_workers, 4), thread_name_prefix="spectral-menu")
+        self.header_reads = OrderedDict()
         self.records: dict[str, Job] = {}
         self.published_assets: dict[str, set[str]] = {}
         self.started: dict[str, float] = {}
@@ -88,6 +91,7 @@ class Jobs:
         with self.lock:
             self.closing = True
         self.executor.shutdown(wait=True, cancel_futures=True)
+        self.header_pool.shutdown(wait=True, cancel_futures=True)
         if isinstance(self.pipeline, Pipeline):
             self.pipeline.transfers.close()
 
@@ -263,7 +267,7 @@ class Jobs:
                 self.cache = {k: v for k, v in self.cache.items() if v != job_id}
             return job.model_copy(deep=True) if job else None
 
-    def load_more(self, job_id: str, ids: list[str], detector: str | None, channels=None) -> str:
+    def load_more(self, job_id: str, ids: list[str], detector: str | None, channels=None, *, metadata_only=False) -> str:
         with self.lock:
             self.cleanup()
             job = self.records.get(job_id)
@@ -276,14 +280,26 @@ class Jobs:
             if any(i not in records for i in ids):
                 raise ValueError("Observation is not part of this field")
             remaining = self.settings.max_frames - len(manifest.frames)
-            if remaining <= 0:
+            if remaining <= 0 and not metadata_only:
                 raise CapacityError("This field reached the loaded-image limit; narrow the date range")
-            requested = list(dict.fromkeys(ids)) if ids else [r.id for r in records.values() if r.status == "pending"]
-            selected = [i for i in requested if records[i].status != "ready"
+            if ids:
+                requested = list(dict.fromkeys(ids))
+            elif metadata_only:
+                requested = manifest.processing.get("sampling_metadata_ids", [])
+            else:
+                preferred_ids = [*manifest.processing.get("sampling_order", []),
+                                 *(key for group in manifest.processing.get("background_tracks", []) for key in group)]
+                preferred = {key: rank for rank, key in enumerate(preferred_ids)}
+                requested = sorted((r.id for r in records.values() if r.status == "pending"),
+                                   key=lambda key: preferred.get(key, len(preferred)))
+            selected = [i for i in requested if (metadata_only or records[i].status != "ready")
                         and records[i].selection != "excluded"
                         and records[i].band_match(manifest.query) != "excluded"
                         and (detector is None or records[i].detector == detector)]
-            selected = selected[:min(self.settings.batch_size, remaining)]
+            if metadata_only:
+                selected = [i for i in selected if records[i].needs_spectral(manifest.query)][:self.settings.batch_size]
+            else:
+                selected = selected[:min(self.settings.batch_size, remaining)]
             if not selected:
                 raise ValueError("No unloaded observations match this selection")
             self._check_storage()
@@ -294,7 +310,7 @@ class Jobs:
             key = cache_key(manifest.query)
             self.cache[key] = job_id
             self.futures[job_id] = self.executor.submit(
-                self._run, job_id, manifest.query, self.root / job_id, key, selected, channels
+                self._run, job_id, manifest.query, self.root / job_id, key, selected, channels, metadata_only
             )
             return job_id
 
@@ -358,7 +374,7 @@ class Jobs:
         except OSError:
             logger.exception("Could not persist timings for job %s", job.job_id)
 
-    def _run(self, job_id: str, query: Query, directory: Path, key: str, ids=None, channels=None):
+    def _run(self, job_id: str, query: Query, directory: Path, key: str, ids=None, channels=None, metadata_only=False):
         job = self.records[job_id]
         cancelled = self.cancel_events[job_id]
         priority = self.priority_loads[job_id]
@@ -393,11 +409,16 @@ class Jobs:
                 options = {"channels": channels} if channels else {}
                 if isinstance(self.pipeline, Pipeline):
                     options["priority"] = priority
+                if metadata_only:
+                    options["metadata_only"] = True
                 result = self.pipeline.load(job.manifest, ids, directory, job_id, report,
                                             publish=publish, timing=timing, **options)
             elif isinstance(self.pipeline, Pipeline):
+                with self.lock:
+                    hint = self.channel_catalogs.get((query.ra_deg, query.dec_deg, query.start_utc, query.end_utc))
                 result = self.pipeline.run(
-                    query, directory, job_id, report, publish=publish, timing=timing, priority=priority
+                    query, directory, job_id, report, publish=publish, timing=timing, priority=priority,
+                    catalog_hint=hint[1] if hint and hint[2] and hint[0] > time.monotonic() else ()
                 )
             else:
                 result = self.pipeline.run(query, directory, job_id, report)
@@ -463,34 +484,49 @@ class Jobs:
         finally:
             self.channel_lookups.release()
 
-    def field_channels(self, query: Query, detector: str, cursor: int):
+    def field_channels(self, query: Query, detector: str, cursor: int, *, progressive=False):
         if not self.channel_lookups.acquire(blocking=False):
             raise CapacityError("Wavelength lookups are busy. Retry shortly.")
         try:
-            key = (query.ra_deg, query.dec_deg, query.start_utc, query.end_utc)
-            with self.lock:
-                cached = self.channel_catalogs.get(key)
-            if cached and cached[0] > time.monotonic():
-                rows, complete = cached[1:]
-            else:
-                archive = self.pipeline.archive
-                rows, notes = archive.search(query.model_copy(update={"live": True}),
-                                             time.monotonic() + self.settings.metadata_seconds)
-                complete = not any(n.startswith("Partial metadata:") for n in notes)
-                if complete:
-                    with self.lock:
-                        self.channel_catalogs[key] = time.monotonic() + 120, rows, complete
-                        self.channel_catalogs.move_to_end(key)
-                        if len(self.channel_catalogs) > 8:
-                            self.channel_catalogs.popitem(last=False)
+            rows, complete = self._field_catalog(query)
             manifest = Manifest(query=query, retrieved_at=datetime.now(UTC).isoformat(),
                                 discovery_complete=complete,
                                 observations=[o.record() for o in rows if o.detector == detector])
-            return self._detector_channels(manifest, detector, cursor)
+            return self._detector_channels(manifest, detector, cursor, progressive)
         finally:
             self.channel_lookups.release()
 
-    def _detector_channels(self, manifest: Manifest, detector: str, cursor: int):
+    def _field_catalog(self, query):
+        key = (query.ra_deg, query.dec_deg, query.start_utc, query.end_utc)
+        with self.lock:
+            cached = self.channel_catalogs.get(key)
+            if cached and cached[0] > time.monotonic():
+                return cached[1:]
+            reading = self.catalog_reads.get(key)
+            owner = reading is None
+            if owner:
+                self.catalog_reads[key] = reading = Future()
+        if not owner:
+            return reading.result()
+        try:
+            rows, notes = self.pipeline.archive.search(query.model_copy(update={"live": True}),
+                                                       time.monotonic() + self.settings.metadata_seconds)
+            complete = not any(n.startswith("Partial metadata:") for n in notes)
+            with self.lock:
+                self.channel_catalogs[key] = time.monotonic() + (120 if complete else 15), rows, complete
+                self.channel_catalogs.move_to_end(key)
+                if len(self.channel_catalogs) > 8:
+                    self.channel_catalogs.popitem(last=False)
+            reading.set_result((rows, complete))
+            return rows, complete
+        except Exception as exc:
+            reading.set_exception(exc)
+            raise
+        finally:
+            with self.lock:
+                self.catalog_reads.pop(key, None)
+
+    def _detector_channels(self, manifest: Manifest, detector: str, cursor: int, progressive=False):
         records = sorted((r for r in manifest.observations if r.detector == detector),
                          key=lambda r: r.id)
         frames = {f.observation_id: f.channel for f in manifest.frames if f.detector == detector}
@@ -517,7 +553,38 @@ class Jobs:
         page = pending[:self.settings.batch_size]
         unavailable = 0
         deadline = time.monotonic() + min(self.settings.metadata_seconds, 30)
-        if page:
+        in_progress = 0
+        if progressive and archive:
+            # Keep page boundaries fixed while late results enter the cache.
+            end = cursor + self.settings.batch_size
+            page = [(i, row) for i, row in pending if i < end]
+            futures = {}
+            with self.lock:
+                for _, row in page:
+                    key = (row.source_url, query.ra_deg, query.dec_deg)
+                    if key not in self.header_reads:
+                        if len(self.header_reads) >= 64:
+                            stale = next((k for k, f in self.header_reads.items() if f.done()), None)
+                            if stale is None:
+                                raise CapacityError("Wavelength lookups are busy. Retry shortly.")
+                            del self.header_reads[stale]
+                        self.header_reads[key] = self.header_pool.submit(archive.spectral_at, row.source_url, query, deadline)
+                    futures[key] = self.header_reads[key]
+            if futures and not labels:
+                wait(futures.values(), timeout=.25, return_when=FIRST_COMPLETED)
+            for future in futures.values():
+                if not future.done():
+                    in_progress += 1
+                elif info := future.result():
+                    labels.add(f"{detector} {info['wavelength_um']:.6f} µm ({info['processing_version']})")
+                else:
+                    unavailable += 1
+            if not in_progress:
+                with self.lock:
+                    for key, future in futures.items():
+                        if self.header_reads.get(key) is future:
+                            del self.header_reads[key]
+        elif page:
             with ThreadPoolExecutor(max_workers=min(self.settings.cutout_workers, 4)) as pool:
                 lookups = [pool.submit(archive.spectral_at, r.source_url, query, deadline)
                            for _, r in page] if archive else []
@@ -531,7 +598,8 @@ class Jobs:
         more = pending[len(page):]
         return {
             "channels": sorted(labels, key=lambda label: (channel_parameters(label) or ("", 0, label))),
-            "unavailable": unavailable, "next_cursor": more[0][0] if more else None,
+            "unavailable": unavailable, "pending": in_progress,
+            "next_cursor": cursor if in_progress else more[0][0] if more else None,
             "total": len(records), "catalog_complete": manifest.discovery_complete,
         }
 

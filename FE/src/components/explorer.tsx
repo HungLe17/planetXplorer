@@ -39,8 +39,12 @@ import ImageControls from "./image-controls";
 import WorkspacePanel from "./workspace-panel";
 import { CycleCatalog, ExposureTable } from "./observation-catalog";
 import SearchBands from "./search-bands";
+import MatchedPicker from "./matched-picker";
+import { matchedSpectra } from "@/lib/matched-spectra";
+import Notification, { NotificationBell, NotificationCenter } from "./notification";
+import PanelResizer from "./panel-resizer";
 import { ObjectPanel, useKnownObjects } from "./known-objects";
-import { draftBands, fieldKey, inSearch, readBands, selectedBands, type BandDraft } from "@/lib/search-bands";
+import { draftBands, fieldKey, inSearch, nextSpectrumBatch, readBands, selectedBands, type BandDraft } from "@/lib/search-bands";
 import {
   activeChannels,
   activeDetectors,
@@ -56,6 +60,7 @@ import {
   readBackup,
   readDisplay,
   snapshot,
+  defaultFieldNames,
   type Backup,
   type Config,
   type Entry,
@@ -71,7 +76,7 @@ import {
   cancelJob,
   loadObservations,
 } from "@/lib/api";
-import { angularWidth, parseQuery, queryUrl } from "@/lib/view-url";
+import { angularWidth, parseQuery, queryUrl, separationDays } from "@/lib/view-url";
 type LoadBatch = {
   jobId: string;
   ids?: string[];
@@ -82,8 +87,10 @@ type LoadBatch = {
   automatic?: boolean;
   resume?: boolean;
   channels?: Query["channels"];
+  metadataOnly?: boolean;
 };
 const empty: Frame[] = [];
+type RestorePosition = Entry["position"] & { scope?: Entry["scope"] };
 function mapRequest(display: Display) {
   return {
     detectors: activeDetectors(display),
@@ -134,6 +141,8 @@ export default function Explorer() {
   const [preferredEpoch, setPreferredEpoch] = useState("");
   const [datesOpen, setDatesOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(true);
+  const [canvasFocused, setCanvasFocused] = useState(false);
+  const savedLocations = useRef<HTMLDetailsElement>(null);
   const [fieldJobId, setFieldJobId] = useState("");
   const [sequenceId, setSequenceId] = useState("");
   const [viewMode, setViewMode] = useState<"visits" | "browse" | "matched">(
@@ -154,6 +163,7 @@ export default function Explorer() {
   const setInvert = (invert: boolean) => update({ invert });
   const { speed, zoom, invert } = display;
   const [fov, setFov] = useState("300");
+  const [minDays, setMinDays] = useState<string | null>(null);
   const [bandDraft, setBandDraft] = useState<BandDraft>({ D1: null });
   const field = useMemo(() => {
     try { return { ...parseQuery(ra, dec, start, end), fov_arcsec: angularWidth(fov) }; }
@@ -161,8 +171,11 @@ export default function Explorer() {
   }, [ra, dec, start, end, fov]);
   const searchBands = selectedBands(bandDraft, fieldKey(field));
   const [entries, setEntries] = useState<Entry[]>([]);
+  const [fieldNames, setFieldNames] = useState(defaultFieldNames);
   const [consent, setConsent] = useState<boolean | null>(null);
   const [selection, setSelection] = useState<PixelBox | null>(null);
+  const [timelineChoices, setTimelineChoices] = useState<Record<string,boolean>>({});
+  const [displayedQuery, setDisplayedQuery] = useState<Query | null>(null);
   const pixel: [number, number] | null = selection
     ? [
         Math.floor((selection[0] + selection[2]) / 2),
@@ -176,10 +189,8 @@ export default function Explorer() {
   const priorityRequests = useRef(new Map<string, Promise<void>>());
   const priorityAcknowledged = useRef(0);
   const priorityController = useRef<AbortController | null>(null);
-  const announcedCycles = useRef(new Set<string>());
-  const visitDialog = useRef<HTMLDialogElement>(null);
   const restoreFrame = useRef("");
-  const restorePosition = useRef<Entry["position"] | null>(null);
+  const restorePosition = useRef<RestorePosition | null>(null);
   const timing = useRef<{
     query: Query;
     job: string;
@@ -188,7 +199,11 @@ export default function Explorer() {
   } | null>(null);
   const lastSaved = useRef<Backup | null>(null);
   const hasCycles = !!manifest?.visits?.some(v => v.kind !== "supplemental");
-  const science = useImages(manifest, display, viewMode !== "visits" || !hasCycles);
+  const [referenceCycle, setReferenceCycle] = useState<string | null>(null);
+  const [differenceMapId, setDifferenceMapId] = useState("");
+  const subtracting = viewMode === "visits" && hasCycles && referenceCycle !== null;
+  const science = useImages(manifest, display, viewMode !== "visits" || !hasCycles, timelineChoices, displayedQuery,
+    subtracting ? referenceCycle : null, differenceMapId);
   const [dockOpen, setDockOpen] = useState(true);
   const [committed, setCommitted] = useState<Query | null>(null);
   const bandsEdited = !!committed?.live && (
@@ -198,43 +213,39 @@ export default function Explorer() {
   const controller = useRef<AbortController | null>(null),
     generation = useRef(0),
     activeJob = useRef<string | null>(null);
-  const [displayedQuery, setDisplayedQuery] = useState<Query | null>(null);
   const allFrames = manifest?.frames ?? empty;
   const batchSize = Math.max(
     1,
     Math.min(8, manifest?.processing?.batch_size ?? 8),
   );
-  const sequences = manifest?.sequences ?? [];
-  const sequence =
-    sequences.find((s) => s.id === sequenceId) ||
-    [...sequences].sort((a, b) => b.frame_ids.length - a.frame_ids.length)[0];
+  const spectra = useMemo(() => matchedSpectra(manifest, timelineChoices, displayedQuery?.min_separation_days),
+    [manifest, timelineChoices, displayedQuery?.min_separation_days]);
+  const sequence = spectra.find(s => s.id === sequenceId) ?? spectra.find(s => s.sequenceIds.includes(sequenceId)) ?? spectra[0];
   const derived = viewMode === "visits" && hasCycles;
   const matched = viewMode === "matched" && !derived;
-  const frames = useMemo(
-      () =>
-        matched
-          ? science.frames.filter(
-              (f) => sequence && f.sequence_id === sequence.id,
-            )
-          : science.frames,
-      [matched, science.frames, sequence],
-    ),
+  const matchedSteps = sequence?.epochs;
+  const frames = useMemo(() => {
+    if (!matched) return science.frames;
+    const byId = new Map(science.frames.map(f => [f.observation_id, f]));
+    return (matchedSteps ?? []).flatMap(step => byId.get(step.source.observation_id) ?? []);
+  }, [matched, matchedSteps, science.frames]),
     index = Math.max(
       0,
       frames.findIndex((f) => f.observation_id === selectedFrame || (derived && f.visit_id === selectedFrame)),
     ),
     frame = frames[index];
   const isVisitMap = !!frame?.visit_id && frame.observation_id === frame.visit_id;
-  const steps = science.steps;
+  const steps = matched ? (matchedSteps ?? []) : science.steps;
   const cycleIndex = frame ? steps.findIndex(({ visit }) =>
     frame.visit_id === visit.id || visit.observation_ids.includes(frame.observation_id)) : -1;
   const selectCycle = useCallback((position: number) => {
     const step = steps[position];
     if (!step) return;
-    restoreFrame.current = step.visit.id;
-    setViewMode("visits");
-    setSelectedFrame(step.visit.id);
-  }, [steps]);
+    const key = matched ? step.source.observation_id : step.visit.id;
+    restoreFrame.current = key;
+    if (!matched) setViewMode("visits");
+    setSelectedFrame(key);
+  }, [steps, matched]);
   // A raw exposure outside a cycle can jump to the nearest cycle in either direction.
   const previousCycle = cycleIndex >= 0 ? cycleIndex - 1
     : steps.findLastIndex(s => frame && Date.parse(s.visit.end_utc) < Date.parse(frame.observed_at));
@@ -243,6 +254,8 @@ export default function Explorer() {
   const product = frame
     ? science.result[science.frames.indexOf(frame)]
     : undefined;
+  const residual = product?.subtraction && pixel
+    ? product.layers[0].values[pixel[1] * science.width + pixel[0]] : undefined;
   const contributors = useMemo(() => {
     if (!frame) return empty;
     if (!isVisitMap) return [frame];
@@ -275,12 +288,31 @@ export default function Explorer() {
     visit_id: f.visit_id,
     observed_at: f.observed_at,
     detector: f.detector as Observation["detector"],
+    channel: f.channel,
+    nominal_channel: f.nominal_channel,
+    wavelength_um: f.wavelength_um,
+    bandwidth_um: f.bandwidth_um,
     release: f.release ?? "—",
     source_url: f.source_url ?? "",
     status: "ready",
   })), [observations, allFrames]);
   const cycleCount = catalogVisits?.filter(v => v.kind !== "supplemental").length ?? 0;
-  const visibleMaps = useMemo(() => new Set(steps.map(s => s.visit.id)), [steps]);
+  const visibleMaps = useMemo(() => new Set(science.steps.map(s => s.visit.id)), [science.steps]);
+  const timelineChecklist = {
+    choices: timelineChoices,
+    includedIds: science.includedIds,
+    frameReasons: science.frameReasons,
+    withinBands: (record: Observation) => inSearch(record, displayedQuery),
+    setIncluded: setTimelineIncluded,
+  };
+  function setTimelineIncluded(id: string, included: boolean) {
+    setPlaying(false);
+    setTimelineChoices(old => ({...old, [id]:included}));
+    if (included && !frameByObservation.has(id)) {
+      const record = catalogRecords.find(row => row.id === id);
+      if (record && (!busy || activeJob.current === fieldJobId)) requestRecord(record);
+    }
+  }
   function inspectRecord(record: Observation) {
     const raw = frameByObservation.get(record.id);
     setDockExpanded(false);
@@ -295,6 +327,11 @@ export default function Explorer() {
       setViewMode("browse");
       setSelectedFrame(record.id);
       setPlaying(false);
+      requestRecord(record);
+    }
+  }
+  function requestRecord(record: Observation) {
+      if (!displayedQuery || !fieldJobId || !inSearch(record, displayedQuery)) return;
       const key = fieldJobId + "/" + record.id;
       if (priorityRequests.current.has(key)) return;
       if (!priorityController.current || priorityController.current.signal.aborted)
@@ -312,7 +349,6 @@ export default function Explorer() {
         if (priorityRequests.current.get(key) === accepted) priorityRequests.current.delete(key);
       });
       priorityRequests.current.set(key, accepted);
-    }
   }
   function openCycle(id: string) {
     setDockExpanded(false);
@@ -349,15 +385,6 @@ export default function Explorer() {
   const cycleMembers = useMemo(() => new Set(manifest?.visits?.filter(v =>
     v.kind !== "supplemental" && v.status !== "invalid").flatMap(v => v.observation_ids)), [manifest?.visits]);
   const requestedId = restoreFrame.current;
-  useEffect(() => {
-    const dialog = visitDialog.current;
-    if (!dialog) return;
-    const keys = conflicts.map(v => fieldJobId + "/" + v.id);
-    if (keys.some(key => !announcedCycles.current.has(key))) {
-      keys.forEach(key => announcedCycles.current.add(key));
-      if (!dialog.open) dialog.showModal();
-    } else if (!keys.length && dialog.open) dialog.close();
-  }, [conflicts, fieldJobId]);
   const filteredObservations = useMemo(
     () =>
       (observations || []).filter(
@@ -373,12 +400,9 @@ export default function Explorer() {
   );
   const selectable = filteredObservations.filter(o => inSearch(o, displayedQuery));
   const canRequest = (record: Observation) => (!busy || fieldJobId === activeJob.current) && inSearch(record, displayedQuery);
-  const pendingCount = selectable.filter(
-    (o) => o.status === "pending",
-  ).length;
-  const failedRecords = selectable.filter(
-    (o) => o.status === "failed",
-  );
+  const pendingRecords = selectable.filter(o => o.status === "pending" && o.selection !== "unavailable");
+  const nextPending = nextSpectrumBatch(pendingRecords, manifest?.processing, batchSize);
+  const nextFailed = nextSpectrumBatch(selectable.filter(o => o.status === "failed"), manifest?.processing, batchSize);
   const unmatchedFrames =
     !matched &&
     !derived &&
@@ -386,6 +410,7 @@ export default function Explorer() {
       1;
   function setMode(mode: "visits" | "browse" | "matched") {
     setPlaying(false);
+    setReferenceCycle(null);
     setViewMode(mode);
     if (mode === "matched" && sequence) setSequenceId(sequence.id);
   }
@@ -443,19 +468,22 @@ export default function Explorer() {
     version: 2,
     exported: new Date().toISOString(),
     locations: entries,
+    fieldNames,
     config: configuration,
     snapshot: snapshot(manifest),
     snapshotComplete: manifest?.processing?.archive_complete === true,
   };
   const position =
     displayedQuery && pixel && science.width
-      ? skyPosition(displayedQuery, ...pixel, science.width, science.height)
+      ? skyPosition(displayedQuery, ...pixel, science.width, science.height, manifest?.processing?.grid_header)
       : displayedQuery;
-  const selectedEntry =
+  const selectedEntry: Omit<Entry, "id" | "name" | "note" | "fields"> | null =
     position && frame
       ? {
           position: { ra_deg: position.ra_deg, dec_deg: position.dec_deg },
-          config: configuration,
+          config: {...configuration, fov:displayedQuery?.fov_arcsec ?? configuration.fov},
+          scope: selection && science.width && science.height
+            ? {kind:"region", box:selection, width:science.width, height:science.height} : {kind:"frame"},
           sources: (product
             ? [...product.inputs, ...product.reference]
             : [frame]
@@ -507,16 +535,23 @@ export default function Explorer() {
       } catch {
         setError("Could not save the workspace on this device.");
       }
-  }, [consent, display, displayedQuery, entries, fov, frame, manifest]);
+  }, [consent, display, displayedQuery, entries, fieldNames, fov, frame, manifest]);
   useEffect(() => {
     if (restorePosition.current && displayedQuery && science.width) {
-      const point = skyPixel(
-        displayedQuery,
-        restorePosition.current,
-        science.width,
-        science.height,
-      );
-      if (point) setSelection([point[0], point[1], point[0], point[1]]);
+      const scope = restorePosition.current.scope;
+      if (scope?.kind === "frame") setSelection(null);
+      else if (scope?.kind === "region") {
+        if (scope.width === science.width && scope.height === science.height) {
+          setSelection(scope.box);
+          setInspectorOpen(true);
+        } else {
+          setSelection(null);
+          setNotice("The saved region uses a different image grid. Its pixel boundaries could not be restored.");
+        }
+      } else {
+        const point = skyPixel(displayedQuery, restorePosition.current, science.width, science.height);
+        if (point) setSelection([point[0], point[1], point[0], point[1]]);
+      }
       restorePosition.current = null;
     }
   }, [displayedQuery, science.width, science.height]);
@@ -530,11 +565,18 @@ export default function Explorer() {
   }
   const canPlay =
     ready && steps.length > 1 && (!busy || committed === displayedQuery);
+  const toggleMotion = useCallback(() => {
+    if (playing) setPlaying(false);
+    else if (canPlay) {
+      if (!derived || cycleIndex < 0) selectCycle(Math.max(0, cycleIndex));
+      setPlaying(true);
+    }
+  }, [playing, canPlay, derived, cycleIndex, selectCycle]);
   const load = useCallback(
     async (
       query: Query,
       wantedFrame = "",
-      wantedPosition: Entry["position"] | null = null,
+      wantedPosition: RestorePosition | null = null,
       more?: LoadBatch,
     ) => {
       controller.current?.abort();
@@ -547,7 +589,7 @@ export default function Explorer() {
       let publication = "";
       let targetSelected = false;
       let firstFramePublished = false;
-      let previousPendingCount = Infinity;
+      const submittedBatches = new Set(more?.ids ? [JSON.stringify([!!more.metadataOnly, more.ids])] : []);
       const before = new Set(
         observedFrames.current.map((f) => f.observation_id),
       );
@@ -579,6 +621,7 @@ export default function Explorer() {
               more.ids ?? more.recordIds?.slice(0, more.size),
               more.detector,
               more.channels,
+              more.metadataOnly,
             )
           : await submit(query, abort.signal);
         let deadline = Date.now() + 180000;
@@ -633,6 +676,8 @@ export default function Explorer() {
                   restorePosition.current = wantedPosition;
                   setSelection(null);
                   setSelectedFrame("");
+                  setTimelineChoices({});
+                  setReferenceCycle(null);
                   setSequenceId("");
                   const restoreRaw = wantedFrame && (
                     result.frames.some(f => f.observation_id === wantedFrame) ||
@@ -700,16 +745,20 @@ export default function Explorer() {
                   (!more.recordIds || more.recordIds.includes(o.id)),
               );
               if (remaining.length) {
-                if (remaining.length >= previousPendingCount)
+                const next = nextSpectrumBatch(remaining, job.manifest.processing, more.size);
+                const signature = JSON.stringify([!!next.metadataOnly, next.ids]);
+                if (submittedBatches.has(signature))
                   throw new Error(
                     "Loading stopped because the last batch made no progress. Retry the pending observations.",
                   );
-                previousPendingCount = remaining.length;
+                submittedBatches.add(signature);
                 await loadObservations(
                   id,
                   abort.signal,
-                  remaining.slice(0, more.size).map((o) => o.id),
+                  next.ids,
                   more.detector,
+                  undefined,
+                  next.metadataOnly,
                 );
                 deadline = Date.now() + 150000;
                 continue;
@@ -780,7 +829,7 @@ export default function Explorer() {
       !observations ||
       !displayedQuery?.live ||
       displayedQuery !== committed ||
-      !fieldJobId || !manifest?.visits?.length
+      !fieldJobId || !manifest || (!manifest.visits?.length && !manifest.processing?.sampling_tracks)
     )
       return;
     const detectors = activeDetectors(display);
@@ -790,7 +839,11 @@ export default function Explorer() {
         .filter(key => key.startsWith("exposure:"))
         .map(key => key.slice(9)),
     );
-    const wanted = observations.filter((o) => o.status === "pending" && o.selection !== "unavailable" && inSearch(o, displayedQuery));
+    const samplingOrder = manifest.processing?.sampling_order;
+    const representativeRank = new Map(samplingOrder?.map((id, i) => [id, i]));
+    const metadataIds = new Set(manifest.processing?.sampling_metadata_ids);
+    const wanted = observations.filter(o => (o.status === "pending" || (o.status === "ready" && metadataIds.has(o.id))) &&
+      o.selection !== "unavailable" && inSearch(o, displayedQuery));
     const needed = (o: (typeof wanted)[number]) => {
       if (pinnedIds.has(o.id)) return true;
       const detector = detectors.find((d) => d === o.detector);
@@ -803,7 +856,14 @@ export default function Explorer() {
       );
     };
     const priority = (o: (typeof wanted)[number]) => {
-      if (requestedId === o.id || pinnedIds.has(o.id)) return -2;
+      if (requestedId === o.id || pinnedIds.has(o.id) || timelineChoices[o.id] === true) return -2;
+      if (requestSpectra && inspectorOpen && visitMembers.has(o.id)) return -1;
+      if (samplingOrder) {
+        if (o.status === "pending" && timelineChoices[o.id] !== false && representativeRank.has(o.id)) return 0;
+        if (timelineChoices[o.id] !== false && metadataIds.has(o.id)) return 1;
+        return display.prefetchBands ? 3 : 4;
+      }
+      // Older manifests have no archive sampling plan. Use their existing map inputs.
       if (
         requestedId &&
         manifest.visits?.some(
@@ -813,24 +873,28 @@ export default function Explorer() {
       )
         return -1;
       if (visitMembers.has(o.id) && cycleMembers.has(o.id) && needed(o)) return 0;
-      if (requestSpectra && inspectorOpen && visitMembers.has(o.id)) return 1;
       if ((cycleMembers.has(o.id) || !hasCycles) && needed(o)) return 2;
       return display.prefetchBands ? 3 : 4;
     };
-    const needsMapFilter = (o: Observation) => !!channels[o.detector]?.length &&
-      !display.prefetchBands && o.id !== requestedId && !pinnedIds.has(o.id) &&
+    const needsMapFilter = (o: Observation) => !samplingOrder && !!channels[o.detector]?.length &&
+      !display.prefetchBands && o.id !== requestedId && !pinnedIds.has(o.id) && !timelineChoices[o.id] &&
       !(requestSpectra && inspectorOpen && visitMembers.has(o.id));
-    const attemptKey = (o: Observation) => JSON.stringify([o.id, needsMapFilter(o) ? channels[o.detector] : null]);
+    const attemptKey = (o: Observation) => JSON.stringify([o.id, metadataIds.has(o.id), needsMapFilter(o) ? channels[o.detector] : null]);
     const queued = wanted
       .filter((o) => priority(o) < 4 && !attempted.current.has(attemptKey(o)))
-      .sort((a, b) => priority(a) - priority(b));
+      .sort((a, b) => priority(a) - priority(b) ||
+        (representativeRank.get(a.id) ?? Infinity) - (representativeRank.get(b.id) ?? Infinity));
     if (!queued.length) return;
     const narrow = needsMapFilter(queued[0]);
-    const batch = queued.filter(o => needsMapFilter(o) === narrow).slice(0, batchSize);
-    batch.forEach((o) => attempted.current.add(attemptKey(o)));
+    const eligible = queued.filter(o => needsMapFilter(o) === narrow &&
+      (!manifest.processing?.sampling_tracks || priority(o) === priority(queued[0])));
+    const {ids, metadataOnly} = nextSpectrumBatch(eligible, manifest.processing, batchSize);
+    const batchIds = new Set(ids);
+    for (const row of eligible) if (batchIds.has(row.id)) attempted.current.add(attemptKey(row));
     void load(displayedQuery, "", null, {
       jobId: fieldJobId,
-      ids: batch.map((o) => o.id),
+      ids,
+      metadataOnly,
       channels: narrow ? channels : undefined,
       size: batchSize,
       automatic: true,
@@ -843,6 +907,11 @@ export default function Explorer() {
     committed,
     fieldJobId,
     manifest?.visits,
+    manifest?.processing?.sampling_order,
+    manifest?.processing?.sampling_tracks,
+    manifest?.processing?.background_tracks,
+    manifest?.processing?.sampling_metadata_ids,
+    timelineChoices,
     display.maps,
     display.prefetchBands,
     requestSpectra,
@@ -904,6 +973,7 @@ export default function Explorer() {
         saved = readBackup(raw);
         lastSaved.current = saved;
         setEntries(saved.locations ?? []);
+        setFieldNames(saved.fieldNames ?? defaultFieldNames);
         setConsent(true);
       }
       const state = params.get("view");
@@ -915,6 +985,7 @@ export default function Explorer() {
         params.set("ra", String(q.ra_deg));
         params.set("dec", String(q.dec_deg));
         params.set("fov", String(q.fov_arcsec ?? 300));
+        if (q.min_separation_days !== undefined) params.set("min_days", String(q.min_separation_days));
         if (q.start_utc) params.set("start", q.start_utc.slice(0, 10));
         if (q.end_utc) params.set("end", q.end_utc.slice(0, 10));
         params.set("frame", saved.config.frame);
@@ -996,8 +1067,11 @@ export default function Explorer() {
       try {
         const bands = params.has("bands") ? readBands(JSON.parse(params.get("bands")!)) : mapRequest(openingDisplay);
         if (!bands.detectors.length) bands.detectors = ["D1"];
+        const spacing = params.get("min_days");
+        setMinDays(spacing);
         const query = {
           ...parseQuery(r, d, s, e),
+          ...(spacing === null ? {} : {min_separation_days: separationDays(spacing)}),
           fov_arcsec: angularWidth(params.get("fov") ?? "300"),
           live: true,
           ...bands,
@@ -1019,6 +1093,7 @@ export default function Explorer() {
     };
   }, [load]);
   useEffect(() => {
+    if (playing && steps.length < 2) setPlaying(false);
     if (!playing || !canPlay) return;
     const timer = setTimeout(() => {
       if (!loop && (nextCycle < 0 || nextCycle >= steps.length)) {
@@ -1035,16 +1110,21 @@ export default function Explorer() {
     };
     document.addEventListener("visibilitychange", hide);
     const keys = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
       if (e.key === "Escape") {
         if (document.querySelector("dialog[open]")) return;
+        if (canvasFocused) {
+          setCanvasFocused(false);
+          return;
+        }
         setInspectorOpen(false);
       }
-      if ((e.target as HTMLElement).closest("input,select,textarea,button,a"))
+      if ((e.target as HTMLElement).closest("input,select,textarea,button,a,summary,[role=separator],[contenteditable=true]"))
         return;
       if (e.code === "Space") {
         if (!canPlay && !playing) return;
         e.preventDefault();
-        setPlaying((p) => !p);
+        toggleMotion();
       }
       if (steps.length < 2) return;
       if (e.key === "ArrowRight") {
@@ -1063,7 +1143,7 @@ export default function Explorer() {
       document.removeEventListener("visibilitychange", hide);
       window.removeEventListener("keydown", keys);
     };
-  }, [canPlay, steps.length, playing, selectCycle, nextCycle, previousCycle]);
+  }, [canPlay, steps.length, playing, selectCycle, nextCycle, previousCycle, toggleMotion, canvasFocused]);
   const onReady = useCallback((value: boolean) => setReady(value), []);
   const onPaint = useCallback((query: Query) => {
     const run = timing.current;
@@ -1089,9 +1169,10 @@ export default function Explorer() {
     e.preventDefault();
     if (busy && !autoBusy) return;
     try {
-      if (!searchBands) throw Error("Choose at least one detector and confirm its subbands for this field.");
+      if (!searchBands) throw Error("Choose at least one detector and confirm its spectra for this field.");
       void load({
         ...parseQuery(ra, dec, start, end),
+        ...(minDays === null ? {} : {min_separation_days: separationDays(minDays)}),
         fov_arcsec: angularWidth(fov),
         live: true,
         ...searchBands,
@@ -1102,12 +1183,13 @@ export default function Explorer() {
   }
   function restoreConfig(
     c: Config,
-    wantedPosition: Entry["position"] | null = null,
+    wantedPosition: RestorePosition | null = null,
   ) {
     setDisplay(c.display);
     setFov(String(c.fov));
     if (c.query) {
       const q = c.query;
+      setMinDays(q.min_separation_days === undefined ? null : String(q.min_separation_days));
       const bands = q.detectors?.length ? readBands(q) : mapRequest(c.display);
       if (!bands.detectors.length) bands.detectors = ["D1"];
       setBandDraft(draftBands(bands, fieldKey({ ...q, fov_arcsec: c.fov })));
@@ -1124,6 +1206,7 @@ export default function Explorer() {
     }
   }
   function importBackup(b: Backup) {
+    if (b.fieldNames) setFieldNames(b.fieldNames);
     if (b.locations)
       setEntries((old) =>
         Array.from(
@@ -1162,29 +1245,24 @@ export default function Explorer() {
     selectCycle(position);
   }
   return (
-    <div className={"app-layout" + (settingsOpen ? "" : " settings-collapsed")}>
+    <NotificationCenter><div className={"app-layout" + (settingsOpen ? "" : " settings-collapsed") + (canvasFocused ? " canvas-focused" : "")}>
       <a className="skip-link" href="#workspace">
         Skip to workspace
       </a>
       <header className="app-header">
-        <a className="brand" href="/" aria-label="Planet X home">
+        <a className="brand" href="/" aria-label="planetXplorer home">
           <span className="brand-mark">
             <Crosshair size={21} strokeWidth={1.5} />
           </span>
           <span>
-            Planet <b>X</b>
+            planet<b>X</b>plorer
           </span>
         </a>
+        <div className="header-context">
+          <span>SPHEREx / IRSA</span>
+          <span>Observation workspace</span>
+        </div>
         <div className="header-actions">
-          <button
-            className="button mobile-field-toggle"
-            aria-label="Toggle field settings"
-            aria-expanded={settingsOpen}
-            onClick={() => setSettingsOpen((v) => !v)}
-          >
-            <SlidersHorizontal size={14} />
-            Field
-          </button>
           <button
             className="button share"
             onClick={share}
@@ -1193,9 +1271,72 @@ export default function Explorer() {
             {copied ? <Check size={14} /> : <Copy size={14} />}
             {copied ? "Link copied" : "Share field"}
           </button>
+          <NotificationBell />
         </div>
       </header>
-      <aside className="sidebar" aria-label="Query and display settings">
+      <div className="workspace-toolbar" role="toolbar" aria-label="Workspace tools">
+        <div className="toolbar-group">
+          <span className="toolbar-label">Field</span>
+          <button className="toolbar-button" aria-label="Toggle field settings"
+            aria-controls="settings-panel" aria-expanded={settingsOpen && !canvasFocused}
+            aria-pressed={settingsOpen && !canvasFocused}
+            title="Show or hide field settings"
+            onClick={() => { setCanvasFocused(false); setSettingsOpen(!settingsOpen || canvasFocused); }}>
+            <SlidersHorizontal size={14} /><span>Settings</span>
+          </button>
+          <button className="toolbar-button" aria-label="Open saved locations"
+            title="Open saved locations and workspace files"
+            onClick={() => {
+              setCanvasFocused(false);
+              setSettingsOpen(true);
+              setTab("Settings");
+              if (savedLocations.current) savedLocations.current.open = true;
+              requestAnimationFrame(() => {
+                savedLocations.current?.scrollIntoView({ block: "nearest" });
+                savedLocations.current?.querySelector("summary")?.focus({ preventScroll: true });
+              });
+            }}>
+            <Layers size={14} /><span>Locations</span>
+          </button>
+        </div>
+        <div className="toolbar-group">
+          <span className="toolbar-label">Panels</span>
+          <button className="toolbar-button" aria-label="Toggle observations"
+            aria-controls="observations-panel" aria-expanded={dockOpen && !canvasFocused}
+            aria-pressed={dockOpen && !canvasFocused} title="Show or hide the observation catalog"
+            onClick={() => { setCanvasFocused(false); setDockOpen(!dockOpen || canvasFocused); setDockExpanded(false); }}>
+            <Layers size={14} /><span>Observations</span>
+          </button>
+          <button className="toolbar-button" aria-label="Toggle frame details"
+            aria-controls="inspector-panel" aria-expanded={inspectorOpen && !canvasFocused}
+            aria-pressed={inspectorOpen && !canvasFocused} title="Show pixel spectra and frame details"
+            onClick={() => {
+              setCanvasFocused(false);
+              setInspectorOpen(!inspectorOpen || canvasFocused);
+              if (inspectorOpen && !canvasFocused) setSpectrumVisit("");
+            }}>
+            <PanelRight size={14} /><span>Details</span>
+          </button>
+          <button className="toolbar-button" aria-pressed={knownOpen && !canvasFocused}
+            disabled={!displayedQuery || !frame} title="Identify cataloged objects in this field"
+            onClick={() => { setCanvasFocused(false); setKnownOpen(!knownOpen || canvasFocused); }}>
+            <Crosshair size={14} /><span>Known objects</span>
+          </button>
+        </div>
+        <div className="toolbar-group toolbar-end">
+          <button className="toolbar-button" aria-label="Canvas only" aria-pressed={canvasFocused}
+            title={canvasFocused ? "Restore panels (Escape)" : "Hide panels to focus on the image"}
+            onClick={() => setCanvasFocused(!canvasFocused)}>
+            {canvasFocused ? <Minimize2 size={14} /> : <Maximize2 size={14} />}<span>Canvas only</span>
+          </button>
+          <button className="toolbar-button" title="Workflow and keyboard shortcuts"
+            onClick={() => { setCanvasFocused(false); setSettingsOpen(true); setTab("Help"); }}>
+            <Info size={14} /><span>Help</span>
+          </button>
+        </div>
+      </div>
+      <aside className="sidebar" id="settings-panel" aria-label="Query and display settings">
+        <PanelResizer panel="settings" />
         <nav className="panel-tabs" aria-label="Settings navigation">
           {["Settings", "Surveys", "Links", "Help", "About"].map((value) => (
             <button
@@ -1211,7 +1352,7 @@ export default function Explorer() {
         <div className="settings-scroll">
           <div hidden={tab !== "Settings"}>
             <details className="sidebar-section" open>
-              <summary>Search</summary>
+              <summary><span className="workflow-step" aria-hidden="true">01</span><span>Search</span></summary>
               <form className="search-panel" onSubmit={search} noValidate>
                 <div className="control-section-heading">
                   <span>Sky coordinates</span>
@@ -1320,6 +1461,17 @@ export default function Explorer() {
                   </div>
                 )}
                 <SearchBands query={field} draft={bandDraft} change={setBandDraft} />
+                <div className="sampling-options">
+                  <label htmlFor="time-sampling">Time sampling</label>
+                  <select id="time-sampling" value={minDays === null ? "auto" : "days"}
+                    onChange={e => setMinDays(e.target.value === "auto" ? null : "30")}>
+                    <option value="auto">Auto · one per cycle and wavelength</option>
+                    <option value="days">Minimum separation in days</option>
+                  </select>
+                  {minDays !== null && <label>Minimum separation (days)
+                    <input name="min_days" type="number" min="0" step="any" required value={minDays}
+                      onChange={e => setMinDays(e.target.value)} /></label>}
+                </div>
                 <div className="query-actions">
                   <button
                     className="button primary"
@@ -1357,6 +1509,7 @@ export default function Explorer() {
                         setSelected("");
                         setDisplay(defaults);
                         setBandDraft({ D1: null });
+                        setMinDays(null);
                         setFov("300");
                         setError("");
                         setNotice("");
@@ -1380,7 +1533,7 @@ export default function Explorer() {
               </label>
             </details>
             <details className="sidebar-section" open>
-              <summary>Spectrum</summary>
+              <summary><span className="workflow-step" aria-hidden="true">02</span><span>Spectrum</span></summary>
               {frame?.previewScale ||
               (manifest?.frames.length && !science.numeric) ? (
                 <p className="preview-note">
@@ -1390,33 +1543,31 @@ export default function Explorer() {
                 </p>
               ) : null}
               <ImageControls
-                fieldJobId={fieldJobId}
                 s={display}
-                update={(patch) => {
+                manifest={manifest}
+                update={(patch, keepView) => {
                   setAutoPaused(false);
-                  setViewMode("visits");
+                  if (!keepView) setViewMode("visits");
                   update(patch);
                 }}
-                frames={manifest?.frames ?? empty}
-                observations={observations}
-                bounds={science.bounds}
               />
             </details>
-            <details className="sidebar-section">
-              <summary>Saved locations</summary>
+            <details className="sidebar-section" ref={savedLocations}>
+              <summary><span className="workflow-step" aria-hidden="true">03</span><span>Saved locations</span></summary>
               <WorkspacePanel
                 backup={backup}
                 saveEntries={setEntries}
+                saveFieldNames={setFieldNames}
                 selected={selectedEntry}
                 consent={consent}
                 setConsent={allowSave}
                 restore={importBackup}
-                reopen={(e) => restoreConfig(e.config, e.position)}
+                reopen={(e) => restoreConfig(e.config, {...e.position, scope:e.scope})}
                 onError={setError}
               />
             </details>
             <details className="sidebar-section">
-              <summary>Playback and appearance</summary>
+              <summary><SlidersHorizontal size={12} aria-hidden="true" /><span>Playback and appearance</span></summary>
               <section className="control-section">
                 <div className="control-section-heading">
                   <span>Playback & scale</span>
@@ -1528,21 +1679,28 @@ export default function Explorer() {
                   <p>
                     The field of view defines the sky area retrieved. Zoom only
                     magnifies the displayed pixels. Click a pixel or left-drag a
-                    region for Details. Right-drag to pan and use two fingers to
-                    pan or zoom on touchscreens.
+                    region with Select (V) for Details. Choose Pan (H) to move
+                    the image, or right-drag with either tool. Use two fingers
+                    to pan or zoom on touchscreens.
                   </p>
                   <p>
-                    Play blinks between loaded observations in acquisition
-                    order. Use Space to play or pause and arrow keys to step.
+                    Play compares observing cycles at matched wavelengths.
+                    Expand a cycle in Observations to choose its frames.
+                    Use Space to play or pause and arrow keys to step.
                   </p>
                   <p>
                     Inversion changes the displayed colors. Compare matching
                     wavelengths before interpreting changes in brightness.
                   </p>
+                  <p>
+                    Use Locations to save a field or selection. Canvas only
+                    hides the panels; press Escape to restore them. On the
+                    image, + / − zooms, F fits, and 1 shows native pixels.
+                  </p>
                 </>
               ) : (
                 <>
-                  <h2>Planet X</h2>
+                  <h2>planetXplorer</h2>
                   <p>
                     A workspace for inspecting infrared observations across
                     time.
@@ -1563,22 +1721,12 @@ export default function Explorer() {
       </aside>
       <main id="workspace">
         <div className="content">
-          <h1 className="sr-only">Planet X</h1>
+          <h1 className="sr-only">planetXplorer</h1>
           <div className="feedback" aria-live="polite">
             {conflicts.length > 0 && (
-              <button
-                className="button"
-                onClick={() => visitDialog.current?.showModal()}
-              >
-                Review visit errors ({conflicts.length})
-              </button>
-            )}
-            <dialog
-              className="visit-dialog"
-              aria-labelledby="visit-error-title"
-              ref={visitDialog}
-            >
-              <h2 id="visit-error-title">Incomplete or conflicting visits</h2>
+              <Notification key={fieldJobId + conflicts.map(v => v.id).join("/")} label="visit warning">
+              <details>
+              <summary>Incomplete or conflicting visits ({conflicts.length})</summary>
               <ul>
                 {conflicts.map((v) => (
                   <li key={v.id}>
@@ -1591,24 +1739,27 @@ export default function Explorer() {
                 Inspect individual exposures in Browse or in the observation
                 table.
               </p>
-              <form method="dialog">
-                <button className="button">Close</button>
-              </form>
-            </dialog>
+              </details>
+              </Notification>
+            )}
             {committed &&
               !busy &&
-              (bandsEdited || Number(ra) !== committed.ra_deg ||
+              (bandsEdited || (minDays === null ? undefined : Number(minDays)) !== committed.min_separation_days ||
+                Number(ra) !== committed.ra_deg ||
                 Number(dec) !== committed.dec_deg ||
                 Number(fov) !== (committed.fov_arcsec ?? 300) ||
                 start !== (committed.start_utc?.slice(0, 10) || "") ||
                 end !== (committed.end_utc?.slice(0, 10) || "")) && (
+                <Notification label="edited search notice">
                 <p>
                   <Info size={14} />
                   Query edited. The viewer still shows the last searched field.
                   Search to apply changes.
                 </p>
+                </Notification>
               )}
             {busy && (
+              <Notification label="search progress">
               <p className="processing">
                 <LoaderCircle size={14} className="spin" />
                 {displayedQuery === committed &&
@@ -1621,33 +1772,43 @@ export default function Explorer() {
                     : " Previous field shown."
                   : ""}
               </p>
+              </Notification>
             )}
             {!busy &&
               displayedQuery &&
               committed &&
               displayedQuery !== committed &&
               frames.length > 0 && (
+                <Notification label="previous field notice">
                 <p>
                   <Info size={14} />
                   Showing the previous field. The latest search has no result.
                 </p>
+                </Notification>
               )}
             {error && (
+              <Notification key={error} label="search error" onDismiss={() => setError("")}>
               <p role="alert" className="error">
                 <Info size={15} />
                 {error}
               </p>
+              </Notification>
             )}
             {science.failure && frames.length > 0 && (
-              <p role="alert">{science.failure}</p>
+              <Notification key={fieldJobId + science.failure} label="image data error">
+                <p role="alert">{science.failure}</p>
+              </Notification>
             )}
             {notice && (
+              <Notification key={fieldJobId + notice} label="search notice" onDismiss={() => setNotice("")}>
               <p>
                 <Info size={15} />
                 {notice}
               </p>
+              </Notification>
             )}
             {autoPaused && !busy && displayedQuery?.live && (
+              <Notification label="paused downloads">
               <button
                 className="button"
                 onClick={() => {
@@ -1657,6 +1818,7 @@ export default function Explorer() {
               >
                 Resume band loading
               </button>
+              </Notification>
             )}
           </div>
           <div
@@ -1670,30 +1832,12 @@ export default function Explorer() {
               times={epochs} epoch={epoch} changeEpoch={setPreferredEpoch} close={() => setKnownOpen(false)} />}
             <section className="viewer-section" aria-label="Observation viewer">
               <div className="section-heading">
+                <span className="viewer-document-title"><Crosshair size={13} />Observation viewer</span>
                 <span className="field-readout mono">
                   {displayedQuery && frames.length
-                    ? `${displayedQuery.ra_deg.toFixed(6)}, ${displayedQuery.dec_deg.toFixed(6)}`
-                    : ""}
+                    ? `RA ${displayedQuery.ra_deg.toFixed(6)}° · Dec ${displayedQuery.dec_deg.toFixed(6)}°`
+                    : "No field loaded"}
                 </span>
-                <div className="viewer-heading-actions">
-                  <button className={"inspector-toggle" + (knownOpen ? " is-active" : "")}
-                    aria-pressed={knownOpen} disabled={!displayedQuery || !frame}
-                    onClick={() => setKnownOpen(!knownOpen)}>Known objects</button>
-                  <button
-                    className={
-                      "inspector-toggle " + (inspectorOpen ? "is-active" : "")
-                    }
-                    aria-label="Toggle frame details"
-                    aria-expanded={inspectorOpen}
-                    onClick={() => {
-                      setInspectorOpen(!inspectorOpen);
-                      if (inspectorOpen) setSpectrumVisit("");
-                    }}
-                  >
-                    <PanelRight size={14} />
-                    <span>Details</span>
-                  </button>
-                </div>
               </div>
               {allFrames.length > 0 && (
                 <div className="sequence-toolbar">
@@ -1704,11 +1848,20 @@ export default function Explorer() {
                   >
                     {hasCycles && (
                       <button
-                        aria-pressed={derived}
+                        aria-pressed={derived && !subtracting}
                         onClick={() => setMode("visits")}
                       >
                         Visits
                       </button>
+                    )}
+                    {hasCycles && (
+                      <button aria-pressed={subtracting} title="Subtract one calibrated cycle from the others"
+                        onClick={() => {
+                          if (subtracting) { setMode("visits"); return; }
+                          setMode("visits");
+                          setReferenceCycle(steps[0]?.visit.id ?? "");
+                          if (steps.length > 1 && cycleIndex <= 0) selectCycle(1);
+                        }}>Subtract</button>
                     )}
                     <button
                       aria-pressed={!matched && !derived}
@@ -1719,41 +1872,21 @@ export default function Explorer() {
                     </button>
                     <button
                       aria-pressed={matched}
-                      disabled={!sequences.some((s) => s.frame_ids.length)}
+                      disabled={!spectra.length}
                       onClick={() => setMode("matched")}
                       title="Inspect exposures with compatible wavelength and calibration"
                     >
                       Matched
                     </button>
                   </div>
-                  {matched && sequences.length > 0 ? (
-                    <>
-                      <label className="sr-only" htmlFor="sequence">
-                        Wavelength sequence
-                      </label>
-                      <select
-                        id="sequence"
-                        value={sequence?.id || ""}
-                        onChange={(e) => {
-                          setSequenceId(e.target.value);
-                          setSelectedFrame("");
-                          setPlaying(false);
-                        }}
-                      >
-                        {[...sequences]
-                          .filter((g) => g.frame_ids.length)
-                          .sort(
-                            (a, b) => b.frame_ids.length - a.frame_ids.length,
-                          )
-                          .map((g) => (
-                            <option key={g.id} value={g.id}>
-                              {g.detector} / {g.wavelength_um.toFixed(3)}{" "}
-                              microns / {g.frame_ids.length} frame
-                              {g.frame_ids.length === 1 ? "" : "s"}
-                            </option>
-                          ))}
-                      </select>
-                    </>
+                  {matched && sequence ? (
+                    <MatchedPicker spectra={spectra} selected={sequence} currentId={frame?.observation_id}
+                      stamp={stamp} select={(id, exposure) => {
+                        setPlaying(false);
+                        setSequenceId(id);
+                        restoreFrame.current = exposure;
+                        setSelectedFrame(exposure);
+                      }} />
                   ) : (
                     <span
                       className={
@@ -1764,6 +1897,8 @@ export default function Explorer() {
                     >
                       {unmatchedFrames
                         ? "Unmatched observations; brightness is not directly comparable."
+                        : subtracting
+                          ? "Cycle subtraction"
                         : derived && frame && !isVisitMap
                           ? "Cycle exposure · selected map inputs pending or unavailable"
                           : derived
@@ -1772,6 +1907,25 @@ export default function Explorer() {
                       {isVisitMap && visit?.status === "pending" && " · Provisional"}
                     </span>
                   )}
+                </div>
+              )}
+              {subtracting && science.difference && (
+                <div className="sequence-toolbar" role="group" aria-label="Cycle subtraction">
+                  {science.differenceMaps.length > 1 && <label>Map{" "}
+                    <select value={science.differenceMap?.id ?? ""} onChange={e => setDifferenceMapId(e.target.value)}>
+                      {science.differenceMaps.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                    </select></label>}
+                  <label>Reference cycle{" "}
+                    <select value={referenceCycle ?? ""} onChange={e => {setPlaying(false); setReferenceCycle(e.target.value);}}>
+                      <option value="">Earliest calibrated cycle</option>
+                      {!!referenceCycle && !science.difference.options.some(v => v.id === referenceCycle) &&
+                        <option value={referenceCycle}>Selected reference unavailable</option>}
+                      {science.difference.options.map(v => <option key={v.id} value={v.id}>{stamp(v.start_utc)}</option>)}
+                    </select>
+                  </label>
+                  <span className="browse-summary">
+                    Displayed cycle − reference · MJy/sr · {invert ? "inverted colors" : "orange brighter, blue fainter"}
+                  </span>
                 </div>
               )}
               <SkyViewer
@@ -1806,6 +1960,7 @@ export default function Explorer() {
                 }}
                 message={science.message}
                 grid={manifest?.grid}
+                gridHeader={manifest?.processing?.grid_header}
               />
               <div className="playback">
                 <div className="transport">
@@ -1827,7 +1982,7 @@ export default function Explorer() {
                     className="play"
                     aria-label={playing ? "Pause" : "Play"}
                     disabled={!canPlay && !playing}
-                    onClick={() => setPlaying((p) => !p)}
+                    onClick={toggleMotion}
                   >
                     {playing ? <Pause size={16} /> : <Play size={16} />}
                   </button>
@@ -1906,12 +2061,17 @@ export default function Explorer() {
               </div>
               {allFrames.length > 0 && steps.length < 2 && (
                 <div className="playback-guidance">
-                  {steps.length ? "One cycle available." : "No playable cycles."} Inspect individual exposures in Observations.
+                  {matched
+                    ? (steps.length ? "One matched epoch is available. Playback needs this spectrum at a second epoch."
+                                    : "No included exposures are available for this spectrum.")
+                    : <>{steps.length ? "One cycle available." : "No playable cycles."} Motion playback needs two cycles with matching wavelengths. Inspect individual exposures in Observations.</>}
                 </div>
               )}
             </section>
             {inspectorOpen && (
-              <aside className="inspector" aria-label="Frame details">
+              <aside className="inspector" id="inspector-panel" aria-label="Frame details">
+                <PanelResizer panel="inspector" />
+                <div className="inspector-scroll">
                 <div className="section-heading">
                   <h2>Frame details</h2>
                   <button
@@ -1922,20 +2082,22 @@ export default function Explorer() {
                     <X size={14} />
                   </button>
                 </div>
-                <Spectrum
-                  planes={detailPlanes}
-                  pixel={pixel}
-                  region={
-                    selection &&
-                    (selection[0] !== selection[2] ||
-                      selection[1] !== selection[3])
-                      ? selection
-                      : null
-                  }
-                  width={science.width}
-                  height={science.height}
-                  pending={pendingSpectrumInputs.length > 0}
-                />
+                {frame && (
+                  <Spectrum
+                    planes={detailPlanes}
+                    pixel={pixel}
+                    region={
+                      selection &&
+                      (selection[0] !== selection[2] ||
+                        selection[1] !== selection[3])
+                        ? selection
+                        : null
+                    }
+                    width={science.width}
+                    height={science.height}
+                    pending={pendingSpectrumInputs.length > 0}
+                  />
+                )}
                 {visit && (
                   <div className="detail-group">
                     <h3>{visit.kind === "supplemental" ? "Additional exposures" : "Observation cycle"}</h3>
@@ -1964,9 +2126,18 @@ export default function Explorer() {
                   </div>
                 )}
                 {!frame ? (
-                  <p className="inspector-empty">Select an observation.</p>
+                  <p className="inspector-empty">Load a field, then select a pixel or region to inspect its spectrum and source observations.</p>
                 ) : (
                   <>
+                    {product?.subtraction && (
+                      <div className="detail-group">
+                        <h3>Cycle difference</h3>
+                        <p>{product.layers[0].map.name} · displayed cycle minus {stamp(product.subtraction.referenceDate)}</p>
+                        {pixel && residual !== undefined && (
+                          <p>Δ at pixel ({pixel[0]+1}, {pixel[1]+1}) · {Number.isFinite(residual) ? residual.toPrecision(5) + " MJy/sr" : "No paired measurement"}</p>
+                        )}
+                      </div>
+                    )}
                     {product && (
                       <div className="detail-group">
                         <h3>Contributing exposures</h3>
@@ -2002,7 +2173,7 @@ export default function Explorer() {
                             </dd>
                           </>
                         )}
-                        {product && isVisitMap && (
+                        {product && isVisitMap && !product.subtraction && (
                           <>
                             <dt>Map layers</dt>
                             <dd>
@@ -2109,6 +2280,7 @@ export default function Explorer() {
                     ))}
                   </>
                 )}
+                </div>
               </aside>
             )}
           </div>
@@ -2118,8 +2290,9 @@ export default function Explorer() {
               (!dockOpen ? "collapsed" : "") +
               (dockExpanded ? " expanded" : "")
             }
-            aria-label="Observations"
+            id="observations-panel" aria-label="Observations"
           >
+            {dockOpen && !dockExpanded && <PanelResizer panel="observations" />}
             <div className="dock-header">
               <button
                 className="dock-heading"
@@ -2219,31 +2392,27 @@ export default function Explorer() {
                       </span>
                       <button
                         className="button"
-                        disabled={busy || !pendingCount || !fieldJobId}
+                        disabled={busy || !nextPending.ids.length || !fieldJobId}
                         onClick={() => {
                           loadBatch({
                             detector: detectorFilter || undefined,
-                            ids: selectable
-                              .filter((o) => o.status === "pending")
-                              .slice(0, batchSize)
-                              .map((o) => o.id),
+                            ...nextPending,
                           });
                         }}
                       >
-                        {pendingCount
-                          ? `Load next ${Math.min(batchSize, pendingCount)}`
+                        {nextPending.ids.length
+                          ? `${nextPending.metadataOnly ? "Check wavelengths for" : "Load next"} ${nextPending.ids.length}`
                           : "No pending images"}
                       </button>
                       <button
                         className="button"
-                        disabled={busy || !pendingCount || !fieldJobId}
+                        disabled={busy || !nextPending.ids.length || !fieldJobId}
                         onClick={() => {
                           loadBatch({
                             detector: detectorFilter || undefined,
                             all: true,
-                            recordIds: selectable
-                              .filter((o) => o.status === "pending")
-                              .map((o) => o.id),
+                            ...nextPending,
+                            recordIds: pendingRecords.map(o => o.id),
                           });
                         }}
                       >
@@ -2258,19 +2427,17 @@ export default function Explorer() {
                           Stop
                         </button>
                       )}
-                      {failedRecords.length > 0 && (
+                      {nextFailed.ids.length > 0 && (
                         <button
                           className="button"
                           disabled={busy || !fieldJobId}
                           onClick={() => {
                             loadBatch({
-                              ids: failedRecords
-                                .slice(0, batchSize)
-                                .map((o) => o.id),
+                              ...nextFailed,
                             });
                           }}
                         >
-                          Retry {Math.min(batchSize, failedRecords.length)}{" "}
+                          Retry {nextFailed.ids.length}{" "}
                           failed
                         </button>
                       )}
@@ -2294,9 +2461,11 @@ export default function Explorer() {
                     <CycleCatalog key={fieldJobId} visits={catalogVisits} records={catalogRecords}
                       filtered={observations ? filteredObservations : catalogRecords} selectedId={frame?.observation_id}
                       selectedVisitId={frame ? visit?.id : undefined} visibleMaps={visibleMaps}
+                      timeline={timelineChecklist} skipReasons={science.reasons}
                       openCycle={openCycle} busy={busy} canRequest={canRequest} inspect={inspectRecord} stamp={stamp} />
                   ) : observations ? (
                     <ExposureTable records={filteredObservations} selectedId={frame?.observation_id}
+                      timeline={timelineChecklist} unavailable="Awaiting cycle assignment"
                       busy={busy} canRequest={canRequest} inspect={inspectRecord} stamp={stamp} />
                   ) : <table>
                     <thead>
@@ -2362,6 +2531,6 @@ export default function Explorer() {
           </section>
         </div>
       </main>
-    </div>
+    </div></NotificationCenter>
   );
 }

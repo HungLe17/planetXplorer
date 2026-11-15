@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import { newMap } from "../src/lib/imaging";
 import { catalogPosition, projectMarker, type CatalogObject } from "../src/lib/known-objects";
 
 const field = {ra_deg: 0, dec_deg: 0, fov_arcsec: 30};
@@ -50,12 +51,14 @@ async function openField(page: Page) {
   await page.setViewportSize({width: 1600, height: 950});
   const frames = dates.map((_, i) => ({
     id: "f" + i, observation_id: "o" + i, observed_at: starts[i], midpoint_utc: midpoints[i],
-    detector: "D1", wavelength_um: 0.96 + i * 0.01, visit_id: i < 2 ? "first" : "last",
+    detector: i === 1 ? "D2" : "D1", wavelength_um: i === 1 ? 1.4 : 0.96,
+    sequence_id: i === 1 ? "D2-matched" : "D1-matched", processing_version:"v1", visit_id: i < 2 ? "first" : "last",
     url: "/api/assets/objects/f" + i + ".png", pixels: "f" + i + ".bin",
   }));
+  frames.push({...frames[2], id:"f3", observation_id:"o3", detector:"D2", wavelength_um:1.4, sequence_id:"D2-matched"});
   const visits = [
     {id: "first", start_utc: starts[0], end_utc: starts[1], observation_ids: ["o0", "o1"]},
-    {id: "last", start_utc: starts[2], end_utc: starts[2], observation_ids: ["o2"]},
+    {id: "last", start_utc: starts[2], end_utc: starts[2], observation_ids: ["o2","o3"]},
   ].map(item => ({...item, status: "complete", issues: []}));
   const observations = frames.map(f => ({...f, id: f.observation_id, release: "DR1", status: "ready", frame_id: f.id}));
   await page.route("**/api/presets", r => r.fulfill({json: {presets: []}}));
@@ -69,8 +72,10 @@ async function openField(page: Page) {
   // The hosted atlas is external. The test checks its public embed URL and field.
   await page.route("https://aladin.cds.unistra.fr/AladinLite/**", r =>
     r.fulfill({contentType: "text/html", body: "<title>Aladin fixture</title>"}));
-  const bands = encodeURIComponent(JSON.stringify({detectors: ["D1"]}));
-  await page.goto("/explore?ra=0&dec=0&fov=30&bands=" + bands);
+  const params = new URLSearchParams({ra:"0", dec:"0", fov:"30",
+    bands:JSON.stringify({detectors:["D1","D2"]}),
+    view:JSON.stringify({maps:[{...newMap("map", "Map"), operands:{D1:1,D2:1}}]})});
+  await page.goto("/explore?" + params);
   await expect(page.locator(".image-readout")).toContainText("Visit composite");
 }
 
@@ -78,6 +83,41 @@ const fetched = "2026-01-02T12:00:00Z";
 function catalog() {
   return {objects: [star, {...star, id: "off-field", ra_deg: 11}], fetched_at: fetched, warnings: []};
 }
+
+test("settings, Aladin, details and observations can be resized without losing the image", async ({page}) => {
+  await page.route("**/api/known-objects/**", route => route.fulfill({json:catalog()}));
+  await openField(page);
+  await page.getByRole("button", {name:"Known objects", exact:true}).click();
+  async function drag(name: string, dx: number, dy: number) {
+    const handle = page.getByRole("separator", {name:"Resize " + name});
+    const before = Number(await handle.getAttribute("aria-valuenow"));
+    const box = (await handle.boundingBox())!;
+    const x = box.x + box.width / 2, y = box.y + box.height / 2;
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + dx, y + dy, {steps:4});
+    await page.mouse.up();
+    await expect.poll(async () => Number(await handle.getAttribute("aria-valuenow")) - before).toBeGreaterThan(30);
+  }
+  await drag("Query and display settings", 45, 0);
+  await drag("Aladin and known objects", 45, 0);
+  await drag("Frame details", -45, 0);
+  await drag("Observations", 0, -45);
+  const details = page.getByRole("separator", {name:"Resize Frame details"});
+  const width = Number(await details.getAttribute("aria-valuenow"));
+  await details.focus();
+  await details.press("ArrowRight");
+  await expect(details).toHaveAttribute("aria-valuenow", String(width - 16));
+  await expect(page.getByRole("group", {name:"Displayed image"})).toContainText("Visit composite");
+  await page.setViewportSize({width:390, height:844});
+  await page.getByRole("button", {name:"Close known objects"}).click();
+  await expect(page.getByLabel("Toggle frame details")).toHaveAttribute("aria-expanded", "false");
+  const settings = page.getByRole("separator", {name:"Resize Query and display settings"});
+  await expect(settings).toHaveAttribute("aria-orientation", "horizontal");
+  await settings.focus();
+  await settings.press("ArrowUp");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+});
 
 async function coloredPixels(canvas: Locator, x: number, y: number) {
   return canvas.evaluate((element, p) => {
