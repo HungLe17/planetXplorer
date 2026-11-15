@@ -90,3 +90,30 @@ def test_partial_euclid_lookup_preserves_available_release():
         result = surveys.euclid(client, 10, 20)
     assert result["unavailable"] == ["Q1"]
     assert result["bands"][0]["count"] == 2
+
+
+def test_euclid_image_comparison_fetches_only_small_trusted_mosaic_cutouts():
+    url = "https://irsa.ipac.caltech.edu/ibe/data/euclid/q1/MER/1/NISP/EUC_MER_BGSUB-MOSAIC-NIR-H.fits"
+    metadata = io.BytesIO()
+    Table(rows=[(url, 60000), ("https://example.test/image.fits", 60001)],
+          names=("access_url", "t_min")).write(metadata, format="votable")
+    image = io.BytesIO()
+    fits.PrimaryHDU(np.array([[1., 2.], [3., np.nan]])).writeto(image)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if request.url.path == "/SIA":
+            assert request.url.params["COLLECTION"] == "euclid_DpdMerBksMosaic"
+            assert request.url.params["MAXREC"] == "24"
+            return httpx.Response(200, content=metadata.getvalue())
+        assert str(request.url).startswith(url)
+        assert request.url.params["size"] == "30arcsec"
+        return httpx.Response(200, content=image.getvalue())
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = surveys.euclid_images(client, 10, 20)
+    assert len(calls) == 2
+    assert result["images"][0]["product_url"] == url
+    assert result["images"][0]["band"] == "NIR-H"
+    assert result["images"][0]["preview"].startswith("data:image/png;base64,")

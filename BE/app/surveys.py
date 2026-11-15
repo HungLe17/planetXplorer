@@ -5,7 +5,7 @@ import csv
 import io
 import re
 from collections import defaultdict
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 import numpy as np
@@ -113,3 +113,41 @@ def euclid(client: httpx.Client, ra: float, dec: float) -> dict:
     if len(unavailable) == 2:
         raise ValueError("Euclid exposure service unavailable")
     return dict(bands=groups, unavailable=unavailable)
+
+
+def euclid_images(client: httpx.Client, ra: float, dec: float) -> dict:
+    """IRSA SIA2 MER science mosaics with bounded IBE cutouts.
+
+    https://irsa.ipac.caltech.edu/ibe/sia.html
+    https://irsa.ipac.caltech.edu/ibe/cutouts.html
+    """
+    content = read_small(client, "https://irsa.ipac.caltech.edu/SIA",
+                         dict(COLLECTION="euclid_DpdMerBksMosaic",
+                              POS=f"CIRCLE {ra} {dec} 0.000001", DPTYPE="image", MAXREC=24), 2_000_000)
+    rows = Table.read(io.BytesIO(content), format="votable")
+    if "access_url" not in rows.colnames:
+        raise ValueError("Unexpected Euclid image metadata")
+    images, bands = [], set()
+    for row in rows:
+        url = str(row["access_url"])
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or parsed.hostname != "irsa.ipac.caltech.edu" or not parsed.path.startswith("/ibe/data/euclid/"):
+            continue
+        match = re.search(r"(NIR-[YJH]|VIS)", parsed.path)
+        band = match.group(1) if match else str(row["obs_id"]) if "obs_id" in rows.colnames else "MER"
+        if band in bands:
+            continue
+        bands.add(band)
+        params = dict(center=f"{ra},{dec}", size="30arcsec", gzip="false")
+        item = dict(band=band, source_url=url + ("&" if parsed.query else "?") + urlencode(params),
+                    product_url=url)
+        if "t_min" in rows.colnames and not np.ma.is_masked(row["t_min"]):
+            item["observed_at"] = Time(float(row["t_min"]), format="mjd").utc.isot + "Z"
+        try:
+            item["preview"] = preview(read_small(client, url, params, 4_000_000))
+        except (httpx.HTTPError, ValueError, OSError):
+            item["warning"] = "Cutout preview unavailable. The original FITS remains available."
+        images.append(item)
+        if len(images) == 4:
+            break
+    return dict(images=images, field_arcsec=30, product="MER background-subtracted mosaic")

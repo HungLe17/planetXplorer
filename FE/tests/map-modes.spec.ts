@@ -43,6 +43,19 @@ async function open(page: Page, job: () => Job, arrays: Record<string, number[]>
   await page.getByRole("checkbox", { name: "Color scale", exact: true }).check();
 }
 const legend = (page: Page) => page.getByRole("group", { name: "Displayed color scale", exact: true });
+async function selectSpectrum(page: Page) {
+  await page.getByLabel("Matched spectra",{exact:true}).click();
+  const row=page.locator(".matched-options details details > summary").first();
+  if(!await row.evaluate(el=>el.parentElement!.hasAttribute("open")))await row.click();
+  await row.locator("..").getByRole("button").first().click();
+}
+async function inspectExposure(page: Page) {
+  const cycle=page.getByRole("region",{name:"Cycle 1",exact:true});
+  const toggle=cycle.locator(".cycle-disclosure");
+  if(await cycle.getByRole("row").count()===0)await toggle.click();
+  await cycle.getByRole("row").filter({has:page.getByText("e0-s16",{exact:true})})
+    .getByRole("button",{name:"View",exact:true}).click();
+}
 
 test("untouched default map sums every available spectrum as calibrated assets arrive", async ({ page }) => {
   const { manifest, arrays } = field();
@@ -85,9 +98,10 @@ test("configured layers, colors, and stretches survive Visits Browse Matched and
     operands: { D6: 1 }, low: "0", high: "50", stretch: i ? "log" : "sqrt",
     stops: [{ at: 0, color: "#000000" }, { at: 1, color: i ? "#0000ff" : "#ff0000" }] }));
   await open(page, () => ({ status: "complete", manifest }), arrays, maps);
-  for (const mode of ["Visits", "Browse", "Matched", "Subtract"]) {
-    await page.getByRole("button", { name: mode, exact: true }).click();
-    await expect(page.getByRole("button", { name: mode, exact: true })).toHaveAttribute("aria-pressed", "true");
+  for (const mode of ["all", "exposure", "spectrum", "subtract"]) {
+    if(mode==="exposure")await inspectExposure(page);
+    if(mode==="spectrum")await selectSpectrum(page);
+    if(mode==="subtract")await page.getByRole("checkbox",{name:"Compare with reference",exact:true}).check();
     await expect(legend(page)).toContainText("Red layer");
     await expect(legend(page)).toContainText("Blue layer");
     await expect(legend(page)).toContainText("sqrt");
@@ -99,9 +113,10 @@ test("configured layers, colors, and stretches survive Visits Browse Matched and
       return false;
     })).toBe(true);
   }
-  await page.getByRole("button", { name: "Browse", exact: true }).click();
+  await page.getByRole("checkbox",{name:"Compare with reference",exact:true}).uncheck();
+  await inspectExposure(page);
   await page.locator(".map-stretch select").first().selectOption("linear");
-  await expect(page.getByRole("button", { name: "Browse", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByRole("button", { name: "Return to timeline", exact: true })).toBeVisible();
   await expect(legend(page)).toContainText("linear");
 });
 
@@ -109,7 +124,7 @@ test("a numeric exposure excluded by every map stays blank instead of showing it
   const { manifest, arrays } = field();
   await open(page, () => ({ status: "complete", manifest }), arrays,
     [{ ...newMap("other", "Other detector"), operands: { D1: 1 } }]);
-  await page.getByRole("button", { name: "Browse", exact: true }).click();
+  await inspectExposure(page);
   await expect(page.getByText("No configured map inputs apply to this exposure. Choose matching spectra in the map’s Inputs.", { exact: true })).toBeVisible();
   await expect(legend(page)).toHaveCount(0);
   await expect.poll(() => page.locator(".sky-canvas canvas").evaluate((canvas: HTMLCanvasElement) => {
@@ -122,10 +137,10 @@ test("a numeric exposure excluded by every map stays blank instead of showing it
 test("three supplemental Matched epochs can subtract without a formal observing cycle", async ({ page }) => {
   const { manifest, arrays } = field(3, true);
   await open(page, () => ({ status: "complete", manifest }), arrays);
-  await page.getByRole("button", { name: "Matched", exact: true }).click();
+  await selectSpectrum(page);
   await expect(page.locator(".frame-counter")).toHaveText(/01\s*\/\s*03/);
-  await page.getByRole("button", { name: "Subtract", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Subtract", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await page.getByRole("checkbox", { name: "Compare with reference", exact: true }).check();
+  await expect(page.getByRole("checkbox", { name: "Compare with reference", exact: true })).toBeChecked();
   await expect(page.getByRole("group", { name: "Displayed image", exact: true })).toContainText("Cycle difference");
   await expect(page.getByLabel("Reference cycle").locator("option[value^=epoch-]")).toHaveCount(3);
   await expect(legend(page)).toContainText("Δ Map 1");
@@ -134,11 +149,11 @@ test("three supplemental Matched epochs can subtract without a formal observing 
 test("Matched maps omit unchecked peer spectra while keeping the selected spectrum", async ({ page }) => {
   const { manifest, arrays } = field();
   await open(page, () => ({ status: "complete", manifest }), arrays);
-  await page.getByRole("button", { name: "Matched", exact: true }).click();
+  await selectSpectrum(page);
   await expect(legend(page)).toContainText("11.00 … 44.00");
   const cycle = page.getByRole("region", { name: "Cycle 1", exact: true });
   await cycle.locator(".cycle-disclosure").click();
   await cycle.getByRole("checkbox", { name: "Include e0-s17 in timeline", exact: true }).uncheck();
   await expect(legend(page)).toContainText("Map 1 · 1.000 … 4.000 MJy/sr");
-  await expect(page.getByRole("button", { name: "Matched", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByLabel("Matched spectra",{exact:true})).toContainText("D6-16");
 });

@@ -109,10 +109,26 @@ export function useImages(manifest: Manifest | null, s: Display, browse: boolean
     const byId = new Map(eligibleFrames.map(f => [f.observation_id, f]));
     return (manifest?.visits ?? []).flatMap(visit => {
       if (visit.kind === "supplemental" || visit.status === "invalid") return [];
-      const members = visit.observation_ids.flatMap(id => byId.get(id) ?? []);
+      const groups = new Map<string, Frame[]>();
+      for (const id of visit.observation_ids) {
+        const f = byId.get(id);
+        if (!f) continue;
+        const key = JSON.stringify([f.detector, f.nominal_channel ?? plan.responseKeys.get(id) ?? f.sequence_id ?? id]);
+        const group = groups.get(key) ?? [];
+        group.push(f); groups.set(key, group);
+      }
+      const members = [...groups.values()].flatMap(group => {
+        const explicit = group.filter(f => choices[f.observation_id] === true);
+        return explicit.length ? explicit :
+          [group.find(f => plan.includedIds.has(f.observation_id)) ?? group[0]];
+      });
       return members.length ? [{ visit, members, source: members[0] }] : [];
     });
-  }, [eligibleFrames, manifest?.visits]);
+  }, [eligibleFrames, manifest?.visits, choices, plan]);
+  const cycleData = useMemo(() => {
+    const ids = new Set(fullCycles.flatMap(step => step.members.map(f => f.observation_id)));
+    return selectedData.filter(p => ids.has(p.frame.observation_id));
+  }, [fullCycles, selectedData]);
   const differenceSteps = useMemo(() => {
     if (!matchedSteps) return fullCycles;
     const byId = new Map(eligibleFrames.map(f => [f.observation_id, f]));
@@ -130,10 +146,10 @@ export function useImages(manifest: Manifest | null, s: Display, browse: boolean
       manifest?.processing?.spectral_tolerance ?? 0.5),
     [selectedData, differenceSteps, s.maps, referenceId, browse, automaticMap, manifest?.processing?.spectral_tolerance]);
   const series = useMemo(() => {
-    // Map every eligible exposure in an epoch. Motion representatives select
-    // comparable playback steps; they must not discard other map wavelengths.
+    // Keep all requested wavelengths, with one automatic representative per
+    // spectrum and cycle. Explicit checklist choices can include repeats.
     const maps = !manifest?.visits?.length ? [] :
-      products(selectedData, s, manifest.visits, automaticMap ? "available" : false);
+      products(cycleData, s, manifest.visits, automaticMap ? "available" : false);
     const byVisit = new Map(maps.map(map => [map.frame.observation_id, map]));
     const groups = new Map<string, typeof plan.steps>();
     const reasons = new Map(plan.reasons);
@@ -167,7 +183,7 @@ export function useImages(manifest: Manifest | null, s: Display, browse: boolean
     for (const step of plan.steps) if (reasons.has(step.visit.id))
       for (const f of step.members) frameReasons.set(f.observation_id, reasons.get(step.visit.id)!);
     return {steps, allMapped: maps, includedIds, frameReasons, reasons};
-  }, [plan, selectedData, s.maps, manifest?.visits, choices, automaticMap, numeric]);
+  }, [plan, cycleData, s.maps, manifest?.visits, choices, automaticMap, numeric]);
   // A single pending exposure can paint immediately, including from a legacy
   // manifest without spectral matching. It never becomes a second motion step.
   const shown = useMemo(() => series.steps.length ? series.steps : plan.preview ? [plan.preview] : [], [series.steps, plan.preview]);

@@ -121,6 +121,9 @@ export default function SkyViewer({
   message,
   unmatchedFrames = false,
   cycleView,
+  subtracting,
+  canSubtract,
+  onSubtract,
 }: {
   zoom: number;
   invert: boolean;
@@ -139,6 +142,9 @@ export default function SkyViewer({
   message: string;
   unmatchedFrames?: boolean;
   cycleView: boolean;
+  subtracting?: boolean;
+  canSubtract?: boolean;
+  onSubtract?: (enabled: boolean) => void;
   frames: RenderedFrame[];
   index: number;
   onReady: (ready: boolean) => void;
@@ -688,6 +694,11 @@ export default function SkyViewer({
             disabled={!loaded} onClick={() => commit({...transform.current,x:0,y:0})}>
             <Crosshair size={14} /><span>Recenter</span>
           </button>
+          {onSubtract && <label className="subtract-toggle">
+            <input type="checkbox" aria-label="Compare with reference" checked={!!subtracting}
+              disabled={!canSubtract && !subtracting} onChange={e => onSubtract(e.target.checked)} />
+            Subtract
+          </label>}
         </div>
         <span className="canvas-tool-hint">
           {tool === "pan" ? "Drag to pan the image" : "Click a pixel or drag a region"}
@@ -844,7 +855,7 @@ export default function SkyViewer({
           <div className="image-readout" role="group" aria-label="Displayed image">
             {fullscreen && chosenObject && <ObjectInfo point={chosenObject} />}
             {fullscreen && unmatchedFrames && (
-              <span>Browse / unmatched observations</span>
+              <span>Individual exposure · unmatched measurements</span>
             )}
 
             <span>
@@ -924,7 +935,7 @@ export default function SkyViewer({
         </button>
         <button
           disabled={!loaded || exporting || !cycleView || frames.length < 2}
-          title={cycleView && frames.length >= 2 ? "Export the full cycle maps as an animated GIF" : "GIF export needs two cycles in Visits or Matched view"}
+          title={cycleView && frames.length >= 2 ? "Export the full cycle maps as an animated GIF" : "GIF export needs two comparable observing epochs"}
           onClick={() => void exportImage(true)}
         >
           GIF

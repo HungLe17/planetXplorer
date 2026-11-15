@@ -959,7 +959,6 @@ test("streams the catalog, separates wavelengths, and loads another detector", a
   await expect(
     page.getByRole("button", { name: "Play", exact: true }),
   ).toBeDisabled();
-  await page.getByRole("button", { name: "Matched", exact: true }).click();
   const chooseSpectrum = async (detector: string) => {
     await page.getByLabel("Matched spectra", {exact:true}).click();
     const band = page.locator(".matched-options").getByLabel(detector + " spectra", {exact:true});
@@ -977,7 +976,6 @@ test("streams the catalog, separates wavelengths, and loads another detector", a
   );
   await page.getByLabel("Detector", { exact: true }).selectOption("D6");
   await page.getByRole("button", { name: "Load", exact: true }).click();
-  await page.getByRole("button", { name: "Matched", exact: true }).click();
   await chooseSpectrum("D6");
   expect(requested).toBe("d6");
   await expect(page.getByLabel("Frame details", { exact: true })).toContainText(

@@ -38,8 +38,6 @@ test("Matched groups the two June and December D6 exposures despite different mi
   const maps = ["Red","Green"].map((name,i) => ({...newMap(name,name), operands:{D6:1}, low:"0", high:"4",
     stops:[{at:0,color:"#000000"},{at:1,color:i ? "#00ff00" : "#ff0000"}]}));
   await page.goto("/explore?ra=150&dec=5&view="+encodeURIComponent(JSON.stringify({maps})));
-  const mode = page.getByRole("button",{name:"Matched",exact:true});
-  await mode.click();
   const picker = page.getByLabel("Matched spectra",{exact:true});
   await expect(picker).toContainText("2 epochs · partial coverage");
   await picker.click();
@@ -56,7 +54,7 @@ test("Matched groups the two June and December D6 exposures despite different mi
   await page.getByRole("button",{name:"Colors",exact:true}).nth(1).click();
   await page.getByRole("button",{name:"Blue for stop 2",exact:true}).click();
   await page.getByRole("button",{name:"Close editor",exact:true}).click();
-  await expect(mode).toHaveAttribute("aria-pressed","true");
+  await expect(picker).toContainText("2 epochs");
   await expect(page.locator(".frame-counter")).toHaveText(/02\s*\/\s*02/);
   await expect.poll(() => page.locator("canvas").first().evaluate((canvas: HTMLCanvasElement) => {
     const pixels = canvas.getContext("2d")!.getImageData(0,0,canvas.width,canvas.height).data;
@@ -70,11 +68,11 @@ test("Matched groups the two June and December D6 exposures despite different mi
   for (const value of ["sqrt","log"]) {
     await stretch.selectOption(value);
     await expect(page.getByRole("group",{name:"Displayed color scale"})).toContainText(value);
-    await expect(mode).toHaveAttribute("aria-pressed","true");
+    await expect(picker).toContainText("2 epochs");
   }
   await page.getByRole("button",{name:"Loop playback",exact:true}).click();
   await page.locator("#speed").selectOption("4");
   await page.getByRole("button",{name:"Play",exact:true}).click();
   await expect(page.locator(".frame-counter")).toHaveText(/02\s*\/\s*02/);
-  await expect(mode).toHaveAttribute("aria-pressed","true");
+  await expect(picker).toContainText("2 epochs");
 });

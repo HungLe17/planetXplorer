@@ -199,7 +199,7 @@ def create_app(settings: Settings | None = None, pipeline=None):
         return {"presets": data}
 
     @app.post("/api/surveys/{survey}")
-    async def survey_field(survey: Literal["neowise", "euclid", "desi"], query: Query):
+    async def survey_field(survey: Literal["neowise", "euclid", "euclid-images", "desi"], query: Query):
         # Context products span their full releases. Dates apply only to the blink sequence.
         def lookup():
             if survey == "desi":
@@ -207,7 +207,8 @@ def create_app(settings: Settings | None = None, pipeline=None):
                         "source_url": desi.LSS}
             with httpx.Client(verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
                               timeout=httpx.Timeout(55, connect=8)) as client:
-                fetch = surveys.neowise if survey == "neowise" else surveys.euclid
+                fetch = {"neowise":surveys.neowise, "euclid":surveys.euclid,
+                         "euclid-images":surveys.euclid_images}[survey]
                 return fetch(client, query.ra_deg, query.dec_deg)
         try:
             return await asyncio.to_thread(lookup)

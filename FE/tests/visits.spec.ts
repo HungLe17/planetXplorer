@@ -282,7 +282,9 @@ test("an invalid cycle explains the conflict and preserves access to its raw exp
   await expect(
     page.getByRole("button", { name: "PNG", exact: true }),
   ).toBeDisabled();
-  await page.getByRole("button", { name: "Browse", exact: true }).click();
+  const cycle=page.getByRole("region",{name:"Cycle 1",exact:true});
+  await cycle.locator(".cycle-disclosure").click();
+  await cycle.getByRole("button",{name:"View",exact:true}).click();
   await expect(
     page.getByRole("button", { name: "PNG", exact: true }),
   ).toBeEnabled();

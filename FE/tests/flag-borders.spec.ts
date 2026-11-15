@@ -20,7 +20,6 @@ test("flag borders show checker severity, preserve pixel interiors and follow PN
     manifest:{frames,processing:{output_shape:[1,3]}}}}));
   await page.route("**/api/assets/flags/quality.bin",r => r.fulfill({body:quality}));
   await page.goto("/explore?ra=5&dec=2&view="+encodeURIComponent(JSON.stringify({maps:[map]})));
-  await page.getByRole("button",{name:"Matched",exact:true}).click();
   const colors = (canvas:HTMLCanvasElement) => {
     const data = canvas.getContext("2d")!.getImageData(0,0,canvas.width,canvas.height).data;
     let yellow=0,orange=0,green=0;

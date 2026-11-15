@@ -173,14 +173,19 @@ test("cycle playback advances from a raw selection and stops at the last cycle w
   page,
 }) => {
   await setup(page);
-  await page.getByRole("button", { name: "Browse", exact: true }).click();
+  const firstCycle=page.getByRole("region",{name:"Cycle 1",exact:true});
+  await firstCycle.locator(".cycle-disclosure").click();
+  await firstCycle.getByRole("row").filter({has:page.getByText("obs0",{exact:true})})
+    .getByRole("button",{name:"View",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Return to timeline",exact:true})).toBeVisible();
   await page.locator("#speed").selectOption("4");
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect
     .poll(() => page.locator(".frame-counter").innerText())
     .not.toBe("01 / 03");
   await page.getByRole("button", { name: "Pause", exact: true }).click();
-  await page.getByRole("button", { name: "Matched", exact: true }).click();
+  await page.getByLabel("Matched spectra",{exact:true}).click();
+  await page.locator(".matched-options details details").first().getByRole("button").first().click();
   await expect(
     page.getByRole("button", { name: "Play", exact: true }),
   ).toBeEnabled();

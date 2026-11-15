@@ -22,7 +22,7 @@ test("subtract calibrated cycles through the viewer and inspect both signs", asy
     Float32Array.from(r.request().url().endsWith("/early.bin") ? [8,1,2,4] : [1,8,2,NaN]).buffer)}));
   await page.goto("/explore?ra=5&dec=4&fov=30");
   await expect(page.getByLabel("Displayed image")).toContainText("Visit composite");
-  await page.getByRole("button", {name:"Subtract", exact:true}).click();
+  await page.getByRole("checkbox", {name:"Compare with reference", exact:true}).check();
   const image = page.getByLabel("Displayed image");
   await expect(image).toContainText("Cycle difference · reference 2025-01-01");
   await expect(image.locator("time")).toHaveAttribute("datetime", frames[1].observed_at);
@@ -39,7 +39,7 @@ test("subtract calibrated cycles through the viewer and inspect both signs", asy
   await page.getByRole("button", {name:"First cycle", exact:true}).click();
   await expect(image).toContainText("Cycle difference · reference 2025-07-01");
   await expect(page.getByText(/Δ at pixel/)).toContainText("-7.0000 MJy/sr");
-  await page.getByRole("button", {name:"Visits", exact:true}).click();
+  await page.getByRole("checkbox", {name:"Compare with reference", exact:true}).uncheck();
   await expect(image).toContainText("Visit composite");
 });
 
@@ -72,9 +72,8 @@ test("three nominal matched epochs subtract across cached sequence IDs and retai
   await expect(page.getByLabel("Map name 1",{exact:true})).toHaveValue("Warm");
   await expect(page.getByLabel("Map name 2",{exact:true})).toHaveValue("Cool");
   await expect(page.getByRole("button",{name:"Zoom in",exact:true})).toBeEnabled();
-  await page.getByRole("button",{name:"Matched",exact:true}).click();
   await expect(page.getByRole("button",{name:"Play",exact:true})).toBeEnabled();
-  await page.getByRole("button",{name:"Subtract",exact:true}).click();
+  await page.getByRole("checkbox",{name:"Compare with reference",exact:true}).check();
   await page.getByRole("button",{name:"Last cycle",exact:true}).click();
   const image=page.getByLabel("Displayed image",{exact:true});
   await expect(image).toContainText("Cycle difference · reference 2025-01-01");

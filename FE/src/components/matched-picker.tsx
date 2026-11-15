@@ -7,7 +7,9 @@ function caption(s: MatchedSpectrum) {
   return `${channel} µm · ${s.epochs.length} ${s.epochs.length === 1 ? "epoch" : "epochs"}`;
 }
 
-export default function MatchedPicker({spectra, selected, currentId, select, stamp}: {
+export default function MatchedPicker({spectra, selected, currentId, select, stamp, allInputs, selectAll}: {
+  allInputs?: boolean;
+  selectAll?: () => void;
   spectra: MatchedSpectrum[];
   selected: MatchedSpectrum;
   currentId?: string;
@@ -16,8 +18,11 @@ export default function MatchedPicker({spectra, selected, currentId, select, sta
 }) {
   const picker = useRef<HTMLDetailsElement>(null);
   return <details className="matched-picker" ref={picker}>
-    <summary aria-label="Matched spectra">{!selected.nominal && selected.detector+" · "}{caption(selected)}{selected.partial && " · partial coverage"}</summary>
+    <summary aria-label="Matched spectra">{allInputs ? "All map inputs" : <>{!selected.nominal && selected.detector+" · "}{caption(selected)}{selected.partial && " · partial coverage"}</>}</summary>
     <div className="matched-options">
+      {selectAll && <button type="button" onClick={() => {
+        selectAll(); if (picker.current) picker.current.open=false;
+      }}>All map inputs</button>}
       {detectors.map(detector => {
         const bands = spectra.filter(s => s.detector === detector);
         return bands.length > 0 && <details key={detector} open={selected.detector === detector}>

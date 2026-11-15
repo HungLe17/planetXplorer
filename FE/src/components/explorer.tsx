@@ -67,6 +67,7 @@ import {
   type Entry,
 } from "@/lib/workspace";
 import FieldSurveys from "./field-surveys";
+import SurveyComparison from "./survey-comparison";
 import { presets, Frame, Manifest, Query, Preset, Observation } from "@/lib/types";
 import {
   poll,
@@ -238,8 +239,8 @@ export default function Explorer() {
   const spectra = useMemo(() => matchedSpectra(manifest, timelineChoices, displayedQuery?.min_separation_days),
     [manifest, timelineChoices, displayedQuery?.min_separation_days]);
   const sequence = spectra.find(s => s.id === sequenceId) ?? spectra.find(s => s.sequenceIds.includes(sequenceId)) ?? spectra[0];
-  const derived = (viewMode === "visits" && hasCycles) || subtracting;
-  const matched = viewMode === "matched";
+  const matched = viewMode === "matched" || (viewMode !== "browse" && !hasCycles && !!sequence);
+  const derived = (viewMode === "visits" && hasCycles && !matched) || subtracting;
   const matchedSteps = sequence?.epochs;
   const science = useImages(manifest, display, !derived, timelineChoices, displayedQuery,
     subtracting ? referenceCycle : null, matched ? matchedSteps : undefined,
@@ -703,7 +704,7 @@ export default function Explorer() {
                     result.frames.some(f => f.observation_id === wantedFrame) ||
                     result.observations?.some(o => o.id === wantedFrame)
                   );
-                  setViewMode(!query.live || restoreRaw ? "browse" : "visits");
+                  setViewMode(restoreRaw ? "browse" : "visits");
                   setDetectorFilter("");
                   setRecordSearch("");
                   setStatusFilter("");
@@ -1768,8 +1769,7 @@ export default function Explorer() {
                 ))}
               </ul>
               <p>
-                Inspect individual exposures in Browse or in the observation
-                table.
+                Inspect individual exposures in the observation table.
               </p>
               </details>
               </Notification>
@@ -1790,22 +1790,6 @@ export default function Explorer() {
                 </p>
                 </Notification>
               )}
-            {busy && (
-              <Notification label="search progress">
-              <p className="processing">
-                <LoaderCircle size={14} className="spin" />
-                {displayedQuery === committed &&
-                manifest?.processing?.refreshing_cache
-                  ? "Showing cached observations while checking the archive for updates."
-                  : `${stage}.`}
-                {manifest?.frames.length
-                  ? displayedQuery === committed
-                    ? ` ${manifest.frames.length} observation${manifest.frames.length === 1 ? "" : "s"} available.`
-                    : " Previous field shown."
-                  : ""}
-              </p>
-              </Notification>
-            )}
             {!busy &&
               displayedQuery &&
               committed &&
@@ -1862,9 +1846,15 @@ export default function Explorer() {
             {knownOpen && displayedQuery && <ObjectPanel query={displayedQuery} data={known}
               chosen={chosenObject} select={selectObject} moving={showMoving} toggleMoving={setShowMoving}
               times={epochs} epoch={epoch} changeEpoch={setPreferredEpoch} close={() => setKnownOpen(false)} />}
-            <section className="viewer-section" aria-label="Observation viewer">
+            <section className="viewer-section" aria-label="Observation viewer" aria-busy={busy}>
               <div className="section-heading">
                 <span className="viewer-document-title"><Crosshair size={13} />Observation viewer</span>
+                <span className="viewer-progress" role="status" aria-label="Cutout progress">
+                  {busy || !science.settled ? <LoaderCircle size={13} className="spin" /> : null}
+                  {busy ? `${stage} · ${allFrames.length} images available`
+                    : !science.settled ? "Loading brightness and quality data…"
+                    : `Ready · ${steps.length} observing epochs`}
+                </span>
                 <span className="field-readout mono">
                   {displayedQuery && frames.length
                     ? `RA ${displayedQuery.ra_deg.toFixed(6)}° · Dec ${displayedQuery.dec_deg.toFixed(6)}°`
@@ -1873,53 +1863,17 @@ export default function Explorer() {
               </div>
               {allFrames.length > 0 && (
                 <div className="sequence-toolbar">
-                  <div
-                    className="view-modes"
-                    role="group"
-                    aria-label="Image view"
-                  >
-                    {hasCycles && (
-                      <button
-                        aria-pressed={derived && !subtracting}
-                        onClick={() => setMode("visits")}
-                      >
-                        Visits
-                      </button>
-                    )}
-                    {(hasCycles || (matchedSteps?.length ?? 0) > 1) && (
-                      <button aria-pressed={subtracting} title="Subtract one calibrated observing epoch from the others"
-                        onClick={() => {
-                          if (subtracting) { setMode(matched ? "matched" : "visits"); return; }
-                          const useMatched = matched || !hasCycles;
-                          const epochs = useMatched ? matchedSteps ?? [] : steps;
-                          setMode(useMatched ? "matched" : "visits");
-                          setReferenceCycle(epochs[0]?.visit.id ?? "");
-                          if (epochs.length > 1 && cycleIndex <= 0) {
-                            restoreFrame.current = epochs[1].visit.id;
-                            setSelectedFrame(epochs[1].visit.id);
-                          }
-                        }}>Subtract</button>
-                    )}
-                    <button
-                      aria-pressed={!matched && !derived}
-                      onClick={() => setMode("browse")}
-                      title="Inspect a single exposure"
-                    >
-                      Browse
-                    </button>
-                    <button
-                      aria-pressed={matched && !subtracting}
-                      disabled={!spectra.length}
-                      onClick={() => setMode("matched")}
-                      title="Inspect exposures with compatible wavelength and calibration"
-                    >
-                      Matched
-                    </button>
-                  </div>
-                  {matched && !subtracting && sequence ? (
+                  {viewMode === "browse" && <button className="button" onClick={() => {
+                    setMode(sequenceId ? "matched" : "visits");
+                    restoreFrame.current = ""; setSelectedFrame("");
+                  }}>Return to timeline</button>}
+                  {sequence ? (
                     <MatchedPicker spectra={spectra} selected={sequence} currentId={frame?.observation_id}
+                      allInputs={!matched} selectAll={() => {
+                        setMode("visits"); setSequenceId(""); restoreFrame.current=""; setSelectedFrame("");
+                      }}
                       stamp={stamp} select={(id, exposure) => {
-                        setPlaying(false);
+                        setMode("matched");
                         setSequenceId(id);
                         restoreFrame.current = exposure;
                         setSelectedFrame(exposure);
@@ -1962,6 +1916,25 @@ export default function Explorer() {
                 </div>
               )}
               <SkyViewer
+                subtracting={subtracting}
+                canSubtract={viewMode !== "browse" && steps.length > 1}
+                onSubtract={(enabled) => {
+                  setPlaying(false);
+                  if (!enabled) {
+                    const epoch = matchedSteps?.find(step => step.visit.id === frame?.visit_id);
+                    const key = matched && epoch ? epoch.source.observation_id : frame?.visit_id ?? "";
+                    restoreFrame.current = key;
+                    setSelectedFrame(key);
+                    setReferenceCycle(null);
+                    return;
+                  }
+                  setReferenceCycle(steps[0]?.visit.id ?? "");
+                  const epoch = steps[Math.min(Math.max(1,cycleIndex),steps.length-1)];
+                  if (epoch) {
+                    restoreFrame.current=epoch.visit.id;
+                    setSelectedFrame(epoch.visit.id);
+                  }
+                }}
                 cycleView={derived || matched}
                 unmatchedFrames={unmatchedFrames}
                 frames={frames}
@@ -1995,6 +1968,7 @@ export default function Explorer() {
                 grid={manifest?.grid}
                 gridHeader={manifest?.processing?.grid_header}
               />
+              <SurveyComparison query={displayedQuery} />
               <div className="playback">
                 <div className="transport">
                   <button
