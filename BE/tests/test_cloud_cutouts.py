@@ -94,6 +94,29 @@ def test_budget_and_untrusted_mirrors_fail_before_network():
             mirror_url(uri)
 
 
+def test_cached_headers_reduce_repeat_transfer_without_changing_cutout(tmp_path):
+    payload = product_bytes(True)
+    requests = []
+
+    def serve(request):
+        start, end = map(int, request.headers["Range"].removeprefix("bytes=").split("-"))
+        requests.append((start, end))
+        return httpx.Response(206, headers={"Content-Range": f"bytes {start}-{end}/{len(payload)}"},
+                              content=payload[start:end + 1])
+
+    with httpx.Client(transport=httpx.MockTransport(serve)) as client:
+        first = tmp_path / "first.fits"
+        second = tmp_path / "second.fits"
+        cold = cloud_cutout(client, URI, QUERY, first, time.monotonic() + 20, 2_000_000)
+        cold_requests = len(requests)
+        requests.clear()
+        warm = cloud_cutout(client, URI, QUERY, second, time.monotonic() + 20, 2_000_000)
+        assert warm < cold
+        assert len(requests) < cold_requests
+        assert not any(start == 0 for start, _ in requests)
+        assert first.read_bytes() == second.read_bytes()
+
+
 def test_cloud_failure_retains_original_irsa_cutout_fallback(tmp_path, monkeypatch):
     def unavailable(*args, **kwargs):
         raise ValueError("Ranges unavailable")

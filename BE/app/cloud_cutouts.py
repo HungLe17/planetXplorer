@@ -8,6 +8,9 @@ import io
 import math
 import re
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from urllib.parse import urlsplit
 
 import astropy.units as u
@@ -18,6 +21,12 @@ from astropy.io import fits
 from astropy.nddata.utils import overlap_slices
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
+
+
+@lru_cache(maxsize=16)
+def _metadata_cache(client, url):
+    # Product paths include their processing version; bound retained headers to 16 MiB.
+    return {"blocks": {}, "total": None, "lock": threading.Lock()}
 
 
 def mirror_url(uri: str) -> str:
@@ -39,17 +48,40 @@ class RangeFile(io.RawIOBase):
     mode = "rb"
     block_size = 65536
 
-    def __init__(self, client, url, deadline, budget, timeout=15):
+    def __init__(self, client, url, deadline, budget, timeout=15, parent=None):
         self.client, self.name = client, url
         self.deadline, self.budget, self.timeout = deadline, budget, timeout
-        self.position, self.transferred, self.total = 0, 0, None
-        self.blocks = {}
-        self.blocks[0] = self._range(0, self.block_size)
+        self.position = 0
+        self._metadata = parent._metadata if parent else _metadata_cache(client, url)
+        self._transfer = parent._transfer if parent else {"bytes": 0, "lock": threading.Lock()}
+        self._cache_headers = parent is None
+        if parent:
+            self.blocks, self.total = dict(parent.blocks), parent.total
+        else:
+            with self._metadata["lock"]:
+                self.blocks = dict(self._metadata["blocks"])
+                self.total = self._metadata["total"]
+        if 0 not in self.blocks:
+            self.blocks[0] = self._range(0, self.block_size)
+            self._remember(0)
+
+    @property
+    def transferred(self):
+        return self._transfer["bytes"]
+
+    def _remember(self, block):
+        if self._cache_headers:
+            with self._metadata["lock"]:
+                if len(self._metadata["blocks"]) < 16:
+                    self._metadata["blocks"][block] = self.blocks[block]
+                    self._metadata["total"] = self.total
 
     def _range(self, start, size):
         remaining = self.deadline - time.monotonic()
-        if remaining <= 0 or self.transferred + size > self.budget:
-            raise ValueError("Cloud cutout byte/time budget exceeded")
+        with self._transfer["lock"]:
+            if remaining <= 0 or self.transferred + size > self.budget:
+                raise ValueError("Cloud cutout byte/time budget exceeded")
+            self._transfer["bytes"] += size
         end = start + size - 1
         with self.client.stream("GET", self.name,
                 headers={"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"},
@@ -73,7 +105,6 @@ class RangeFile(io.RawIOBase):
                 data.extend(chunk)
             if len(data) != size:
                 raise ValueError("Incomplete cloud range")
-        self.transferred += size
         return bytes(data)
 
     def readable(self):
@@ -95,6 +126,8 @@ class RangeFile(io.RawIOBase):
     def read(self, size=-1):
         if size < 0:
             raise ValueError("Unbounded cloud reads are disabled")
+        if time.monotonic() >= self.deadline:
+            raise ValueError("Cloud cutout time budget exceeded")
         size = min(size, max(0, self.total - self.position))
         if not size:
             return b""
@@ -107,6 +140,7 @@ class RangeFile(io.RawIOBase):
             block = self.position // self.block_size * self.block_size
             if block not in self.blocks:
                 self.blocks[block] = self._range(block, min(self.block_size, self.total - block))
+                self._remember(block)
             offset = self.position - block
             part = self.blocks[block][offset:offset + size]
             parts.append(part)
@@ -161,13 +195,22 @@ def cloud_cutout(client, uri, query, path, deadline, budget, timeout=15):
                 if (hdu.header.get("NAXIS") != 2
                         or (hdu.header["NAXIS2"], hdu.header["NAXIS1"]) != shape):
                     raise ValueError("Cloud quality plane geometry is unsupported")
-                # Full-width contiguous strips avoid hundreds of per-row HTTP round trips.
-                data = np.array(hdu.section[sy, :][:, sx], copy=True)
-                output.append(fits.ImageHDU(data=data, header=shifted_header(hdu.header, sx.start, sy.start)))
             table = hdus["WCS-WAVE"]
             if table.size > 65536:
                 raise ValueError("Cloud spectral calibration exceeds its limit")
-            output.append(table.copy())
+            spectral_table = table.copy()
+            # Each worker has its own FITS cursor, shares cached headers and one byte budget.
+            # Whole-width row strips keep the uncompressed planes to one request apiece.
+            def read_plane(name):
+                with RangeFile(client, remote.name, deadline, budget, timeout, parent=remote) as plane_file:
+                    with fits.open(plane_file, memmap=False, lazy_load_hdus=True) as planes:
+                        hdu = planes[name]
+                        data = np.array(hdu.section[sy, :][:, sx], copy=True)
+                        return fits.ImageHDU(data=data, header=shifted_header(hdu.header, sx.start, sy.start))
+
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="cloud-plane") as executor:
+                output.extend(executor.map(read_plane, ("IMAGE", "FLAGS", "VARIANCE")))
+            output.append(spectral_table)
             with fits.HDUList(output) as cutout:
                 cutout.writeto(path, overwrite=True)
         return remote.transferred

@@ -305,6 +305,94 @@ def test_live_candidate_yields_image_before_catalog_and_is_replaced(tmp_path):
     assert all(len(s.frames) == 1 for s in snapshots)
 
 
+@pytest.mark.parametrize("blocked_stage", ["discovery", "calibration"])
+def test_multi_input_first_valid_plane_precedes_remaining_metadata(tmp_path, blocked_stage):
+    import shutil
+    from threading import Event
+    from app.archive import Archive
+    from app.config import Settings
+    from app.pipeline import Pipeline
+
+    published = Event()
+    good = replace(OBS, identity="good")
+    other = replace(OBS, identity="other", mjd=OBS.mjd + 180)
+    rejected = replace(OBS, identity="wrong-spectrum", mjd=OBS.mjd - 180)
+    query = QUERY.model_copy(update={"live": True, "detectors": ["D1", "D6"],
+        "channels": {"D1": ["D1-01"], "D6": ["D6-16"]}})
+    calibration = decode(FIXTURE, good, query, SOURCE)
+    downloads, snapshots = [], []
+
+    class MultiInputArchive(Archive):
+        def __init__(self):
+            pass
+
+        def search(self, query, deadline, *, on_candidate, timing):
+            if blocked_stage == "discovery":
+                on_candidate(rejected)
+                on_candidate(good)
+                assert published.wait(5), "First valid input waited for the remaining catalog"
+                return [rejected, good], []
+            return [good, other], []
+
+        def cached_spectral(self, uri, query):
+            return None
+
+        def probe_spectral(self, obs, query, deadline):
+            if blocked_stage == "calibration" and obs == other:
+                assert published.wait(5), "First valid input waited for unrelated calibration"
+            return dict(nominal_channel=1 if obs == rejected else calibration.nominal_channel,
+                        wavelength_um=calibration.wavelengths[0], bandwidth_um=calibration.bandwidths[0],
+                        processing_version=calibration.version)
+
+        def fetch(self, obs, query, path, deadline, **kwargs):
+            downloads.append(obs.identity)
+            shutil.copyfile(FIXTURE, path)
+            return obs.uri
+
+    def publish(manifest):
+        snapshots.append(manifest)
+        if manifest.frames:
+            # A partial view contains actual available planes, never invented RGB inputs.
+            assert {frame.detector for frame in manifest.frames} == {"D6"}
+            published.set()
+
+    pipeline = Pipeline(Settings(cache_dir=tmp_path / "cache", cutout_workers=2), MultiInputArchive())
+    try:
+        result = pipeline.run(query, tmp_path, "multi", lambda _: None, publish=publish)
+        assert published.is_set()
+        assert downloads[0] == "good" and "wrong-spectrum" not in downloads
+        assert result.frames and all(frame.nominal_channel == 16 for frame in result.frames)
+    finally:
+        pipeline.transfers.close()
+
+
+def test_decoded_edge_channel_is_rejected_for_broad_detector_selection(tmp_path, monkeypatch):
+    import shutil
+    import app.pipeline as pipeline_module
+    from app.config import Settings
+    from app.pipeline import Pipeline
+
+    query = QUERY.model_copy(update={"detectors": ["D6"]})
+    edge = replace(decode(FIXTURE, OBS, query, SOURCE), nominal_channel=0)
+    monkeypatch.setattr(pipeline_module, "decode", lambda *args, **kwargs: edge)
+
+    class OneExposure:
+        def search(self, *_):
+            return [OBS], []
+
+        def fetch(self, obs, query, path, deadline):
+            shutil.copyfile(FIXTURE, path)
+            return SOURCE
+
+    pipeline = Pipeline(Settings(cache_dir=tmp_path / "cache"), OneExposure())
+    try:
+        result = pipeline.run(query, tmp_path, "edge", lambda _: None)
+        assert result.frames == []
+        assert "geometry disagrees" in result.omissions[0]["reason"]
+    finally:
+        pipeline.transfers.close()
+
+
 def test_shared_preview_supports_cached_frame_without_quality_sidecar(tmp_path):
     from app.pixel_quality import PixelQuality
     data = np.arange(25, dtype=float).reshape(5, 5)

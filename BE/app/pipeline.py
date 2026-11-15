@@ -541,9 +541,11 @@ class _FrameJob:
                 cutout = decode(path, obs, self.query, source)
                 if cutout.nominal_channel is None:
                     cutout.nominal_channel = record.nominal_channel
-                if (any(nominal_parameters(label) for label in self.query.channels.get(obs.detector, []))
-                        and self.query.band_match(obs.detector, cutout.wavelengths[0], cutout.bandwidths[0], cutout.version,
-                                                  cutout.nominal_channel) != "matched"):
+                decoded_match = self.query.band_match(obs.detector, cutout.wavelengths[0], cutout.bandwidths[0],
+                                                     cutout.version, cutout.nominal_channel)
+                if (decoded_match == "excluded" or
+                        (any(nominal_parameters(label) for label in self.query.channels.get(obs.detector, []))
+                         and decoded_match != "matched")):
                     raise ArchiveError("Downloaded detector geometry disagrees with the selected spectrum.")
                 return cutout
         finally:
@@ -705,11 +707,13 @@ class _FrameJob:
         early_obs, early_future, early_error = None, None, None
         probe, probing = None, None
         checked = {}
-        # Before discovery finishes the winning cross-cycle wavelength cannot
-        # be known. A search for exactly one channel already identifies it.
+        # A multi-input view can publish its first confirmed detector plane while
+        # the remaining inputs are discovered. A single unrestricted detector
+        # still waits for its cross-cycle wavelength ranking.
         single_channel = (self.query.detectors and len(self.query.detectors) == 1
                           and len(self.query.channels.get(self.query.detectors[0], [])) == 1)
-        early_allowed = single_channel or self.query.detectors is None
+        multi_input = bool(self.query.detectors and len(self.query.detectors) > 1)
+        early_allowed = single_channel or multi_input or self.query.detectors is None
 
         def start_early(obs, record):
             nonlocal early_obs, early_future
@@ -747,7 +751,8 @@ class _FrameJob:
                         early_error = str(exc)
                 elif event is probe:
                     record = probing.record()
-                    if self.confirm(probing, record) and early_obs is None:
+                    self.apply_probe(record, probe)
+                    if record.selection == "matched" and early_obs is None:
                         start_early(probing, record)
                     checked[probing] = record
                     probe = None
@@ -758,9 +763,9 @@ class _FrameJob:
                         if cached:
                             record.set_spectral(cached)
                     match = record.band_match(self.query)
-                    if match == "matched":
+                    if match == "matched" and not (self.query.detectors and record.needs_spectral(self.query)):
                         start_early(event, record)
-                    elif match == "unknown":
+                    elif match in ("unknown", "matched"):
                         candidates.append(event)
                 if early_obs is None and not probe and candidates:
                     probing = candidates.popleft()
@@ -785,6 +790,7 @@ class _FrameJob:
                 record.selection, record.reason = old.selection, old.reason
                 record.channel, record.wavelength_um, record.bandwidth_um = old.channel, old.wavelength_um, old.bandwidth_um
                 record.nominal_channel = old.nominal_channel
+                record.geometry_checked = old.geometry_checked
         selected = [obs for obs in selected if obs not in checked or checked[obs].selection == "matched"]
         # Catalog consumers can browse or prioritize records immediately, even when
         # every candidate still needs a wavelength check and the image cache is cold.
@@ -796,15 +802,28 @@ class _FrameJob:
             # A first detector match is already usable. Publish its image as soon
             # as ready, while calibration headers identify cross-cycle candidates.
             records = {r.id: r for r in self.result.observations}
-            if early_allowed and not warm and early_obs is None and selected and records[selected[0].identity].selection == "matched":
-                start_early(selected[0], records[selected[0].identity])
+            if early_allowed and not warm and early_obs is None:
+                candidate = next((obs for obs in selected if records[obs.identity].selection == "matched"
+                                  and not records[obs.identity].needs_spectral(self.query)), None)
+                if candidate is not None:
+                    start_early(candidate, records[candidate.identity])
             until = min(self.download_deadline, time.monotonic() + min(6, self.settings.metadata_seconds))
-            probes = {pool.submit(probe_band, row_by_id[r.id], self.query, until): r for r in metadata}
-            receipts = list(probes)
+            probes = {}
+            for record in metadata:
+                obs = row_by_id[record.id]
+                future = self.early_metadata.get(obs)
+                if future is None:
+                    future = pool.submit(probe_band, obs, self.query, until)
+                    self.early_metadata[obs] = future
+                probes[future] = record
+            probe_events = Queue()
+            for future in probes:
+                future.add_done_callback(probe_events.put)
             if early_future and early_obs in rows and early_obs.identity not in self.accepted and not early_error:
-                receipts.append(early_future)
+                early_future.add_done_callback(probe_events.put)
             outstanding = len(probes)
-            for future in as_completed(receipts):
+            while outstanding:
+                future = probe_events.get()
                 self.report("validate")
                 if future is early_future:
                     try:
@@ -812,8 +831,13 @@ class _FrameJob:
                     except (ArchiveError, ValueError, KeyError, OSError) as exc:
                         early_error = str(exc)
                     continue
-                self.apply_probe(probes[future], future)
+                record = probes[future]
+                self.apply_probe(record, future)
                 outstanding -= 1
+                if early_allowed and not warm and early_obs is None and record.selection == "matched":
+                    start_early(row_by_id[record.id], record)
+                    if early_future is not None:
+                        early_future.add_done_callback(probe_events.put)
                 if not outstanding:
                     break  # The regular queue can fill the other slot while the early cutout is still in flight.
             frames, _ = self.grouped()
