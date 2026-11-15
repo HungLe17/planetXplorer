@@ -14,7 +14,7 @@ import {
   motionSelection,
   matchesChannel,
   responseKey,
-  archivedAt,
+  pixelFlagMarkers,
   grey,
   type Display,
   type CycleInput,
@@ -191,37 +191,19 @@ export function useImages(manifest: Manifest | null, s: Display, browse: boolean
           bounds: p.subtraction && difference ? difference.boundsByMap.get(map.id) ?? difference.bounds : mapBounds(values, map),
           signed: !!p.subtraction || isSignedMap(map),
         }));
-        const used = new Set([...p.inputs, ...(p.subtraction ? p.reference : [])].map((f) => f.observation_id));
-        const bands = p.sourcePlanes.filter(
-          (plane) => used.has(plane.frame.observation_id) && plane.quality,
-        );
-        const warnings: number[] = [];
-        for (let i = 0; i < count; i++) {
-          if (
-            p.layers.some((l) => p.subtraction ? Number.isFinite(l.values[i]) : l.values[i] >= 0) &&
-            bands.some(
-              (b) =>
-                b.quality &&
-                ((b.quality.flags[i] & ~(1 << 21)) !== 0 ||
-                  (b.quality.status[i] & 0x80) !== 0) &&
-                !(archivedAt(b, i) < 0),
-            )
-          )
-            warnings.push(i);
-        }
         return {
           ...p.frame,
           matchedMap:p.matchedMap,
           subtraction: p.subtraction,
           canvas: renderProduct(p, width, height, scales),
           mapScales: scales,
-          warningPixels: bands.length ? Uint32Array.from(warnings) : undefined,
+          ...pixelFlagMarkers(p, count, data),
           sourceDates: [
             ...new Set([...p.inputs, ...p.reference].map((f) => f.observed_at)),
           ].sort(),
         };
       }),
-    [result, difference, count, width, height],
+    [result, difference, data, count, width, height],
   );
   const timeline = useMemo(
     () => imageTimeline(manifest, rendered, result, browse, difference?.steps ?? shown),

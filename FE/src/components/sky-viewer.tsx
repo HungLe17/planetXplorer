@@ -208,6 +208,7 @@ export default function SkyViewer({
     current && !current.canvas ? assets.get(current.url) : undefined;
   const currentImage = current?.canvas ?? entry?.value;
   const currentWarnings = current?.warningPixels;
+  const currentSerious = current?.seriousPixels;
   const loaded = !!currentImage;
   useEffect(() => {
     onReady(loaded);
@@ -318,26 +319,28 @@ export default function SkyViewer({
     img: FrameImage,
     g: { x: number; y: number; w: number; h: number },
     warningPixels?: Uint32Array,
+    seriousPixels?: Uint32Array,
   ) {
     ctx.imageSmoothingEnabled = false;
     ctx.filter = invert ? "invert(1)" : "none";
     ctx.drawImage(img, g.x, g.y, g.w, g.h);
-    if (display.markFlagged && warningPixels?.length) {
+    if (display.markFlagged && (warningPixels?.length || seriousPixels?.length)) {
       const cellWidth = g.w / img.width,
         cellHeight = g.h / img.height;
       ctx.save();
       ctx.filter = "none";
-      ctx.fillStyle = "#ffbd45";
-      ctx.beginPath();
-      for (const i of warningPixels) {
-        ctx.rect(
-          g.x + (i % img.width) * cellWidth,
-          g.y + Math.floor(i / img.width) * cellHeight,
-          cellWidth * 0.28,
-          cellHeight * 0.28,
-        );
+      const inset = Math.min(0.5, cellWidth / 4, cellHeight / 4);
+      ctx.lineWidth = inset * 2;
+      for (const [indices, color] of [[warningPixels, "#ffd600"], [seriousPixels, "#ff8c00"]] as const) {
+        ctx.strokeStyle = color;
+        ctx.beginPath();
+        for (const i of indices ?? []) {
+          ctx.rect(g.x + (i % img.width) * cellWidth + inset,
+            g.y + Math.floor(i / img.width) * cellHeight + inset,
+            cellWidth - inset * 2, cellHeight - inset * 2);
+        }
+        ctx.stroke();
       }
-      ctx.fill();
       ctx.restore();
     }
   }
@@ -385,7 +388,7 @@ export default function SkyViewer({
       const exportFrames = animated ? frames : [frames[index]];
       const qualityLegend =
         display.markFlagged &&
-        exportFrames.some((f) => f.warningPixels?.length);
+        exportFrames.some((f) => f.warningPixels?.length || f.seriousPixels?.length);
       const out = document.createElement("canvas");
       out.width = width;
       const ctx = out.getContext("2d", { willReadFrequently: true })!;
@@ -434,7 +437,7 @@ export default function SkyViewer({
         const scale = Math.min(width / img.width, height / img.height);
         const mapWidth = Math.round(img.width * scale), mapHeight = Math.round(img.height * scale);
         const mapX = Math.round((width - mapWidth) / 2);
-        paint(ctx, img, { x: mapX, y: 0, w: mapWidth, h: mapHeight }, frame.warningPixels);
+        paint(ctx, img, { x: mapX, y: 0, w: mapWidth, h: mapHeight }, frame.warningPixels, frame.seriousPixels);
         ctx.restore();
         ctx.fillStyle = "white";
         ctx.font = font;
@@ -465,10 +468,13 @@ export default function SkyViewer({
           if (qualityLegend) {
             y += gap;
             ctx.textAlign = "left";
-            ctx.fillStyle = "#ffbd45";
-            ctx.fillRect(12, y + 4, 12, 12);
+            ctx.strokeStyle = "#ffd600";
+            ctx.strokeRect(12.5, y + 4.5, 12, 12);
+            ctx.strokeStyle = "#ff8c00";
+            ctx.strokeRect(208.5, y + 4.5, 12, 12);
             ctx.fillStyle = "white";
-            ctx.fillText("Flagged pixel", 32, y);
+            ctx.fillText("Warning", 32, y);
+            ctx.fillText("Serious", 228, y);
           }
         }
         if (lib && gif) {
@@ -518,7 +524,7 @@ export default function SkyViewer({
       ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
       ctx.clearRect(0, 0, rect.width, rect.height);
       if (!currentImage) return;
-      paint(ctx, currentImage, geometry(currentImage, rect.width, rect.height), currentWarnings);
+      paint(ctx, currentImage, geometry(currentImage, rect.width, rect.height), currentWarnings, currentSerious);
       if (markers.length) {
         const g = geometry(currentImage, rect.width, rect.height);
         ctx.save();
@@ -575,6 +581,7 @@ export default function SkyViewer({
     magnification,
     invert,
     currentWarnings,
+    currentSerious,
     display.markFlagged,
     dragBox,
     selection,
@@ -944,7 +951,8 @@ export default function SkyViewer({
               checked={display.markFlagged}
               onChange={(e) => update({ markFlagged: e.target.checked })}
             />{" "}
-            Mark flagged pixels ({currentWarnings.length})
+            Mark flagged pixels ({currentWarnings.length + (currentSerious?.length ?? 0)})
+            <span> · yellow warning · orange serious</span>
           </label>
         )}
         </div>

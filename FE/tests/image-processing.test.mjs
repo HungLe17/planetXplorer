@@ -10,6 +10,8 @@ import {
   defaults,
   exportName,
   fillComposite,
+  flagSeverity,
+  pixelFlagMarkers,
   frameAsset,
   grey,
   inspectBand,
@@ -51,6 +53,37 @@ function exposure(detector, wavelength, date, values, quality) {
 const a = exposure("D1", 1.0, "2026-01-01", [2, 8]),
   b = exposure("D2", 1.2, "2026-01-04", [5, 2]),
   c = exposure("D1", 1.0, "2026-06-02", [20, 10]);
+
+test("checker severity preserves serious precedence and photometry bits without uint32 wrapping", () => {
+  assert.equal(flagSeverity(0),0);
+  assert.equal(flagSeverity(2 ** 21),0);
+  for (let bit=0; bit<34; bit++) {
+    if (bit === 21) continue;
+    const severity = bit === 7 || bit === 33 ? 2 : 1;
+    assert.equal(flagSeverity(2 ** bit),severity,"bit "+bit);
+    assert.equal(flagSeverity(2 ** bit + 2 ** 21),severity);
+  }
+  assert.equal(flagSeverity(2 ** 33 + 128 + 4),2);
+});
+
+test("pixel borders aggregate measured contributor and reference flags independently of brightness and variance", () => {
+  const quality = (flags,status) => ({flags:Uint32Array.from(flags),status:Uint8Array.from(status),
+    archived:Float32Array.from([3,-2,NaN,4])});
+  const primary = exposure("D1",1,"2026-01-01",[3,-2,NaN,4],quality([2 ** 21,4,128,0],[129,1,5,1]));
+  const reference = exposure("D1",1,"2025-01-01",[3,-2,NaN,4],quality([0,128,4,128],[1,1,1,0]));
+  const unrelated = exposure("D2",2,"2026-01-01",[1,1,1,1],quality([128,128,128,128],[1,1,1,1]));
+  const p = {frame:primary.frame,inputs:[primary.frame],reference:[reference.frame],
+    sourcePlanes:[primary,reference,unrelated],layers:[]};
+  const markers = pixelFlagMarkers(p,4);
+  assert.deepEqual([...markers.warningPixels],[]);
+  assert.deepEqual([...markers.seriousPixels],[1,2]);
+  assert.deepEqual(pixelFlagMarkers({...p,sourcePlanes:[primary]},4,[primary,reference,unrelated]),markers);
+  p.reference = [];
+  const single = pixelFlagMarkers(p,4);
+  assert.deepEqual([...single.warningPixels],[1]);
+  assert.deepEqual([...single.seriousPixels],[2]);
+  assert.deepEqual(pixelFlagMarkers({...p,sourcePlanes:[]},4),{});
+});
 function visit(id, planes, status = "complete") {
   return {
     id,

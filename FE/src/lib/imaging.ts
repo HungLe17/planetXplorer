@@ -209,6 +209,7 @@ export type RenderedFrame = Frame & {
   sourceDates?: string[];
   previewScale?: PreviewScale;
   warningPixels?: Uint32Array;
+  seriousPixels?: Uint32Array;
   mapScales?: MapScale[];
 };
 export function frameAsset(frame: Frame, path: string, base: string) {
@@ -841,6 +842,31 @@ const flagNames: Record<number, string> = {
   29: "SATELLITE_HALO",
 };
 
+// Severity policy from spherex-flag-checker/src/spherex_flags/flags.py (MIT).
+// https://github.com/themilan1337/spherex-flag-checker/blob/main/src/spherex_flags/flags.py
+// FIT_ERROR is photometry-only bit 33. Arithmetic preserves it without uint32 wrapping.
+export function flagSeverity(flags: number): 0 | 1 | 2 {
+  if (Math.floor(flags / 2 ** 33) % 2 || Math.floor(flags / 2 ** 7) % 2) return 2;
+  return flags === 0 || flags === 2 ** 21 ? 0 : 1;
+}
+
+export function pixelFlagMarkers(product: Product, count: number, availablePlanes = product.sourcePlanes) {
+  const used = new Set([...product.inputs, ...product.reference].map(f => f.observation_id));
+  const planes = availablePlanes.filter(p => p.quality && used.has(p.frame.observation_id));
+  if (!planes.length) return {};
+  const warnings: number[] = [], serious: number[] = [];
+  for (let i = 0; i < count; i++) {
+    let severity = 0;
+    for (const plane of planes) {
+      const q = plane.quality!;
+      if (q.status[i] & 0x7f) severity = Math.max(severity, flagSeverity(q.flags[i]));
+    }
+    if (severity === 2) serious.push(i);
+    else if (severity === 1) warnings.push(i);
+  }
+  return {warningPixels:Uint32Array.from(warnings), seriousPixels:Uint32Array.from(serious)};
+}
+
 export function flagLabels(frame: Frame, bits: number) {
   const labels: string[] = [];
   for (let bit = 0; bit < 32; bit++)
@@ -863,7 +889,8 @@ export function inspectBand(p: Plane, i: number) {
     flags: flagLabels(p.frame, bits),
     treatment,
     uncertaintyUnavailable: !!(q && q.status[i] & 0x80),
-    warning: !!(bits & ~(1 << 21)),
+    severity: flagSeverity(bits),
+    warning: flagSeverity(bits) === 1,
   };
 }
 export type PixelRect = [number, number, number, number];
