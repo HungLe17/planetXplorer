@@ -42,22 +42,28 @@ export function useAssets<T>(
     [assets],
   );
   useEffect(() => {
-    const needed = new Set(urls);
-    for (const url of needed) {
-      const cached = assets.get(url);
-      if (!cached) start(url);
-      else if (capacity) {
-        // Refresh recency so stepping back through neighboring frames stays cheap.
-        assets.delete(url);
-        assets.set(url, cached);
+    let active = true;
+    // A superseded mount (including Strict Mode's probe) must not start a transfer.
+    queueMicrotask(() => {
+      if (!active) return;
+      const needed = new Set(urls);
+      for (const url of needed) {
+        const cached = assets.get(url);
+        if (!cached) start(url);
+        else if (capacity) {
+          // Refresh recency so stepping back through neighboring frames stays cheap.
+          assets.delete(url);
+          assets.set(url, cached);
+        }
       }
-    }
-    for (const [url, asset] of assets) {
-      if (needed.has(url)) continue;
-      if (capacity && assets.size <= capacity) break;
-      asset.abort.abort();
-      assets.delete(url);
-    }
+      for (const [url, asset] of assets) {
+        if (needed.has(url)) continue;
+        if (capacity && assets.size <= capacity) break;
+        asset.abort.abort();
+        assets.delete(url);
+      }
+    });
+    return () => { active = false; };
   }, [assets, capacity, start, urls]);
   const retry = useCallback(
     (url: string) => {

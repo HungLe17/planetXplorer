@@ -4,6 +4,7 @@ import {
   checkImportedFields,
   changes,
   readBackup,
+  readDisplay,
   type Entry,
   type Backup,
   type ArchiveCheck,
@@ -19,7 +20,10 @@ const entry: Entry = {
   id: "location",
   name: "Star",
   note: "follow up",
-  flag: "candidate",
+  fields: [
+    { name: "Follow up?", value: "candidate" },
+    { name: "", value: "" },
+  ],
   config,
   position: { ra_deg: 12.001, dec_deg: -7.01 },
   sources: ["test"],
@@ -28,7 +32,7 @@ const entry: Entry = {
   metadata: {},
 };
 const backup: Backup = {
-  version: 1,
+  version: 2,
   exported: "2026-11-14T12:00:00Z",
   config,
   locations: [entry],
@@ -43,16 +47,48 @@ test("round-trips each workspace export section, including picked position and p
     { config, locations: [entry] },
   ]) {
     const data = readBackup(
-      JSON.stringify({ version: 1, exported: backup.exported, ...fields }),
+      JSON.stringify({ version: 2, exported: backup.exported, ...fields }),
     );
     expect(!!data.config).toBe("config" in fields);
     expect(!!data.locations).toBe("locations" in fields);
     if (data.locations) expect(data.locations[0]).toMatchObject(entry);
   }
 });
+test("restoring a saved search retains its selected subbands", () => {
+  const bands = {detectors:["D2","D6"],channels:{D6:["D6 4.543210 µm (7.0.5)"]}};
+  const data = readBackup(JSON.stringify({...backup,config:{...config,query:{...config.query,...bands}}}));
+  expect(data.config?.query?.detectors).toEqual(bands.detectors);
+  expect(data.config?.query?.channels).toEqual(bands.channels);
+});
+
+test("upgrades legacy flags and allows blank questions or answers", () => {
+  const { fields, ...legacy } = entry;
+  for (const flag of ["candidate", ""]) {
+    const data = readBackup(
+      JSON.stringify({
+        ...backup,
+        version: 1,
+        locations: [{ ...legacy, flag }],
+      }),
+    );
+    expect(data.version).toBe(2);
+    expect(data.locations?.[0].fields).toEqual(
+      flag ? [{ name: "Personal flag", value: flag }] : [],
+    );
+    expect(readBackup(JSON.stringify(data))).toEqual(data);
+  }
+  expect(readBackup(JSON.stringify(backup)).locations?.[0].fields).toEqual(
+    fields,
+  );
+});
 test("rejects invalid or duplicate entries and invalid settings before restoring", () => {
   for (const invalid of [
     { ...backup, locations: [entry, entry] },
+    {
+      ...backup,
+      locations: [{ ...entry, fields: [{ name: "Question", value: false }] }],
+    },
+    { ...backup, locations: [{ ...entry, fields: null }] },
     {
       ...backup,
       locations: [{ ...entry, position: { ra_deg: 360, dec_deg: 0 } }],
@@ -74,6 +110,29 @@ test("rejects invalid or duplicate entries and invalid settings before restoring
     },
   ])
     expect(() => readBackup(JSON.stringify(invalid))).toThrow();
+});
+test("restores legacy RGB exposures and round-trips transparent map stops and background preference", () => {
+  const migrated = readDisplay({ mode: "rgb", rgb: ["aD1", "bD2", "cD3"] });
+  expect(migrated.maps.map((map) => Object.keys(map.operands))).toEqual([
+    ["exposure:aD1"],
+    ["exposure:bD2"],
+    ["exposure:cD3"],
+  ]);
+  const display = {
+    ...migrated,
+    prefetchBands: true,
+    maps: migrated.maps.map((map) => ({
+      ...map,
+      stops: [{ at: 0, color: "#00000000" }, map.stops[1]],
+    })),
+  };
+  const restored = readBackup(
+    JSON.stringify({ ...backup, config: { ...config, display } }),
+  );
+  expect(restored.config?.display).toEqual(display);
+  expect(() =>
+    readDisplay({ ...display, maps: [display.maps[0], display.maps[0]] }),
+  ).toThrow();
 });
 test("comparing a legacy cutout to the same source product does not imply reprocessing", () => {
   expect(changes(entry.snapshot, { test: "archive/DR1/test.fits" }, true)).toBe(

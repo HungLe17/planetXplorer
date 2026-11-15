@@ -44,6 +44,8 @@ export function queryUrl(query: Query, view?: unknown, frame?: string) {
   const url = new URL("/explore", window.location.origin);
   url.searchParams.set("ra", String(query.ra_deg));
   url.searchParams.set("dec", String(query.dec_deg));
+  if (query.detectors?.length)
+    url.searchParams.set("bands", JSON.stringify({ detectors: query.detectors, channels: query.channels ?? {} }));
   if (query.fov_arcsec && query.fov_arcsec !== 300)
     url.searchParams.set("fov", String(query.fov_arcsec));
   if (query.start_utc)

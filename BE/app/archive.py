@@ -11,13 +11,17 @@ https://caltech-ipac.github.io/spherex-archive-documentation/spherex-data-access
 import csv
 import io
 import os
+import random
 import re
 import ssl
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import UTC
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlsplit
 import xml.etree.ElementTree as ET
@@ -28,7 +32,8 @@ from astropy.time import Time
 from astropy.io.votable import parse_single_table
 
 from .config import Settings
-from .schemas import Query
+from .schemas import ObservationRecord, Query
+from .spectral import spectral_header_index
 
 
 ORIGIN = "https://irsa.ipac.caltech.edu"
@@ -41,6 +46,7 @@ RELEASES = {
 COLLECTION_TABLE = "/include/SIA2_collection_info.tsv"
 METADATA_PAGES = 8
 DETECTORS = tuple(f"D{i}" for i in range(1, 7))
+CUTOUT_ATTEMPTS = 4
 
 
 class ArchiveError(RuntimeError):
@@ -51,18 +57,29 @@ def archive_failure(exc: httpx.HTTPError, operation: str) -> str:
     if isinstance(exc, httpx.TimeoutException):
         return f"IRSA {operation} timed out. Retry later or use a narrower date range."
     if isinstance(exc, httpx.HTTPStatusError):
-        return (
-            f"IRSA {operation} returned HTTP {exc.response.status_code}. Retry later."
-        )
+        message = f"IRSA {operation} returned HTTP {exc.response.status_code}."
+        return message + " Retry later." if retryable(exc) else message
     return f"Cannot connect to IRSA for {operation}. Check the backend's internet access and proxy settings."
 
 
 def retryable(exc: httpx.HTTPError) -> bool:
-    return (
-        not isinstance(exc, httpx.HTTPStatusError)
-        or exc.response.status_code == 429
-        or exc.response.status_code >= 500
-    )
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (408, 429, 500, 502, 503, 504)
+    return isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError))
+
+
+def retry_after_seconds(response: httpx.Response) -> float:
+    value = response.headers.get("Retry-After", "").strip()
+    if value.isascii() and value.isdigit():
+        return float(value)
+    if value:
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is not None:
+                return max(0.0, date.timestamp() - time.time())
+        except (ValueError, TypeError, OverflowError, OSError):
+            pass
+    return 0.0
 
 
 @dataclass(frozen=True)
@@ -72,6 +89,10 @@ class Observation:
     mjd: float
     detector: str
     release: str
+
+    def record(self):
+        return ObservationRecord(id=self.identity, source_url=self.uri, detector=self.detector,
+                                 release=self.release, observed_at=Time(self.mjd, format="mjd").to_datetime(UTC).isoformat())
 
 
 Timing = Callable[[str, float, str | None, str], None]
@@ -126,8 +147,17 @@ class Archive:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.discovery_lock = threading.Lock()
+        self.discovery_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="collection-info")
+        self.discovery_future = None
         self.discovery_until = 0.0
         self.discovery_note = ""
+        self.spectral_lock = threading.Lock()
+        self.spectral_index = OrderedDict()
+        # One cutout allowance for this IRSA client, shared by all search jobs.
+        self.cutout_slots = threading.BoundedSemaphore(min(2, settings.cutout_workers))
+        self.cutout_lock = threading.Lock()
+        self.cutout_resume_at = 0.0
+        self.cutout_busy_status = 0
         token = os.getenv(TOKEN_ENV) if TOKEN_ENV else None
         self.client = httpx.Client(
             headers={"Authorization": f"Bearer {token}"} if token else None,
@@ -137,7 +167,50 @@ class Archive:
         )
 
     def close(self):
+        self.discovery_pool.shutdown(wait=True, cancel_futures=True)
         self.client.close()
+
+    def probe_spectral(self, obs: Observation, query: Query, deadline: float):
+        return self.spectral_at(obs.uri, query, deadline)
+
+    def cached_spectral(self, uri: str, query: Query):
+        key = (uri, query.ra_deg, query.dec_deg)
+        with self.spectral_lock:
+            if key in self.spectral_index:
+                self.spectral_index.move_to_end(key)
+                return self.spectral_index[key]
+        return None
+
+    def spectral_at(self, uri: str, query: Query, deadline: float):
+        """Inspect bounded calibration metadata, never a full-size science image."""
+        if info := self.cached_spectral(uri, query):
+            return info
+
+        def read_range(spec, byte_limit):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ArchiveError("Spectral metadata deadline reached")
+            with self.client.stream("GET", checked_url(uri),
+                                    headers={"Range": spec, "Accept-Encoding": "identity"},
+                                    timeout=min(self.settings.request_seconds, remaining)) as response:
+                if response.status_code != 206 or not response.headers.get("Content-Range"):
+                    raise ArchiveError("Spectral header byte ranges unavailable")
+                data = bytearray()
+                for chunk in response.iter_bytes(8192):
+                    if len(data) + len(chunk) > byte_limit or time.monotonic() >= deadline:
+                        raise ArchiveError("Spectral metadata read exceeded its limit")
+                    data.extend(chunk)
+                return bytes(data)
+        try:
+            info = spectral_header_index(read_range("bytes=0-92159", 92160),
+                                         read_range("bytes=-28800", 28800), query)
+        except (ArchiveError, httpx.HTTPError, ValueError, TypeError, IndexError, KeyError, OSError):
+            return None
+        with self.spectral_lock:
+            self.spectral_index[(uri, query.ra_deg, query.dec_deg)] = info
+            if len(self.spectral_index) > 2048:
+                self.spectral_index.popitem(last=False)
+        return info
 
     def discovery(self) -> str:
         with self.discovery_lock:
@@ -172,29 +245,45 @@ class Archive:
         started = time.monotonic()
         deadline = min(deadline, started + self.settings.metadata_seconds)
         announced = False
+        offered = set()
 
         def offer(batch):
             nonlocal announced
-            if announced:
+            if announced and not query.channels:
                 return
-            candidates = self._select_rows(batch)
-            if candidates:
-                # A collection's latest visit is likely to survive date/detector sampling.
-                candidate = candidates[-1]
-                announced = True
-                if timing:
+            candidates = []
+            for obs in reversed(self._select_rows(batch)):
+                if obs in offered or query.band_match(obs.detector) == "excluded":
+                    continue
+                info = self.cached_spectral(obs.uri, query) if obs.detector in query.channels else None
+                match = query.band_match(obs.detector, info["wavelength_um"], info["bandwidth_um"],
+                                         info["processing_version"]) if info else query.band_match(obs.detector)
+                if match != "excluded":
+                    candidates.append((match, obs))
+            # Existing target-local calibration can establish an immediate match. Unknowns
+            # are offered to the job for metadata probing, never directly for download.
+            for _, candidate in sorted(candidates, key=lambda item: item[0] != "matched"):
+                offered.add(candidate)
+                if not announced and timing:
                     timing("first_candidate", time.monotonic() - started, candidate.identity, "ok")
+                announced = True
                 if on_candidate:
                     on_candidate(candidate)
+                if not query.channels:
+                    break
 
-        # Collection discovery is informational. Let it run alongside the actual field search.
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            discovery = pool.submit(self.discovery) if query.live else None
-            rows, notes = self._search_field(
-                query, deadline, offer if on_candidate or timing else None, timing
-            )
-            if discovery and (note := discovery.result()):
-                notes.insert(1, note)
+        # This advisory inventory describes other published collections. A slow
+        # inventory response must never hold up an already reconciled sky catalog.
+        if query.live and self.discovery_lock.acquire(blocking=False):
+            try:
+                if (time.monotonic() >= self.discovery_until
+                        and (self.discovery_future is None or self.discovery_future.done())):
+                    self.discovery_future = self.discovery_pool.submit(self.discovery)
+            finally:
+                self.discovery_lock.release()
+        rows, notes = self._search_field(query, deadline, offer if on_candidate or timing else None, timing)
+        if query.live and self.discovery_note:
+            notes.insert(1, self.discovery_note)
         return rows, notes
 
     def _search_field(self, query, deadline, offer, timing):
@@ -481,54 +570,82 @@ class Archive:
                     for obs in (groups[det][-1:] if quota == 1 else evenly_spaced(groups[det], quota))]
         return sorted(selected, key=lambda o: (o.mjd, o.identity))
 
+    def _await_cutout(self, not_before: float, deadline: float, on_wait: Callable[[], None] | None):
+        while True:
+            now = time.monotonic()
+            with self.cutout_lock:
+                resume = max(not_before, self.cutout_resume_at)
+                busy = self.cutout_busy_status if self.cutout_resume_at > now else None
+            if max(now, resume) >= deadline:
+                if busy:
+                    raise ArchiveError(f"IRSA cutout service is busy (HTTP {busy}). Retry later.")
+                raise ArchiveError("Cutout download time limit reached. Retry later.")
+            if resume <= now:
+                return
+            if on_wait:
+                on_wait()
+            time.sleep(min(resume - now, 1.0))
+
+    def _download_cutout(self, url, path, deadline, started, timing, observation_id):
+        current = url
+        for _ in range(4):
+            checked_url(current)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ArchiveError("Cutout download time limit reached. Retry later.")
+            with self.client.stream("GET", current, timeout=min(self.settings.request_seconds, remaining)) as r:
+                if r.is_redirect:
+                    current = urljoin(current, r.headers["location"])
+                    continue
+                r.raise_for_status()
+                total = 0
+                with path.open("wb") as f:
+                    for chunk in response_chunks(r, started, timing, "cutout_first_byte", observation_id):
+                        if time.monotonic() >= deadline:
+                            raise ArchiveError("Cutout download time limit reached. Retry later.")
+                        total += len(chunk)
+                        if total > self.settings.max_download_bytes:
+                            raise ArchiveError("Archive cutout exceeded the download limit")
+                        f.write(chunk)
+                return
+        raise ArchiveError("Archive returned too many redirects")
+
     def fetch(self, obs: Observation, query: Query, path: Path, deadline: float, *,
-              timing: Timing | None = None):
-        url = (
-            checked_url(obs.uri)
-            + "?"
-            + urlencode({"center": f"{query.ra_deg},{query.dec_deg}d", "size": query.fov_arcsec / 3600})
-        )
-        for attempt in range(2):
-            started = time.monotonic()
-            try:
-                current = url
-                for _ in range(4):
-                    checked_url(current)
-                    with self.client.stream(
-                        "GET",
-                        current,
-                        timeout=max(
-                            0.1,
-                            min(
-                                self.settings.request_seconds,
-                                deadline - time.monotonic(),
-                            ),
-                        ),
-                    ) as r:
-                        if r.is_redirect:
-                            current = urljoin(current, r.headers["location"])
-                            continue
-                        r.raise_for_status()
-                        total = 0
-                        with path.open("wb") as f:
-                            for chunk in response_chunks(r, started, timing, "cutout_first_byte", obs.identity):
-                                if time.monotonic() > deadline:
-                                    raise ArchiveError("Processing deadline reached")
-                                total += len(chunk)
-                                if total > self.settings.max_download_bytes:
-                                    raise ArchiveError(
-                                        "Archive cutout exceeded the download limit"
-                                    )
-                                f.write(chunk)
-                        return url
-                raise ArchiveError("Archive returned too many redirects")
-            except ArchiveError:
-                path.unlink(missing_ok=True)
-                raise
-            except httpx.HTTPError as exc:
-                path.unlink(missing_ok=True)
-                if attempt or not retryable(exc) or time.monotonic() >= deadline:
-                    raise ArchiveError(archive_failure(exc, "cutout download")) from exc
-                record_retry(timing, "cutout_retry", started, exc, obs.identity)
-                time.sleep(min(0.5, max(0, deadline - time.monotonic())))
-        raise ArchiveError("Cutout download failed")
+              timing: Timing | None = None, on_wait: Callable[[], None] | None = None):
+        url = checked_url(obs.uri) + "?" + urlencode({
+            "center": f"{query.ra_deg},{query.dec_deg}d", "size": query.fov_arcsec / 3600,
+        })
+        while not self.cutout_slots.acquire(timeout=min(1.0, max(0, deadline - time.monotonic()))):
+            if time.monotonic() >= deadline:
+                raise ArchiveError("Cutout download time limit reached while queued. Retry later.")
+            if on_wait:
+                on_wait()
+        try:
+            retry_at = 0.0
+            for attempt in range(CUTOUT_ATTEMPTS):
+                self._await_cutout(retry_at, deadline, on_wait)
+                started = time.monotonic()
+                try:
+                    self._download_cutout(url, path, deadline, started, timing, obs.identity)
+                    return url
+                except httpx.HTTPError as exc:
+                    path.unlink(missing_ok=True)
+                    if not retryable(exc):
+                        raise ArchiveError(archive_failure(exc, "cutout download")) from exc
+                    delay = 2 ** attempt + random.uniform(0, 1)
+                    if isinstance(exc, httpx.HTTPStatusError):
+                        delay = max(delay, retry_after_seconds(exc.response))
+                    retry_at = time.monotonic() + delay
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (429, 503):
+                        with self.cutout_lock:
+                            if retry_at > self.cutout_resume_at:
+                                self.cutout_resume_at = retry_at
+                                self.cutout_busy_status = exc.response.status_code
+                    if attempt + 1 == CUTOUT_ATTEMPTS or retry_at >= deadline:
+                        raise ArchiveError(archive_failure(exc, "cutout download")) from exc
+                    record_retry(timing, "cutout_retry", started, exc, obs.identity)
+        except (ArchiveError, OSError):
+            path.unlink(missing_ok=True)
+            raise
+        finally:
+            self.cutout_slots.release()

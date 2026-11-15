@@ -15,7 +15,7 @@ type Props = {
   saveEntries: (e: Entry[]) => void;
   reopen: (e: Entry) => void;
   restore: (b: Backup) => void;
-  selected: Omit<Entry, "id" | "name" | "note" | "flag"> | null;
+  selected: Omit<Entry, "id" | "name" | "note" | "fields"> | null;
   consent: boolean | null;
   setConsent: (v: boolean) => void;
   onError: (s: string) => void;
@@ -47,7 +47,7 @@ export default function WorkspacePanel({
         id: crypto.randomUUID(),
         name: "",
         note: "",
-        flag: "",
+        fields: [],
       });
   }
   function saveEntry() {
@@ -58,11 +58,11 @@ export default function WorkspacePanel({
         ? entries.map((e) => (e.id === draft.id ? draft : e))
         : [...entries, draft],
     );
-    setDraft(null);
+    setFind("");
     if (consent === null) setShowPrompt(true);
   }
   function exportJson() {
-    const data: Backup = { version: 1, exported: new Date().toISOString() };
+    const data: Backup = { version: 2, exported: new Date().toISOString() };
     if (section !== "locations") {
       data.config = backup.config;
       data.snapshot = backup.snapshot;
@@ -86,7 +86,10 @@ export default function WorkspacePanel({
       const data = readBackup(await file.text());
       if (controller.signal.aborted) return;
       restore(data);
-      setDraft(null);
+      if (data.locations) {
+        setFind("");
+        setDraft(data.locations[0] ?? null);
+      }
       setImportDate(data.exported);
       setChecking(true);
       if (consent === null) setShowPrompt(true);
@@ -103,9 +106,156 @@ export default function WorkspacePanel({
       if (!controller.signal.aborted) setChecking(false);
     }
   }
+  const search = find.trim().toLowerCase();
+  const visibleEntries = entries.filter((entry) =>
+    [
+      entry.name,
+      entry.note,
+      String(entry.position.ra_deg),
+      String(entry.position.dec_deg),
+      ...entry.fields.flatMap(({ name, value }) => [name, value]),
+    ].some((text) => text.toLowerCase().includes(search)),
+  );
+  const saved = entries.find((entry) => entry.id === draft?.id);
+  function updateField(index: number, key: "name" | "value", text: string) {
+    if (!draft) return;
+    setDraft({
+      ...draft,
+      fields: draft.fields.map((field, i) =>
+        i === index ? { ...field, [key]: text } : field,
+      ),
+    });
+  }
   return (
-    <section className="science-controls">
-      <h3>Workspace</h3>
+    <section className="science-controls saved-workspace">
+      <div className="saved-actions">
+        <button type="button" onClick={add} disabled={!selected}>
+          Add location
+        </button>
+      </div>
+      <div className="saved-split">
+        <div className="saved-list">
+          <label>
+            Find locations
+            <input
+              type="search"
+              value={find}
+              onChange={(e) => setFind(e.target.value)}
+            />
+          </label>
+          <ul aria-label="Saved location list">
+            {visibleEntries.map((entry) => (
+              <li key={entry.id}>
+                <button
+                  type="button"
+                  className="saved-choice"
+                  aria-pressed={entry.id === draft?.id}
+                  onClick={() => setDraft(entry)}
+                >
+                  <strong>{entry.name || "Sky location"}</strong>
+                  <small>
+                    {entry.position.ra_deg.toFixed(5)}°,{" "}
+                    {entry.position.dec_deg.toFixed(5)}°
+                  </small>
+                </button>
+              </li>
+            ))}
+          </ul>
+          {visibleEntries.length === 0 && (
+            <p>
+              {entries.length
+                ? "No matching locations."
+                : "No saved locations."}
+            </p>
+          )}
+        </div>
+        {draft ? (
+          <form
+            className="saved-editor"
+            onSubmit={(e) => {
+              e.preventDefault();
+              saveEntry();
+            }}
+          >
+            <label>
+              Location name
+              <input
+                value={draft.name}
+                onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+              />
+            </label>
+            <p>
+              RA {draft.position.ra_deg.toFixed(6)}° · Dec{" "}
+              {draft.position.dec_deg.toFixed(6)}°
+            </p>
+            {draft.fields.map((field, i) => (
+              <div className="saved-field-row" key={i}>
+                <label>
+                  Field name
+                  <input
+                    aria-label={`Field name ${i + 1}`}
+                    value={field.name}
+                    onChange={(e) => updateField(i, "name", e.target.value)}
+                  />
+                </label>
+                <label>
+                  Value
+                  <input
+                    aria-label={`Field value ${i + 1}`}
+                    value={field.value}
+                    onChange={(e) => updateField(i, "value", e.target.value)}
+                  />
+                </label>
+                <button
+                  type="button"
+                  aria-label={`Remove field ${i + 1}`}
+                  onClick={() =>
+                    setDraft({
+                      ...draft,
+                      fields: draft.fields.filter((_, index) => index !== i),
+                    })
+                  }
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              onClick={() =>
+                setDraft({
+                  ...draft,
+                  fields: [...draft.fields, { name: "", value: "" }],
+                })
+              }
+            >
+              + Add field
+            </button>
+            <label>
+              Notes
+              <textarea
+                value={draft.note}
+                onChange={(e) => setDraft({ ...draft, note: e.target.value })}
+              />
+            </label>
+            <div className="saved-actions">
+              <button type="submit">Save entry</button>
+              {saved && (
+                <button type="button" onClick={() => reopen(saved)}>
+                  Open view
+                </button>
+              )}
+              <button type="button" onClick={() => setDraft(saved ?? null)}>
+                Cancel
+              </button>
+            </div>
+          </form>
+        ) : (
+          <p className="saved-editor">
+            Select a location to edit or reopen it.
+          </p>
+        )}
+      </div>
       <button type="button" onClick={() => setShowPrompt(true)}>
         {consent ? "Device saving settings" : "Save your work"}
       </button>
@@ -144,83 +294,6 @@ export default function WorkspacePanel({
           </button>
         </div>
       )}
-      <details>
-        <summary>Saved locations ({entries.length})</summary>
-        <button onClick={add} disabled={!selected}>
-          Add location
-        </button>{" "}
-        <button onClick={() => setDraft(null)}>Browse</button>
-        {draft ? (
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              saveEntry();
-            }}
-          >
-            <p>
-              {draft.position.ra_deg.toFixed(6)}°,{" "}
-              {draft.position.dec_deg.toFixed(6)}°
-            </p>
-            <label>
-              Name
-              <input
-                value={draft.name}
-                onChange={(e) => setDraft({ ...draft, name: e.target.value })}
-              />
-            </label>
-            <label>
-              Personal flag
-              <input
-                value={draft.flag}
-                onChange={(e) => setDraft({ ...draft, flag: e.target.value })}
-              />
-            </label>
-            <label>
-              Notes
-              <textarea
-                value={draft.note}
-                onChange={(e) => setDraft({ ...draft, note: e.target.value })}
-              />
-            </label>
-            <button type="submit">Save entry</button>{" "}
-            <button type="button" onClick={() => setDraft(null)}>
-              Cancel
-            </button>
-          </form>
-        ) : (
-          <>
-            <label>
-              Find entries
-              <input value={find} onChange={(e) => setFind(e.target.value)} />
-            </label>
-            {entries
-              .filter((e) =>
-                [
-                  e.name,
-                  e.note,
-                  e.flag,
-                  String(e.position.ra_deg),
-                  String(e.position.dec_deg),
-                ]
-                  .join(" ")
-                  .toLowerCase()
-                  .includes(find.toLowerCase()),
-              )
-              .map((e) => (
-                <article key={e.id}>
-                  <strong>{e.name || "Sky location"}</strong> {e.flag}
-                  <p>
-                    {e.position.ra_deg.toFixed(5)}°,{" "}
-                    {e.position.dec_deg.toFixed(5)}°
-                  </p>
-                  <p>{e.note}</p>
-                  <button onClick={() => setDraft(e)}>Edit</button>{" "}
-                  <button onClick={() => reopen(e)}>Open view</button>
-                </article>
-              ))}
-          </>
-        )}
-      </details>
       <details>
         <summary>Import / export JSON</summary>
         <label>

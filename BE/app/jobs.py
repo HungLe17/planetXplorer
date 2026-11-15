@@ -5,6 +5,7 @@ import re
 import shutil
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,7 +14,9 @@ from uuid import uuid4
 from .archive import ASSET_PREFIX, ORIGIN, RELEASES
 from .config import Settings
 from .pipeline import PIPELINE_VERSION, Pipeline, atomic_json, update_counts
-from .schemas import Job, JobTiming, Manifest, ObservationRecord, Query
+from .schemas import Job, JobTiming, Manifest, ObservationRecord, Query, channel_parameters
+from .visits import field_visits
+from .transfers import PriorityLoads
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +41,7 @@ def result_status(manifest: Manifest) -> str:
 def prepared_manifest(folder: Path) -> Manifest | None:
     try:
         manifest = Manifest.model_validate_json((folder / "manifest.json").read_text(encoding="utf-8"))
-        if not manifest.frames or manifest.processing.get("version") not in {"1.0.0", PIPELINE_VERSION}:
+        if not manifest.frames or manifest.processing.get("version") not in {"1.0.0", "2.0.0", PIPELINE_VERSION}:
             return None
         for frame in manifest.frames:
             if not re.fullmatch(r"frame-(?:[0-9]{2,4}|[a-f0-9]{24})\.png", frame.id):
@@ -47,9 +50,11 @@ def prepared_manifest(folder: Path) -> Manifest | None:
             if frame.pixels and frame.pixels != stem + ".bin":
                 return None
             if frame.quality and (not frame.pixels or frame.quality != stem + "-quality.bin"
-                                  or manifest.processing.get("version") != PIPELINE_VERSION):
+                                  or manifest.processing.get("version") not in {"2.0.0", PIPELINE_VERSION}):
                 return None
-            if any(not (folder / name).is_file() for name in (frame.id, frame.pixels, frame.quality) if name):
+            if frame.spectral and (not frame.pixels or frame.spectral != stem + "-spectral.bin"):
+                return None
+            if any(not (folder / name).is_file() for name in (frame.id, frame.pixels, frame.quality, frame.spectral) if name):
                 return None
         return manifest
     except (ValueError, OSError):
@@ -68,15 +73,23 @@ class Jobs:
         self.root.mkdir(parents=True, exist_ok=True)
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="spherex")
         self.lock = threading.RLock()
+        self.channel_lookups = threading.BoundedSemaphore(2)
+        self.channel_catalogs = OrderedDict()
         self.records: dict[str, Job] = {}
         self.published_assets: dict[str, set[str]] = {}
         self.started: dict[str, float] = {}
         self.cache: dict[str, str] = {}
         self.cancel_events: dict[str, threading.Event] = {}
         self.futures = {}
+        self.priority_loads: dict[str, PriorityLoads] = {}
+        self.closing = False
 
     def close(self):
+        with self.lock:
+            self.closing = True
         self.executor.shutdown(wait=True, cancel_futures=True)
+        if isinstance(self.pipeline, Pipeline):
+            self.pipeline.transfers.close()
 
     def cleanup(self):
         now = datetime.now(UTC)
@@ -96,6 +109,7 @@ class Jobs:
             self.started.pop(key, None)
             self.cancel_events.pop(key, None)
             self.futures.pop(key, None)
+            self.priority_loads.pop(key, None)
         for directory in self.root.iterdir():
             if not directory.is_dir() or directory.name in active:
                 continue
@@ -174,6 +188,7 @@ class Jobs:
                 self.cache[key] = job_id
                 return job_id
             self.cancel_events[job_id] = threading.Event()
+            self.priority_loads[job_id] = PriorityLoads()
             self.cache[key] = job_id
             self.futures[job_id] = self.executor.submit(
                 self._run, job_id, query, directory, key
@@ -201,8 +216,11 @@ class Jobs:
                         shutil.copyfile(folder / frame.pixels, directory / frame.pixels)
                     if frame.quality:
                         shutil.copyfile(folder / frame.quality, directory / frame.quality)
+                    if frame.spectral:
+                        shutil.copyfile(folder / frame.spectral, directory / frame.spectral)
                     shutil.copyfile(folder / frame.id, directory / frame.id)
                     frame.url = f"/api/assets/{job_id}/{frame.id}"
+                manifest.visits = field_visits(manifest, manifest.frames)
                 manifest.cached = True
                 manifest.warnings.insert(
                     0,
@@ -239,7 +257,7 @@ class Jobs:
                 self.cache = {k: v for k, v in self.cache.items() if v != job_id}
             return job.model_copy(deep=True) if job else None
 
-    def load_more(self, job_id: str, ids: list[str], detector: str | None) -> str:
+    def load_more(self, job_id: str, ids: list[str], detector: str | None, channels=None) -> str:
         with self.lock:
             self.cleanup()
             job = self.records.get(job_id)
@@ -256,6 +274,9 @@ class Jobs:
                 raise CapacityError("This field reached the loaded-image limit; narrow the date range")
             requested = list(dict.fromkeys(ids)) if ids else [r.id for r in records.values() if r.status == "pending"]
             selected = [i for i in requested if records[i].status != "ready"
+                        and records[i].selection != "excluded"
+                        and (not manifest.query.live or manifest.query.detectors is None
+                             or records[i].detector in manifest.query.detectors)
                         and (detector is None or records[i].detector == detector)]
             selected = selected[:min(self.settings.batch_size, remaining)]
             if not selected:
@@ -264,11 +285,34 @@ class Jobs:
             job.status = job.stage = "queued"
             job.error = None
             self.cancel_events[job_id] = threading.Event()
+            self.priority_loads[job_id] = PriorityLoads()
             key = cache_key(manifest.query)
             self.cache[key] = job_id
             self.futures[job_id] = self.executor.submit(
-                self._run, job_id, manifest.query, self.root / job_id, key, selected
+                self._run, job_id, manifest.query, self.root / job_id, key, selected, channels
             )
+            return job_id
+
+    def prioritize(self, job_id: str, obs_id: str) -> str:
+        with self.lock:
+            self.cleanup()
+            job = self.records.get(job_id)
+            if not job or not job.manifest:
+                raise KeyError("Unknown field or the catalog has not arrived")
+            record = next((r for r in job.manifest.observations if r.id == obs_id), None)
+            if not record:
+                raise ValueError("Observation is not part of this field")
+            if record.selection == "excluded" or record.band_match(job.manifest.query) == "excluded":
+                raise ValueError("Observation is outside the selected bands")
+            if job.status == "cancelling":
+                raise CapacityError("Search cancellation is in progress")
+            if record.status == "ready":
+                return job_id
+            if job.status in ("running", "queued"):
+                self.priority_loads[job_id].request(obs_id)
+                return job_id
+            self.load_more(job_id, [obs_id], None)
+            self.priority_loads[job_id].request(obs_id)
             return job_id
 
     # Call under self.lock so polling always sees a consistent manifest and clock.
@@ -296,6 +340,8 @@ class Jobs:
                 assets.add(frame.pixels)
             if frame.quality:
                 assets.add(frame.quality)
+            if frame.spectral:
+                assets.add(frame.spectral)
 
     def _finish_timing(self, job):
         self._timing(job, "total", outcome=job.status)
@@ -307,9 +353,10 @@ class Jobs:
         except OSError:
             logger.exception("Could not persist timings for job %s", job.job_id)
 
-    def _run(self, job_id: str, query: Query, directory: Path, key: str, ids=None):
+    def _run(self, job_id: str, query: Query, directory: Path, key: str, ids=None, channels=None):
         job = self.records[job_id]
         cancelled = self.cancel_events[job_id]
+        priority = self.priority_loads[job_id]
 
         def report(stage):
             with self.lock:
@@ -338,11 +385,14 @@ class Jobs:
             if cancelled.is_set():
                 raise JobCancelled("Search cancelled")
             if ids is not None:
+                options = {"channels": channels} if channels else {}
+                if isinstance(self.pipeline, Pipeline):
+                    options["priority"] = priority
                 result = self.pipeline.load(job.manifest, ids, directory, job_id, report,
-                                            publish=publish, timing=timing)
+                                            publish=publish, timing=timing, **options)
             elif isinstance(self.pipeline, Pipeline):
                 result = self.pipeline.run(
-                    query, directory, job_id, report, publish=publish, timing=timing
+                    query, directory, job_id, report, publish=publish, timing=timing, priority=priority
                 )
             else:
                 result = self.pipeline.run(query, directory, job_id, report)
@@ -363,6 +413,19 @@ class Jobs:
             else:
                 self._publish(job, result)
                 job.status = result_status(result)
+                # A click can arrive after the dispatcher drained, during final
+                # rendering. Keep it in this job before allowing the next poll.
+                trailing = priority.take_waiting()
+                if trailing:
+                    records = {r.id: r for r in result.observations}
+                    trailing = [i for i in trailing if i in records and records[i].status != "ready"
+                                and records[i].selection != "excluded"]
+                if trailing and not self.closing and len(result.frames) < self.settings.max_frames:
+                    job.status = job.stage = "queued"
+                    self.futures[job_id] = self.executor.submit(
+                        self._run, job_id, query, directory, key, trailing
+                    )
+                    return
             if job.status in ("failed", "cancelled"):
                 if job.manifest:
                     for record in job.manifest.observations:
@@ -381,6 +444,91 @@ class Jobs:
             self.cleanup()
             job = self.records.get(job_id)
             return job.model_copy(deep=True) if job else None
+
+    def channel_options(self, job_id: str, detector: str, cursor: int):
+        job = self.get(job_id)
+        if not job:
+            raise KeyError("Unknown or expired field")
+        if not job.manifest:
+            raise ValueError("The field catalog is still loading")
+        if not self.channel_lookups.acquire(blocking=False):
+            raise CapacityError("Wavelength lookups are busy. Retry shortly.")
+        try:
+            return self._detector_channels(job.manifest, detector, cursor)
+        finally:
+            self.channel_lookups.release()
+
+    def field_channels(self, query: Query, detector: str, cursor: int):
+        if not self.channel_lookups.acquire(blocking=False):
+            raise CapacityError("Wavelength lookups are busy. Retry shortly.")
+        try:
+            key = (query.ra_deg, query.dec_deg, query.start_utc, query.end_utc)
+            with self.lock:
+                cached = self.channel_catalogs.get(key)
+            if cached and cached[0] > time.monotonic():
+                rows, complete = cached[1:]
+            else:
+                archive = self.pipeline.archive
+                rows, notes = archive.search(query.model_copy(update={"live": True}),
+                                             time.monotonic() + self.settings.metadata_seconds)
+                complete = not any(n.startswith("Partial metadata:") for n in notes)
+                if complete:
+                    with self.lock:
+                        self.channel_catalogs[key] = time.monotonic() + 120, rows, complete
+                        self.channel_catalogs.move_to_end(key)
+                        if len(self.channel_catalogs) > 8:
+                            self.channel_catalogs.popitem(last=False)
+            manifest = Manifest(query=query, retrieved_at=datetime.now(UTC).isoformat(),
+                                discovery_complete=complete,
+                                observations=[o.record() for o in rows if o.detector == detector])
+            return self._detector_channels(manifest, detector, cursor)
+        finally:
+            self.channel_lookups.release()
+
+    def _detector_channels(self, manifest: Manifest, detector: str, cursor: int):
+        records = sorted((r for r in manifest.observations if r.detector == detector),
+                         key=lambda r: r.id)
+        frames = {f.observation_id: f.channel for f in manifest.frames if f.detector == detector}
+        labels = {label for label in frames.values() if label}
+        query = manifest.query
+        cache = getattr(self.pipeline, "exposure_cache", None)
+        cutouts = cache.field_index(query) if cache else {}
+        archive = getattr(self.pipeline, "archive", None)
+        unresolved = []
+        for i, record in enumerate(records):
+            label = record.channel or frames.get(record.id)
+            if not label:
+                info = cutouts.get((record.id, record.source_url))
+                if not info and archive:
+                    info = archive.cached_spectral(record.source_url, query)
+                if info and info.get("wavelength_um") is not None:
+                    label = f"{detector} {info['wavelength_um']:.6f} µm ({info['processing_version']})"
+            if label:
+                labels.add(label)
+            else:
+                unresolved.append((i, record))
+
+        pending = [(i, record) for i, record in unresolved if i >= cursor]
+        page = pending[:self.settings.batch_size]
+        unavailable = 0
+        deadline = time.monotonic() + min(self.settings.metadata_seconds, 30)
+        if page:
+            with ThreadPoolExecutor(max_workers=min(self.settings.cutout_workers, 4)) as pool:
+                lookups = [pool.submit(archive.spectral_at, r.source_url, query, deadline)
+                           for _, r in page] if archive else []
+                for future in lookups:
+                    if info := future.result():
+                        labels.add(f"{detector} {info['wavelength_um']:.6f} µm ({info['processing_version']})")
+                    else:
+                        unavailable += 1
+                if not archive:
+                    unavailable += len(page)
+        more = pending[len(page):]
+        return {
+            "channels": sorted(labels, key=lambda label: (channel_parameters(label) or ("", 0, label))),
+            "unavailable": unavailable, "next_cursor": more[0][0] if more else None,
+            "total": len(records), "catalog_complete": manifest.discovery_complete,
+        }
 
     def asset(self, job_id: str, asset_id: str) -> Path | None:
         with self.lock:

@@ -3,123 +3,305 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import gifenc from "gifenc";
 import {
+  activeChannels,
+  activeDetectors,
+  archivedAt,
   defaults,
-  products,
-  displayBounds,
-  intensityByte,
-  palette,
-  thermal,
-  skyPosition,
-  skyPixel,
-  previewScale,
-  fillImageData,
-  inspectBand,
-  bandWarning,
-  pixelVisible,
   exportName,
+  fillComposite,
+  frameAsset,
   grey,
+  inspectBand,
+  imageTimeline,
+  intensityByte,
+  mapBounds,
+  measureSpectrum,
+  newMap,
+  palette,
+  previewScale,
+  products,
+  readMaps,
+  skyPixel,
+  skyPosition,
+  spectrumBins,
+  thermal,
 } from "../src/lib/imaging.ts";
 
-function exposure(detector, wavelength, date, values) {
+function exposure(detector, wavelength, date, values, quality) {
   const id = detector + "-" + wavelength + "-" + date;
   return {
     frame: {
       id,
-      url: id + ".png",
       observation_id: id,
-      observed_at: date,
+      url: id + ".png",
       detector,
+      observed_at: date,
       wavelength_um: wavelength,
       channel: detector + " " + wavelength + " µm",
     },
     values: Float32Array.from(values),
+    quality,
   };
 }
-const a = exposure("D2", 1.1, "2026-01-01", [2, NaN]);
-const b = exposure("D2", 1.2, "2026-06-01", [8, 12]);
-const c = exposure("D3", 2.2, "2026-11-10", [3, 4]);
-
-test("the unfiltered timeline includes each ready wavelength in acquisition order", () => {
-  for (const ready of [[b], [a, b], [a, b, c]])
-    assert.deepEqual(
-      products(ready, defaults).map((p) => p.frame),
-      ready.map((p) => p.frame),
-    );
-});
-
-test("detector selection averages wavelengths equally rather than weighting by exposure counts", () => {
-  const later = exposure("D2", 1.1, "2026-12-10", [6, 8]);
-  const images = products([a, b, c, later], {
+const a = exposure("D1", 1.0, "2026-01-01", [2, 8]),
+  b = exposure("D2", 1.2, "2026-01-04", [5, 2]),
+  c = exposure("D1", 1.0, "2026-06-02", [20, 10]);
+function visit(id, planes, status = "complete") {
+  return {
+    id,
+    observation_ids: planes.map((p) => p.frame.observation_id),
+    start_utc: planes[0].frame.observed_at,
+    end_utc: planes.at(-1).frame.observed_at,
+    status,
+    issues: [],
+  };
+}
+function map(name, operands, extra = {}) {
+  return { ...newMap(name, name), operands, ...extra };
+}
+function rgba(p) {
+  const input = new Uint8ClampedArray(4 * p.layers[0].values.length);
+  const scales = p.layers.map(({ map, values }) => ({
+    ...map,
+    bounds: mapBounds(values, map),
+  }));
+  fillComposite(input, p.layers, scales);
+  return [...input];
+}
+test("visits combine signed channels only within the same valid visit; raw browsing retains each exposure", () => {
+  const d = exposure("D1", 0.9, "2026-01-02", [7, 1]);
+  const data = [a, d, b, c],
+    visits = [visit("one", [a, d, b]), visit("two", [c], "invalid")];
+  const display = {
     ...defaults,
-    windowDays: 0,
-    operands: { D2: 1, [c.frame.channel]: -1 },
-  });
-  assert.equal(images.length, 1);
-  assert.deepEqual([...images[0].planes[0]], [3, 6]);
-  assert.equal(images[0].inputs.length, 4);
+    maps: [map("sum", { D1: 1, D2: -1 }), map("D2", { [b.frame.channel]: 1 })],
+  };
+  const [out] = products(data, display, visits);
+  assert.equal(out.frame.observation_id, "one");
+  assert.deepEqual([...out.layers[0].values], [4, 7]);
+  assert.deepEqual([...out.layers[1].values], [5, 2]);
+  assert.deepEqual(out.sourcePlanes, [a, d, b]);
+  assert.equal(products(data, display, visits).length, 1);
+  assert.deepEqual(
+    products(data, display, visits, true).map((p) => p.frame),
+    data.map((p) => p.frame),
+  );
+  assert.deepEqual(
+    products(data, display).map((p) => p.frame),
+    data.map((p) => p.frame),
+  );
 });
-
-test("static RGB uses the selected exposures regardless of date window", () => {
-  const s = {
+test("supplemental exposures remain browsable and do not enter cycle maps or difference references", () => {
+  const extra = exposure("D1", 1.0, "2026-04-01", [500, 300]);
+  const planes = [a, extra, c];
+  const visits = [visit("jan", [a]), { ...visit("apr", [extra]), kind: "supplemental" }, visit("jun", [c])];
+  const display = {
+    ...defaults,
+    maps: [map("diff", { D1: 1 }, { difference: true, windowDays: 1, exclusionDays: 3 })],
+  };
+  const grouped = products(planes, display, visits);
+  assert.deepEqual(grouped.map(p => p.frame.observation_id), ["jan", "jun"]);
+  assert.deepEqual([...grouped[1].layers[0].values], [18, 2]);
+  assert.deepEqual(products(planes, defaults, visits, true).map(p => p.frame), planes.map(p => p.frame));
+});
+test("two rows add colors, saturate components at 255 and preserve alpha", () => {
+  const e = exposure("D1", 1, "2026-01-01", [10, 5, NaN, -4]),
+    other = exposure("D2", 1.2, "2026-01-01", [10, NaN, 8, -3]);
+  const rows = [
+    map(
+      "R",
+      { D1: 1 },
+      {
+        stops: [
+          { at: 0, color: "#ff000000" },
+          { at: 1, color: "#ff0000" },
+        ],
+        low: "0",
+        high: "10",
+        stretch: "linear",
+      },
+    ),
+    map(
+      "yellow",
+      { D2: 1 },
+      {
+        stops: [
+          { at: 0, color: "#ffff00" },
+          { at: 1, color: "#ffff00" },
+        ],
+      },
+    ),
+  ];
+  const [p] = products([e, other], { ...defaults, maps: rows }, [
+    visit("v", [e, other]),
+  ]);
+  assert.deepEqual(
+    rgba(p),
+    [255, 255, 0, 255, 255, 0, 0, 128, 255, 255, 0, 255, 0, 0, 0, 0],
+  );
+});
+test("pixel flags preserve finite archives, negatives remain available in Details and overflow uses field max before manual stretch", () => {
+  const q = {
+    archived: Float32Array.from([2, 8, NaN, -3, NaN, 999]),
+    flags: Uint32Array.from([1 << 6, 1 << 21, 2, 1 << 31, 0, 0]),
+    status: Uint8Array.from([5, 1, 131, 4, 5, 0]),
+  };
+  const e = exposure("D1", 1, "2026-01-01", [NaN, 7, NaN, NaN, NaN, NaN], q);
+  const [p] = products(
+    [e],
+    {
+      ...defaults,
+      maps: [
+        map("field", { D1: 1 }, { low: "0", high: "16", stretch: "linear" }),
+      ],
+    },
+    [visit("v", [e])],
+  );
+  assert.deepEqual([...p.layers[0].values], [2, 8, 8, NaN, NaN, NaN]);
+  assert.deepEqual(
+    rgba(p).filter((_, i) => i % 4 === 0),
+    [32, 128, 128, 0, 0, 0],
+  );
+  assert.ok(Number.isNaN(archivedAt(e, 2)));
+  assert.equal(inspectBand(e, 3).archived, -3);
+  assert.deepEqual(inspectBand(e, 3).flags, ["Bit 31"]);
+  assert.ok(inspectBand(e, 2).uncertaintyUnavailable);
+});
+test("spectra retain an overflow-only archive as missing while the picture has a visible marker", () => {
+  const e = exposure("D1", 1, "2026-01-01", [NaN], {
+    archived: Float32Array.of(NaN),
+    flags: Uint32Array.of(2),
+    status: Uint8Array.of(3),
+  });
+  const [p] = products([e], defaults, [visit("v", [e])]);
+  assert.deepEqual(rgba(p), [255, 255, 255, 255]);
+  assert.ok(Number.isNaN(inspectBand(e, 0).archived));
+});
+test("pending channels never produce partial signed expressions; independent complete layers are visible", () => {
+  const v = visit("pending", [a, b], "pending");
+  const [p] = products(
+    [a],
+    {
+      ...defaults,
+      maps: [map("incomplete", { D1: 1, D2: -1 }), map("ready", { D1: 1 })],
+    },
+    [v],
+  );
+  assert.deepEqual(
+    p.layers.map((l) => l.map.name),
+    ["ready"],
+  );
+});
+test("difference uses only matching channels in the configured windows; migration retains pinned RGB inputs", () => {
+  const first = visit("jan", [a, b]),
+    second = visit("jun", [c]);
+  const display = {
+    ...defaults,
+    maps: [
+      map(
+        "diff",
+        { D1: 1 },
+        { difference: true, windowDays: 1, exclusionDays: 3 },
+      ),
+    ],
+  };
+  assert.deepEqual(
+    [...products([a, b, c], display, [first, second])[1].layers[0].values],
+    [18, 2],
+  );
+  const migrated = readMaps(undefined, {
     ...defaults,
     mode: "rgb",
-    rgb: [c, a, b].map((p) => p.frame.observation_id),
-    difference: true,
-    windowDays: 0,
-  };
-  const [p] = products([a, b, c], s);
-  assert.deepEqual(p.planes, [c.values, a.values, b.values]);
-  assert.deepEqual(p.inputs, [c.frame, a.frame, b.frame]);
-  assert.deepEqual(products([a, b], s), []);
-});
-
-test("WiseView subtraction sums inside-window values and excludes nearby reference epochs", () => {
-  const frames = [
-    exposure("D2", 1, "2026-01-01", [9, NaN]),
-    exposure("D2", 1, "2026-01-02", [10, NaN]),
-    exposure("D2", 1, "2026-01-04", [999, 10]),
-    exposure("D2", 1, "2026-01-20", [2, 12]),
-    exposure("D2", 1, "2026-01-30", [4, 12]),
-    b,
-  ];
-  const [p] = products(frames, {
-    ...defaults,
-    operands: { [frames[0].frame.channel]: 1 },
-    windowDays: 4,
-    exclusionDays: 8,
-    difference: true,
+    rgb: [a.frame.id, b.frame.id, c.frame.id],
   });
-  assert.deepEqual([...p.planes[0]], [13, NaN]);
   assert.deepEqual(
-    p.inputs.map((f) => f.id),
-    frames.slice(0, 2).map((p) => p.frame.id),
+    migrated.map((m) => m.name),
+    ["Red", "Green", "Blue"],
   );
-  assert.deepEqual(
-    p.reference.map((f) => f.id),
-    frames.slice(3, 5).map((p) => p.frame.id),
-  );
-  assert.deepEqual(
-    products(frames.slice(0, 2), { ...defaults, difference: true }),
-    [],
+  assert.equal(Object.keys(migrated[0].operands)[0], "exposure:" + a.frame.id);
+  assert.deepEqual(readMaps(migrated, defaults), migrated);
+  assert.throws(() =>
+    readMaps([{ ...migrated[0], stops: [null, null] }], defaults),
   );
 });
-
-test("stretch shares physical bounds and preserves negative data and missing values", () => {
-  const e = exposure("D4", 2.5, "2026-01-02", [-10, NaN, 15, 90]);
-  const images = products([e], defaults);
-  const bounds = displayBounds(images, defaults);
-  assert.deepEqual(bounds, [-10, 90]);
-  for (const stretch of ["linear", "sqrt", "log", "asinh"]) {
-    assert.equal(intensityByte(-10, bounds, stretch), 0);
-    assert.equal(intensityByte(90, bounds, stretch), 255);
-    assert.equal(intensityByte(12, [12, 12], stretch), 128);
+test("detector demand unions channels across rows; whole detectors take precedence", () => {
+  const key = "D4 3.100000 µm (7.0.5)";
+  const s = {
+    ...defaults,
+    maps: [
+      map("one", { D1: 1, [key]: -1 }),
+      map("two", { "D1 0.811000 µm (7.0.5)": 1 }),
+    ],
+  };
+  assert.deepEqual(activeDetectors(s), ["D1", "D4"]);
+  assert.deepEqual(activeChannels(s), { D4: [key] });
+  assert.deepEqual(activeDetectors({ ...defaults, maps: [] }), []);
+  assert.deepEqual(activeDetectors({
+    ...defaults, maps: [map("pinned", { "exposure:someD6": 1 })],
+  }), []); // A pinned exposure is scheduled by catalog ID, independently of detector demand.
+});
+test("pixel wavelength, signed brightness and overflow share detector bins across field and rectangle spectra", () => {
+  const first = exposure("D1", 0.9, "2026-01-01", [0, 0, 0], {
+    archived: Float32Array.from([2, -4, NaN]),
+    flags: Uint32Array.from([0, 1 << 21, 2]),
+    status: Uint8Array.from([1, 1, 3]),
+  });
+  const second = exposure("D1", 1.0, "2026-01-02", [12, 6, 3]);
+  first.wavelengths = Float32Array.from([0.89, 0.98, 0.94]);
+  second.wavelengths = Float32Array.from([0.99, 0.96, NaN]);
+  const planes = [first, second],
+    centers = spectrumBins(planes);
+  const field = measureSpectrum(planes, centers, 3, [0, 0, 2, 0], true);
+  assert.deepEqual(
+    field.bins.map((p) => p.finite),
+    [1, 3],
+  );
+  assert.deepEqual(
+    field.bins.map((p) => p.mean),
+    [2, 14 / 3],
+  );
+  assert.equal(field.samples[0].overflow, 1);
+  assert.deepEqual(
+    [...field.samples[0].flags],
+    [
+      ["SOURCE", 1],
+      ["OVERFLOW", 1],
+    ],
+  );
+  const pixel = measureSpectrum(planes, centers, 3, [1, 0, 1, 0], true);
+  assert.equal(pixel.bins.length, 1);
+  assert.equal(pixel.bins[0].mean, 1);
+  assert.ok(Math.abs(pixel.bins[0].wave - 0.97) < 1e-6);
+  assert.equal(pixel.samples[0].mean, -4);
+  assert.deepEqual(field.domain, [0.75, 5, 0, 12 * 1.04]);
+  const waiting = { ...first, frame: { ...first.frame, spectral: "wave.bin" }, wavelengths: undefined };
+  const unfinished = measureSpectrum([waiting], centers, 3, [0, 0, 0, 0], true);
+  assert.equal(unfinished.samples[0].mean, 2);
+  assert.deepEqual(unfinished.bins, []);
+});
+test("existing stretches and GIF export retain their calibrated intensity scales", () => {
+  assert.equal(intensityByte(15, [-10, 90], "sqrt"), 128);
+  assert.equal(intensityByte(15, [-10, 90], "linear"), 64);
+  assert.equal(intensityByte(1, [1, 1], "asinh"), 128);
+  assert.equal(intensityByte(4, [0, 4], "log"), 255);
+  assert.deepEqual(palette(thermal)[255], [255, 255, 200, 255]);
+  const animation = gifenc.GIFEncoder();
+  for (const plane of [a, b]) {
+    const [p] = products([plane], defaults, [], true),
+      pixels = Uint8Array.from(rgba(p)),
+      colors = gifenc.quantize(pixels, 256);
+    animation.writeFrame(gifenc.applyPalette(pixels, colors), 2, 1, {
+      palette: colors,
+      repeat: 0,
+      delay: 500,
+    });
   }
-  assert.equal(intensityByte(15, bounds, "sqrt"), 128);
-  assert.equal(intensityByte(15, bounds, "linear"), 64);
-  assert.deepEqual(palette(thermal)[255], [255, 255, 200]);
-  assert.deepEqual([...e.values], [-10, NaN, 15, 90]);
+  animation.finish();
+  assert.equal(
+    Buffer.from(animation.bytes()).subarray(0, 6).toString(),
+    "GIF89a",
+  );
 });
-
 test("north-up and east-left sky selection wraps RA at the meridian", () => {
   const q = { ra_deg: 0, dec_deg: 10 };
   assert.deepEqual(skyPosition(q, 1, 1, 3, 3), q);
@@ -149,39 +331,6 @@ test("saved selected sky coordinates restore to the same pixel around RA wrap an
     }
 });
 
-test("rendering feeds measured RGB and transparent invalid pixels to image export", () => {
-  const rgb = [a, c, b].map((p) => p.values);
-  const rgba = new Uint8ClampedArray(8);
-  fillImageData(rgba, rgb, [0, 10], "linear", palette(thermal));
-  assert.deepEqual([...rgba], [51, 77, 204, 255, 0, 0, 0, 0]);
-  const animation = gifenc.GIFEncoder();
-  for (const e of [b, c]) {
-    const pixels = new Uint8ClampedArray(8);
-    fillImageData(pixels, [e.values], [0, 12], "sqrt", palette(grey));
-    const colors = gifenc.quantize(pixels, 256);
-    animation.writeFrame(gifenc.applyPalette(pixels, colors), 2, 1, {
-      palette: colors,
-      repeat: 0,
-      delay: 500,
-    });
-  }
-  animation.finish();
-  const bytes = Buffer.from(animation.bytes());
-  assert.equal(bytes.subarray(0, 6).toString("ascii"), "GIF89a");
-  assert.equal(bytes.readUint16LE(6), 2);
-  assert.equal(bytes.readUint16LE(8), 1);
-  assert.ok(bytes.includes("NETSCAPE2.0"));
-  assert.equal(bytes.at(-1), 0x3b);
-  let i = bytes.indexOf(Buffer.from([0x21, 0xf9, 4])),
-    frames = 0;
-  while (i >= 0) {
-    assert.equal(bytes.readUInt16LE(i + 4), 50);
-    frames++;
-    i = bytes.indexOf(Buffer.from([0x21, 0xf9, 4]), i + 1);
-  }
-  assert.equal(frames, 2);
-});
-
 test("export filenames retain provenance for static composites and animations", () => {
   const q = { ra_deg: 1, dec_deg: -2, fov_arcsec: 400 };
   const name = exportName(
@@ -200,157 +349,7 @@ test("export filenames retain provenance for static composites and animations", 
   );
   assert.equal(
     name,
-    "2026-01-01T00-00-00Z_to_2026-11-10T00-00-00Z_N-up_E-left_RA1_Dec-2_FOV400arcsec_zoom2",
-  );
-});
-
-function qualityExposure(
-  detector,
-  wavelength,
-  archived,
-  flags,
-  status,
-  science = archived.map(() => NaN),
-) {
-  return {
-    ...exposure(detector, wavelength, "2026-01-01", science),
-    quality: {
-      archived: Float32Array.from(archived),
-      flags: Uint32Array.from(flags),
-      status: Uint8Array.from(status),
-    },
-  };
-}
-
-function renderBytes(product, bounds, inspectFlagged = false, stops = grey) {
-  const rgba = new Uint8ClampedArray(product.planes[0].length * 4);
-  fillImageData(
-    rgba,
-    product.planes,
-    bounds,
-    "linear",
-    palette(stops),
-    product.sourcePlanes,
-    inspectFlagged,
-  );
-  return [...rgba];
-}
-
-test("Barnard RGB marks two archived overflow NaNs and preserves the third band's measurement", () => {
-  const source = 1 << 21,
-    bloom = 1 << 26,
-    overflow = 1 << 1,
-    error = 1 << 2;
-  const core = source | bloom | overflow | error;
-  const red = qualityExposure(
-    "D3",
-    2.31,
-    [NaN, 12, 99999],
-    [core, bloom, 0],
-    [131, 2, 1],
-  );
-  const green = qualityExposure(
-    "D6",
-    4.72,
-    [1722.82, 10, NaN],
-    [source | bloom | overflow, 0, 0],
-    [2, 1, 0],
-  );
-  const blue = qualityExposure(
-    "D3",
-    2.27,
-    [NaN, 8, NaN],
-    [core, 0, 0],
-    [131, 1, 0],
-  );
-  const bands = [red, green, blue];
-  const [p] = products(bands, {
-    ...defaults,
-    mode: "rgb",
-    rgb: bands.map((b) => b.frame.observation_id),
-  });
-  assert.deepEqual(
-    renderBytes(p, [0, 2000]),
-    [255, 220, 255, 255, 2, 1, 1, 255, 0, 0, 0, 0],
-  );
-  assert.deepEqual(displayBounds([p], defaults), [8, Math.fround(1722.82)]);
-  assert.deepEqual(inspectBand(red, 0, false), {
-    archived: NaN,
-    flags: ["OVERFLOW", "SUR_ERROR", "SOURCE", "BLOOM"],
-    treatment: "Overflow · shown at maximum",
-    uncertaintyUnavailable: true,
-    warning: true,
-  });
-  assert.equal(inspectBand(green, 0, false).archived, Math.fround(1722.82));
-  assert.equal(pixelVisible(p, 0, false), true);
-  assert.equal(pixelVisible(p, 2, true), false);
-  for (const science of p.planes) assert.ok(Number.isNaN(science[0]));
-});
-
-test("single-band inspection admits flagged finite values while gaps and hard masks stay transparent", () => {
-  const e = qualityExposure(
-    "D6",
-    4,
-    [NaN, 5, 10, NaN, 999, 11, 12, NaN],
-    [2, 1 << 10, 1 << 21, 2 | 512, 2 | 64, 0, 1 << 31, 0],
-    [131, 4, 1, 133, 5, 130, 4, 0],
-    [NaN, NaN, 8, NaN, NaN, NaN, NaN, NaN],
-  );
-  const [p] = products([e], {
-    ...defaults,
-    operands: { [e.frame.channel]: 1 },
-  });
-  assert.deepEqual(displayBounds([p], defaults), [8, 11]);
-  assert.deepEqual(
-    displayBounds([p], { ...defaults, inspectFlagged: true }),
-    [5, 12],
-  );
-  assert.deepEqual(renderBytes(p, [0, 10], false, thermal).slice(0, 4), [
-    ...palette(thermal)[255],
-    255,
-  ]);
-  assert.deepEqual(
-    renderBytes(p, [0, 10], false).filter((_, i) => i % 4 === 3),
-    [255, 0, 255, 0, 0, 255, 0, 0],
-  );
-  assert.deepEqual(
-    renderBytes(p, [0, 10], true).filter((_, i) => i % 4 === 3),
-    [255, 255, 255, 0, 0, 255, 255, 0],
-  );
-  assert.equal(inspectBand(e, 2, false).archived, 10);
-  assert.deepEqual(inspectBand(e, 6, true).flags, ["Bit 31"]);
-  assert.ok(inspectBand(e, 5, false).uncertaintyUnavailable);
-  assert.equal(bandWarning(e.quality, 1, false), false);
-  assert.equal(bandWarning(e.quality, 1, true), true);
-});
-
-test("overflow and inspection-only brightness never contribute to detector averages or differences", () => {
-  const e = qualityExposure(
-    "D6",
-    4,
-    [NaN, 999, 2],
-    [2, 1 << 10, 0],
-    [131, 4, 1],
-    [NaN, NaN, 2],
-  );
-  const anotherBand = exposure("D6", 4.1, "2026-01-02", [2, 3, 4]);
-  const later = exposure("D6", 4, "2026-12-01", [1, 1, 1]);
-  const settings = { ...defaults, inspectFlagged: true, operands: { D6: 1 } };
-  const [average] = products([e, anotherBand], settings);
-  assert.equal(average.sourcePlanes, undefined);
-  assert.deepEqual([...average.planes[0]], [2, 3, 3]);
-  const [difference] = products([e, later], {
-    ...settings,
-    operands: { [e.frame.channel]: 1 },
-    difference: true,
-    windowDays: 1,
-    exclusionDays: 2,
-  });
-  assert.equal(difference.sourcePlanes, undefined);
-  assert.deepEqual([...difference.planes[0]], [NaN, NaN, 1]);
-  assert.deepEqual(
-    renderBytes(difference, [0, 10], true).slice(0, 8),
-    Array(8).fill(0),
+    "2026-01-01T00-00-00Z_to_2026-06-02T00-00-00Z_N-up_E-left_RA1_Dec-2_FOV400arcsec_zoom2",
   );
 });
 
@@ -373,4 +372,44 @@ test("prepared preview legends reuse their recorded grayscale stretch and units"
     stretch: "linear",
     units: "display levels",
   });
+});
+
+test("mixed manifests keep chronological raw PNGs and calibrated products with aligned lookup; grouped views omit PNGs", () => {
+  const preview = {
+    ...a.frame,
+    id: "legacy",
+    observation_id: "legacy",
+    url: "/api/assets/job/legacy.png",
+  };
+  const numeric = {
+    ...b.frame,
+    pixels: "cal.bin",
+    url: "/api/assets/job/cal.png",
+  };
+  const manifest = {
+    frames: [preview, numeric],
+    visits: [visit("jan", [a, b], "invalid")],
+  };
+  const [product] = products([{ ...b, frame: numeric }], defaults, [], true);
+  for (const [m, raw] of [
+    [manifest, true],
+    [{ frames: manifest.frames }, false],
+  ]) {
+    const out = imageTimeline(m, [numeric], [product], raw);
+    assert.deepEqual(
+      out.frames.map((f) => f.id),
+      ["legacy", numeric.id],
+    );
+    assert.equal(out.result[0], undefined);
+    assert.equal(out.result[1], product);
+    assert.equal(out.frames[0].previewScale.units, "display levels");
+  }
+  assert.deepEqual(imageTimeline(manifest, [], [], false), {
+    frames: [],
+    result: [],
+  });
+  assert.equal(
+    frameAsset(numeric, "cal.bin", "https://example.invalid/"),
+    "https://example.invalid/api/assets/job/cal.bin",
+  );
 });

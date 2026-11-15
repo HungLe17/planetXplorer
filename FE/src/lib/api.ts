@@ -3,6 +3,13 @@ import { normalizeApiBase } from "./api-config";
 export const base = normalizeApiBase(
   process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000",
 );
+export class ServiceError extends Error {
+  readonly code: string;
+  constructor(message: string, code: string) {
+    super(message);
+    this.code = code;
+  }
+}
 export async function request<T>(
   path: string,
   signal: AbortSignal,
@@ -18,6 +25,9 @@ export async function request<T>(
     ...(body ? { method: "POST", body: JSON.stringify(body) } : {}),
   });
   if (!response.ok) {
+    const detail = await response.json().then(r => r?.detail, () => null);
+    if (typeof detail?.message === "string" && typeof detail?.code === "string")
+      throw new ServiceError(detail.message, detail.code);
     if (response.status === 404) {
       const pollingJob = !body && /^\/api\/jobs\/[^/]+$/.test(path);
       throw new Error(
@@ -27,10 +37,9 @@ export async function request<T>(
       );
     }
     if (response.status === 429) {
-      const error = await response.json().catch(() => null);
       throw new Error(
-        typeof error?.detail === "string"
-          ? error.detail
+        typeof detail === "string"
+          ? detail
           : "The processing queue is full. Please try again shortly.",
       );
     }
@@ -89,11 +98,16 @@ export const loadObservations = async (
   signal: AbortSignal,
   observation_ids: string[] = [],
   detector?: string,
+  channels?: Query["channels"],
 ) => {
   const data = await request<{ job_id: string }>(
     "/api/jobs/" + encodeURIComponent(id) + "/load",
     signal,
-    { observation_ids, ...(detector ? { detector } : {}) },
+    {
+      observation_ids,
+      ...(detector ? { detector } : {}),
+      ...(channels ? { channels } : {}),
+    },
   );
   return data.job_id;
 };

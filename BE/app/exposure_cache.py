@@ -105,12 +105,15 @@ class ExposureCache:
             pixels = np.asarray(array, dtype="<f8")
             metadata = json.dumps(
                 {"frame": frame.model_dump(mode="json"), "shape": pixels.shape,
+                 "has_spectral": quality is not None and quality.spectral is not None,
                  "waves": [float(x) if np.isfinite(x) else None for x in wavelengths],
                  "bands": [float(x) if np.isfinite(x) else None for x in bandwidths]},
                 separators=(",", ":"), allow_nan=False,
             )
             # Keep the measurements and their provenance in one atomic cache record.
             blob = pixels.tobytes() + (quality.to_bytes() if quality is not None else b"")
+            if quality is not None and quality.spectral is not None:
+                blob += np.asarray(quality.spectral, dtype="<f4").tobytes()
             if len(metadata) + len(blob) > self.limit:
                 return
             with self._open() as db:
@@ -138,7 +141,9 @@ class ExposureCache:
             shape = tuple(meta["shape"])
             array = np.frombuffer(blob, dtype="<f8", count=int(np.prod(shape))).reshape(shape)
             sidecar = memoryview(blob)[array.nbytes:]
-            quality = PixelQuality.from_bytes(sidecar, shape) if len(sidecar) else None
+            quality = PixelQuality.from_bytes(sidecar[:array.size * 9], shape) if len(sidecar) else None
+            if meta.get("has_spectral"):
+                quality.spectral = np.frombuffer(sidecar[array.size * 9:], dtype="<f4").reshape(2, *shape)
             if frame.quality and quality is None:
                 raise ValueError("Incomplete exposure quality data")
             waves, bands = np.array(meta["waves"], dtype=float), np.array(meta["bands"], dtype=float)
@@ -170,20 +175,38 @@ class ExposureCache:
             with self._open() as db:
                 available = {}
                 for row in db.execute("""
-                    SELECT identity,uri,mjd,detector,release FROM exposure
+                    SELECT identity,uri,mjd,detector,release,metadata FROM exposure
                     WHERE field=? AND stored>=? AND mjd BETWEEN ? AND ?
                 """, (field, since, *self._dates(query))):
-                    obs = Observation(**dict(row))
+                    fields = dict(row)
+                    frame = json.loads(fields.pop("metadata"))["frame"]
+                    obs = Observation(**fields)
                     old = available.get(obs.identity)
-                    if obs.release.lower() in RELEASES and (
+                    if query.band_match(obs.detector, frame["wavelength_um"], frame["bandwidth_um"],
+                                        frame["processing_version"]) == "matched" and obs.release.lower() in RELEASES and (
                         old is None or Archive._version_key(obs) > Archive._version_key(old)
                     ):
                         available[obs.identity] = obs
                 sample = Archive.candidates(list(available.values()), self.settings.max_candidates)
                 return [entry for obs in sample if (entry := self._read(db, field, obs, since))]
-        except (OSError, sqlite3.Error):
+        except (OSError, sqlite3.Error, ValueError, KeyError):
             logger.warning("Could not open cached field", exc_info=True)
             return []
+
+    def field_index(self, query):
+        """Read only the small headers of cached revisions, without loading pixel arrays."""
+        if not self.path.is_file():
+            return {}
+        try:
+            with self._open() as db:
+                rows = db.execute("""
+                    SELECT identity,uri,metadata FROM exposure
+                    WHERE field=? AND stored>=? AND mjd BETWEEN ? AND ?
+                """, (self._field(query), time.time() - self.settings.ttl_seconds, *self._dates(query)))
+                return {(row["identity"], row["uri"]): json.loads(row["metadata"])["frame"] for row in rows}
+        except (OSError, sqlite3.Error, ValueError, KeyError):
+            logger.warning("Could not read the field spectral index", exc_info=True)
+            return {}
 
     def reconcile(self, query, observations, complete, *, as_of=None):
         """Forget superseded revisions, and treat disappearance as conclusive only in a complete lookup."""

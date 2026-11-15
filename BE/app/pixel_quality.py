@@ -30,6 +30,7 @@ class PixelQuality:
     values: np.ndarray
     flags: np.ndarray
     status: np.ndarray
+    spectral: np.ndarray | None = None  # wavelength and bandwidth in µm at the same detector sample
 
     @classmethod
     def from_detector(cls, values, flags, variance):
@@ -63,18 +64,20 @@ class PixelQuality:
         values[inside] = self.values.flat[selected]
         flags[inside] = self.flags.flat[selected]
         status[inside] = self.status.flat[selected]
-        return PixelQuality(values, flags, status)
+        spectral = None
+        if self.spectral is not None:
+            spectral = np.full((2, *shape), np.nan, dtype="<f4")
+            for target, plane in zip(spectral, self.spectral, strict=True):
+                target[inside] = plane.flat[selected]
+        return PixelQuality(values, flags, status, spectral)
 
     @property
     def states(self):
         return self.status & 0x7F
 
     def display_values(self, science):
-        states = self.states
-        normal = states == PixelState.NORMAL
-        values = np.where(normal & np.isfinite(science), science, self.values)
-        values[~(normal | (states == PixelState.WARNING))] = np.nan
-        return values
+        return np.where((self.states != PixelState.OUTSIDE) & np.isfinite(self.values)
+                        & (self.values >= 0), self.values, np.nan)
 
     def to_bytes(self):
         # Three contiguous, north-up planes in the same orientation as frame.pixels.

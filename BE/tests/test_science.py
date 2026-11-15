@@ -237,16 +237,18 @@ def test_live_publication_precedes_slow_cutout_and_keeps_sorted_assets(tmp_path)
             assert Image.open(tmp_path / Path(frame.url).name).size == (49, 49)
             assert (tmp_path / frame.pixels).stat().st_size == 49 * 49 * 4
         snapshots.append(manifest)
-        release_earlier.set()
+        if manifest.frames:
+            release_earlier.set()
 
     m = Pipeline(Settings(cache_dir=tmp_path / "cache"), DelayedArchive()).run(
         QUERY.model_copy(update={"live": True}), tmp_path, "progressive", lambda stage: None,
         publish=publish, timing=lambda *event: timings.append(event),
     )
-    assert [[f.observation_id for f in s.frames] for s in snapshots] == [
-        ["later"], [OBS.identity, "later"]
-    ]
-    first = snapshots[0].frames[0]
+    assert not snapshots[0].frames and len(snapshots[0].observations) == 2
+    with_frames = [s for s in snapshots if s.frames]
+    assert [f.observation_id for f in with_frames[0].frames] == ["later"]
+    assert [f.observation_id for f in with_frames[-1].frames] == [OBS.identity, "later"]
+    first = with_frames[0].frames[0]
     assert m.frames[1].id == first.id and m.frames[1].pixels == first.pixels
     assert first.url.endswith("-preview.png") and m.frames[1].url.endswith(first.id)
     assert all((tmp_path / f.id).exists() for f in m.frames)

@@ -1,274 +1,505 @@
-import { grey, thermal, type Display } from "@/lib/imaging";
-import type { Frame } from "@/lib/types";
+import { useEffect, useRef, useState } from "react";
+import { Plus, Trash2, X } from "./icons";
+import { request } from "@/lib/api";
+import {
+  detectors,
+  grey,
+  newMap,
+  thermal,
+  type Display,
+  type SpectralMap,
+  type Stop,
+} from "@/lib/imaging";
+import type { Frame, Observation } from "@/lib/types";
 
+const swatches = [
+  ["Transparent", "#00000000"],
+  ["Black", "#000000"],
+  ["White", "#ffffff"],
+  ["Red", "#ff0000"],
+  ["Green", "#00ff00"],
+  ["Blue", "#0000ff"],
+];
+type Tool = "Inputs" | "Colors" | "Function";
+type Editor = { id: string; tool: Tool };
+type ChannelPage = {
+  channels: string[];
+  next_cursor: number | null;
+  unavailable: number;
+  total: number;
+  catalog_complete: boolean;
+};
+type Lookup = { page?: ChannelPage; loading?: boolean; error?: string };
+function ChannelDiscovery({
+  lookup,
+  discover,
+}: {
+  lookup?: Lookup;
+  discover: () => void;
+}) {
+  const page = lookup?.page;
+  let action = "Discover channels";
+  if (lookup?.loading) action = "Checking wavelengths…";
+  else if (page?.next_cursor != null) action = "Find more channels";
+  else if (lookup?.error || page?.unavailable) action = "Retry wavelength lookup";
+  else if (page) action = "Refresh channels";
+
+  return (
+    <>
+      <button type="button" disabled={lookup?.loading} onClick={discover}>
+        {action}
+      </button>
+      <div role="status">
+        {lookup?.loading && <p>Reading calibration metadata…</p>}
+        {lookup?.error && <p>{lookup.error}</p>}
+        {page && !lookup?.loading && !lookup?.error && (
+          <>
+            {page.unavailable > 0 && (
+              <p>
+                Wavelength unavailable for {page.unavailable} exposure(s).
+                You can select the whole detector.
+              </p>
+            )}
+            {page.total === 0 && <p>No exposures in the current catalog.</p>}
+            {!page.catalog_complete && <p>The field catalog is partial.</p>}
+          </>
+        )}
+      </div>
+    </>
+  );
+}
+function gradient(stops: Stop[]) {
+  return (
+    "linear-gradient(to right," +
+    [...stops]
+      .sort((a, b) => a.at - b.at)
+      .map((p) => p.color + " " + p.at * 100 + "%")
+      .join(",") +
+    ")"
+  );
+}
 export default function ImageControls({
   s,
   update,
   frames,
-  bounds,
+  observations = [],
+  fieldJobId,
 }: {
   s: Display;
   update: (p: Partial<Display>) => void;
   frames: Frame[];
-  bounds: number[];
+  bounds?: number[];
+  observations?: Observation[];
+  fieldJobId?: string;
 }) {
-  const channels = Array.from(
-    new Set(frames.map((f) => f.channel).filter((v): v is string => !!v)),
-  );
-  function operand(key: string, sign: number) {
-    const next = { ...s.operands };
-    if (next[key] === sign) delete next[key];
-    else {
-      for (const name of Object.keys(next))
-        if (name.startsWith(key + " ") || key.startsWith(name + " "))
-          delete next[name];
+  const [editor, setEditor] = useState<Editor | null>(null);
+  const dialog = useRef<HTMLDialogElement>(null);
+  const [lookups, setLookups] = useState<Record<string, Lookup>>({});
+  const channelRequests = useRef(new Map<string, AbortController>());
+  useEffect(() => {
+    const requests = channelRequests.current;
+    setLookups({});
+    return () => {
+      for (const pending of requests.values()) pending.abort();
+      requests.clear();
+    };
+  }, [fieldJobId]);
+
+  async function discover(det: string) {
+    if (!fieldJobId || channelRequests.current.has(det)) return;
+    const controller = new AbortController();
+    channelRequests.current.set(det, controller);
+    const previous = lookups[det]?.page;
+    const cursor = previous?.next_cursor ?? 0;
+    setLookups((all) => ({ ...all, [det]: { page: previous, loading: true } }));
+    try {
+      const page = await request<ChannelPage>(
+        `/api/jobs/${encodeURIComponent(fieldJobId)}/channels/${det}?cursor=${cursor}`,
+        controller.signal,
+        undefined,
+        45000,
+      );
+      if (controller.signal.aborted) return;
+      if (cursor && previous)
+        page.channels = [...new Set([...previous.channels, ...page.channels])];
+      setLookups((all) => ({ ...all, [det]: { page } }));
+    } catch {
+      if (!controller.signal.aborted)
+        setLookups((all) => ({
+          ...all,
+          [det]: {
+            page: previous,
+            error:
+              "Wavelength lookup failed. Retry or select the whole detector.",
+          },
+        }));
+    } finally {
+      if (channelRequests.current.get(det) === controller)
+        channelRequests.current.delete(det);
+    }
+  }
+  const current = s.maps.find((m) => m.id === editor?.id);
+  useEffect(() => {
+    const d = dialog.current;
+    if (editor && current && d && !d.open) d.showModal();
+  }, [editor, current]);
+  function patch(id: string, change: Partial<SpectralMap>) {
+    update({
+      maps: s.maps.map((m) => (m.id === id ? { ...m, ...change } : m)),
+    });
+  }
+  function operand(key: string, sign: number, detector: string) {
+    if (!current) return;
+    const next = { ...current.operands };
+    const previous = next[key];
+    delete next[key];
+    if (sign && previous !== sign) {
+      for (const other of Object.keys(next))
+        if (
+          key === detector
+            ? other.startsWith(detector + " ")
+            : other === detector
+        )
+          delete next[other];
       next[key] = sign;
     }
-    update({ operands: next });
+    patch(current.id, { operands: next });
   }
+  function stop(index: number, change: Partial<Stop>) {
+    if (current)
+      patch(current.id, {
+        stops: current.stops.map((p, i) =>
+          i === index ? { ...p, ...change } : p,
+        ),
+      });
+  }
+  function signButtons(key: string, det: string) {
+    return (
+      <span className="operand-signs">
+        {[1, -1].map((v) => (
+          <button
+            type="button"
+            key={v}
+            aria-label={(v === 1 ? "Add " : "Subtract ") + key}
+            aria-pressed={current?.operands[key] === v}
+            onClick={() => operand(key, v, det)}
+          >
+            {v === 1 ? "+" : "−"}
+          </button>
+        ))}
+      </span>
+    );
+  }
+  const channels = [
+    ...new Set([
+      ...frames.map((f) => f.channel ?? ""),
+      ...observations.map((o) => o.channel ?? ""),
+      ...Object.values(lookups).flatMap((l) => l.page?.channels ?? []),
+      ...s.maps.flatMap((m) => Object.keys(m.operands)),
+    ]),
+  ];
   return (
-    <section className="science-controls">
-      <h3>Image processing</h3>
-      {frames.some((f) => f.quality) && (
-        <label>
-          <input
-            type="checkbox"
-            checked={s.inspectFlagged}
-            onChange={(e) => update({ inspectFlagged: e.target.checked })}
-          />{" "}
-          Inspect flagged pixels
-        </label>
-      )}
-      <label>
-        Display mode
-        <select
-          value={s.mode}
-          onChange={(e) => update({ mode: e.target.value })}
-        >
-          <option value="single">Intensity / false color</option>
-          <option value="rgb">Static RGB</option>
-        </select>
-      </label>
-      {s.mode === "rgb" ? (
-        ["Red", "Green", "Blue"].map((label, i) => (
-          <label key={label}>
-            {label} wavelength and exposure
-            <select
-              value={s.rgb[i]}
-              onChange={(e) =>
-                update({
-                  rgb: s.rgb.map((v, j) => (i === j ? e.target.value : v)),
-                })
-              }
-            >
-              <option value="">Select exposure</option>
-              {frames.map((f) => (
-                <option
-                  key={f.id}
-                  value={f.observation_id}
-                  disabled={s.rgb.some(
-                    (id, j) =>
-                      j !== i &&
-                      frames.find((other) => other.observation_id === id)
-                        ?.channel === f.channel,
-                  )}
-                >
-                  {f.channel} · {f.observed_at.slice(0, 19)}
-                </option>
-              ))}
-            </select>
-          </label>
-        ))
-      ) : (
-        <>
-          <details open>
-            <summary>Band expression</summary>
-            {[1, 2, 3, 4, 5, 6].map((n) => {
-              const det = "D" + n,
-                options = channels.filter((c) => c.startsWith(det + " "));
-              return (
-                <div key={det}>
-                  <label>
-                    <input
-                      type="checkbox"
-                      disabled={!options.length}
-                      checked={!!s.operands[det]}
-                      onChange={() => operand(det, s.operands[det] || 1)}
-                    />{" "}
-                    {det} · average ({options.length})
-                  </label>
-                  {options.length > 0 && (
-                    <details>
-                      <summary>Wavelengths</summary>
-                      {[det, ...options].map((k) => (
-                        <div key={k}>
-                          {k === det ? (
-                            "Whole detector"
-                          ) : (
-                            <button
-                              type="button"
-                              aria-label={"Select " + k}
-                              onClick={() => update({ operands: { [k]: 1 } })}
-                            >
-                              {k}
-                            </button>
-                          )}{" "}
-                          {[-1, 1].map((sign) => (
-                            <button
-                              type="button"
-                              key={sign}
-                              aria-label={
-                                (sign === 1 ? "Add " : "Subtract ") + k
-                              }
-                              aria-pressed={s.operands[k] === sign}
-                              onClick={() => operand(k, sign)}
-                            >
-                              {sign === 1 ? "+" : "−"}
-                            </button>
-                          ))}
-                        </div>
-                      ))}
-                    </details>
-                  )}
-                </div>
-              );
-            })}
-            <output>
-              {Object.entries(s.operands)
-                .map(([n, sign]) => (sign === 1 ? "+ " : "− ") + n)
-                .join(" ") ||
-                (s.difference
-                  ? "Automatic · most observations"
-                  : "All wavelengths")}
-            </output>
-          </details>
-          <label>
+    <section className="science-controls map-rows" aria-label="Spectrum maps">
+      {s.maps.map((map, i) => (
+        <div className="map-row" key={map.id}>
+          <div className="map-row-heading">
+            <span
+              className="map-swatch"
+              style={{ background: gradient(map.stops) }}
+            />
             <input
-              type="checkbox"
-              checked={s.difference}
-              onChange={(e) => update({ difference: e.target.checked })}
-            />{" "}
-            Difference imaging
-          </label>
-          {s.difference && (
-            <label>
-              Window width (days)
-              <input
-                type="number"
-                min="0"
-                value={s.windowDays}
-                onChange={(e) =>
-                  update({ windowDays: Math.max(0, Number(e.target.value)) })
-                }
-              />
-            </label>
-          )}
-          {s.difference && (
-            <label>
-              Exclusion width (days)
-              <input
-                type="number"
-                min="0"
-                value={s.exclusionDays}
-                onChange={(e) =>
-                  update({ exclusionDays: Math.max(0, Number(e.target.value)) })
-                }
-              />
-            </label>
-          )}
-        </>
-      )}
-      <label>
-        Intensity stretch
-        <select
-          value={s.stretch}
-          onChange={(e) => update({ stretch: e.target.value })}
-        >
-          {["linear", "sqrt", "log", "asinh"].map((k) => (
-            <option key={k}>{k}</option>
-          ))}
-        </select>
-      </label>
-      {(["low", "high"] as const).map((k, i) => (
-        <label key={k}>
-          {i ? "Maximum" : "Minimum"} (MJy/sr)
-          <input
-            type="number"
-            step="any"
-            placeholder={String(bounds[i])}
-            value={s[k]}
-            onChange={(e) => update({ [k]: e.target.value })}
-          />
-        </label>
-      ))}
-      {s.mode === "single" && (
-        <details open>
-          <summary>Color gradient</summary>
-          <button onClick={() => update({ stops: grey })}>
-            Grayscale
-          </button>{" "}
-          <button onClick={() => update({ stops: thermal })}>Thermal</button>
-          <div
-            style={{
-              height: 14,
-              background:
-                "linear-gradient(to right," +
-                [...s.stops]
-                  .sort((a, b) => a.at - b.at)
-                  .map((p) => p.color + " " + p.at * 100 + "%")
-                  .join(",") +
-                ")",
-            }}
-          />
-          {s.stops.map((stop, i) => (
-            <div key={i} className="color-stop">
-              <input
-                aria-label={"Stop color " + (i + 1)}
-                type="color"
-                value={stop.color}
-                onChange={(e) =>
-                  update({
-                    stops: s.stops.map((v, j) =>
-                      j === i ? { ...v, color: e.target.value } : v,
-                    ),
-                  })
-                }
-              />
-              <input
-                aria-label={"Stop position " + (i + 1)}
-                type="range"
-                min="0"
-                max="1"
-                step=".01"
-                value={stop.at}
-                onChange={(e) =>
-                  update({
-                    stops: s.stops.map((v, j) =>
-                      j === i ? { ...v, at: Number(e.target.value) } : v,
-                    ),
-                  })
-                }
-              />
+              aria-label={"Map name " + (i + 1)}
+              value={map.name}
+              onChange={(e) => patch(map.id, { name: e.target.value })}
+            />
+            <button
+              type="button"
+              title="Delete map"
+              aria-label={"Delete " + (map.name || "map")}
+              onClick={() => {
+                if (window.confirm("Delete " + (map.name || "this map") + "?"))
+                  update({ maps: s.maps.filter((m) => m.id !== map.id) });
+              }}
+            >
+              <Trash2 size={15} />
+            </button>
+          </div>
+          <div className="map-actions">
+            {(["Inputs", "Colors", "Function"] as const).map((tool) => (
               <button
-                aria-label={"Remove stop " + (i + 1)}
-                disabled={s.stops.length <= 2}
-                onClick={() =>
-                  update({ stops: s.stops.filter((_, j) => i !== j) })
-                }
+                key={tool}
+                type="button"
+                onClick={() => setEditor({ id: map.id, tool })}
               >
-                ×
+                {tool}
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
+      <button
+        className="button"
+        type="button"
+        onClick={() =>
+          update({
+            maps: [
+              ...s.maps,
+              newMap(crypto.randomUUID(), "Map " + (s.maps.length + 1)),
+            ],
+          })
+        }
+      >
+        <Plus size={14} /> Add map
+      </button>
+      {editor && current && (
+        <dialog
+          ref={dialog}
+          className="map-dialog"
+          aria-label={editor.tool + " for " + current.name}
+          onClose={() => setEditor(null)}
+          onClick={(e) => {
+            if (e.target === dialog.current) dialog.current?.close();
+          }}
+        >
+          <div className="science-controls map-dialog-body">
+            <div className="section-heading">
+              <h3>
+                {current.name || "Map"} · {editor.tool}
+              </h3>
+              <button
+                type="button"
+                aria-label="Close editor"
+                onClick={() => dialog.current?.close()}
+              >
+                <X size={16} />
               </button>
             </div>
-          ))}
-          <button
-            disabled={s.stops.length >= 32}
-            onClick={() =>
-              update({ stops: [...s.stops, { at: 0.5, color: "#ff8800" }] })
-            }
-          >
-            Add color stop
-          </button>
-        </details>
+            {editor.tool === "Inputs" && (
+              <>
+                <p>
+                  Select + or − for a detector or any of its measured channels.
+                  Select the same sign again to remove it.
+                </p>
+                {detectors.map((det) => {
+                  const options = channels
+                    .filter((c) => c.startsWith(det + " "))
+                    .sort(
+                      (a, b) => parseFloat(a.slice(3)) - parseFloat(b.slice(3)),
+                    );
+                  return (
+                    <div key={det} className="map-detector">
+                      <div className="map-detector-heading">
+                        <strong>{det} · whole detector</strong>
+                        {signButtons(det, det)}
+                      </div>
+                      <details>
+                        <summary>Channels ({options.length})</summary>
+                        {fieldJobId ? (
+                          <ChannelDiscovery
+                            lookup={lookups[det]}
+                            discover={() => discover(det)}
+                          />
+                        ) : (
+                          !options.length && (
+                            <p>
+                              Search this field to look up wavelengths, or
+                              select the whole detector.
+                            </p>
+                          )
+                        )}
+                        {options.map((key) => (
+                          <div className="map-channel" key={key}>
+                            <span>{key}</span>
+                            {signButtons(key, det)}
+                          </div>
+                        ))}
+                      </details>
+                    </div>
+                  );
+                })}
+                {Object.keys(current.operands)
+                  .filter((k) => k.startsWith("exposure:"))
+                  .map((key) => (
+                    <div key={key}>
+                      Pinned exposure {key.slice(9)}{" "}
+                      <button onClick={() => operand(key, 0, "")}>
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                <output>
+                  {Object.entries(current.operands)
+                    .map(
+                      ([k, v]) =>
+                        (v === 1 ? "+ " : "− ") + k.replace("exposure:", ""),
+                    )
+                    .join(" ") || "No inputs selected"}
+                </output>
+              </>
+            )}
+            {editor.tool === "Colors" && (
+              <div className="map-colors">
+                <div
+                  className="map-gradient"
+                  style={{ height: 16, background: gradient(current.stops) }}
+                />
+                <div className="map-actions">
+                  <button
+                    type="button"
+                    onClick={() => patch(current.id, { stops: grey })}
+                  >
+                    Grayscale
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => patch(current.id, { stops: thermal })}
+                  >
+                    Thermal
+                  </button>
+                </div>
+                {current.stops.map((p, i) => (
+                  <fieldset key={i} className="map-stop">
+                    <legend>Stop {i + 1}</legend>
+                    <div className="map-actions">
+                      <input
+                        type="color"
+                        aria-label={"Stop color " + (i + 1)}
+                        value={p.color.slice(0, 7)}
+                        onChange={(e) => stop(i, { color: e.target.value })}
+                      />
+                      {swatches.map(([name, color]) => (
+                        <button
+                          type="button"
+                          key={name}
+                          title={name}
+                          aria-label={name + " for stop " + (i + 1)}
+                          className={
+                            "color-swatch" +
+                            (name === "Transparent" ? " transparent" : "")
+                          }
+                          aria-pressed={p.color.toLowerCase() === color}
+                          style={{ backgroundColor: color }}
+                          onClick={() => stop(i, { color })}
+                        >
+                          {name === "Transparent" ? "∅" : ""}
+                        </button>
+                      ))}
+                    </div>
+                    <label>
+                      Position · {Math.round(p.at * 100)}%
+                      <input
+                        type="range"
+                        aria-label={"Stop position " + (i + 1)}
+                        min="0"
+                        max="1"
+                        step=".01"
+                        value={p.at}
+                        onChange={(e) =>
+                          stop(i, { at: Number(e.target.value) })
+                        }
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      disabled={current.stops.length <= 2}
+                      onClick={() =>
+                        patch(current.id, {
+                          stops: current.stops.filter((_, j) => j !== i),
+                        })
+                      }
+                    >
+                      Remove stop
+                    </button>
+                  </fieldset>
+                ))}
+                <button
+                  type="button"
+                  disabled={current.stops.length >= 32}
+                  onClick={() =>
+                    patch(current.id, {
+                      stops: [...current.stops, { at: 0.5, color: "#ff8800" }],
+                    })
+                  }
+                >
+                  Add color stop
+                </button>
+              </div>
+            )}
+            {editor.tool === "Function" && (
+              <>
+                <label>
+                  Intensity stretch
+                  <select
+                    value={current.stretch}
+                    onChange={(e) =>
+                      patch(current.id, { stretch: e.target.value })
+                    }
+                  >
+                    {["linear", "sqrt", "log", "asinh"].map((f) => (
+                      <option key={f}>{f}</option>
+                    ))}
+                  </select>
+                </label>
+                {(["low", "high"] as const).map((k, i) => (
+                  <label key={k}>
+                    {i ? "Maximum" : "Minimum"} (MJy/sr)
+                    <input
+                      type="number"
+                      step="any"
+                      placeholder="Automatic"
+                      value={current[k]}
+                      onChange={(e) =>
+                        patch(current.id, { [k]: e.target.value })
+                      }
+                    />
+                  </label>
+                ))}
+                {current.low !== "" &&
+                  current.high !== "" &&
+                  Number(current.low) > Number(current.high) && (
+                    <p role="alert">Minimum exceeds maximum.</p>
+                  )}
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={current.difference}
+                    onChange={(e) =>
+                      patch(current.id, { difference: e.target.checked })
+                    }
+                  />{" "}
+                  Difference imaging
+                </label>
+                {current.difference &&
+                  (["windowDays", "exclusionDays"] as const).map((k, i) => (
+                    <label key={k}>
+                      {i ? "Exclusion width" : "Window width"} (days)
+                      <input
+                        type="number"
+                        min="0"
+                        max="1000000"
+                        value={current[k]}
+                        onChange={(e) =>
+                          patch(current.id, {
+                            [k]: Math.max(
+                              0,
+                              Math.min(1e6, Number(e.target.value)),
+                            ),
+                          })
+                        }
+                      />
+                    </label>
+                  ))}
+              </>
+            )}
+            <button
+              className="button primary"
+              type="button"
+              onClick={() => dialog.current?.close()}
+            >
+              Done
+            </button>
+          </div>
+        </dialog>
       )}
     </section>
   );

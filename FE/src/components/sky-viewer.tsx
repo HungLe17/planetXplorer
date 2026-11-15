@@ -1,4 +1,5 @@
 "use client";
+// @refresh reset
 import {
   useCallback,
   useEffect,
@@ -7,18 +8,12 @@ import {
   useRef,
   useState,
 } from "react";
-import {
-  Expand,
-  Maximize2,
-  Minimize2,
-  Minus,
-  Plus,
-  RotateCcw,
-} from "lucide-react";
+import { Expand, Maximize2, Minimize2, Minus, Plus, RotateCcw } from "./icons";
 import { download } from "@/lib/workspace";
 import {
   exportName,
   intensityByte,
+  palette,
   type Display,
   type RenderedFrame,
 } from "@/lib/imaging";
@@ -33,6 +28,7 @@ import {
 } from "@/lib/view-transform";
 
 type FrameImage = HTMLCanvasElement | HTMLImageElement;
+export type PixelBox = [number, number, number, number];
 function loadPreview(url: string, signal: AbortSignal, retry = false) {
   return new Promise<HTMLImageElement>((resolve, reject) => {
     const image = new Image();
@@ -61,7 +57,6 @@ export default function SkyViewer({
   frames,
   index,
   onReady,
-  onFailure,
   onPaint,
   zoom: magnification,
   invert,
@@ -71,9 +66,11 @@ export default function SkyViewer({
   query,
   bounds,
   colors,
-  onPixel,
+  selection,
+  onSelect,
   message,
   unmatchedFrames = false,
+  cycleView,
 }: {
   zoom: number;
   invert: boolean;
@@ -83,13 +80,14 @@ export default function SkyViewer({
   query: Query | null;
   bounds: number[];
   colors: number[][];
-  onPixel: (x: number, y: number) => void;
+  selection: PixelBox | null;
+  onSelect: (selection: PixelBox) => void;
   message: string;
   unmatchedFrames?: boolean;
+  cycleView: boolean;
   frames: RenderedFrame[];
   index: number;
   onReady: (ready: boolean) => void;
-  onFailure: () => void;
   onPaint: (query: Query) => void;
 }) {
   const canvas = useRef<HTMLCanvasElement>(null),
@@ -97,9 +95,18 @@ export default function SkyViewer({
     shell = useRef<HTMLDivElement>(null);
   const pointers = useRef(new Map<number, Point>());
   const lastPointerType = useRef("");
+  const panGesture = useRef(false);
+  const [dragBox, setDragBox] = useState<PixelBox | null>(null);
   const multiTouch = useRef(false),
     tap = useRef<{ point: Point; time: number } | null>(null),
     start = useRef<Point | null>(null);
+  const tapSelection = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (tapSelection.current !== null) clearTimeout(tapSelection.current);
+    },
+    [query],
+  );
   const [fullscreen, setFullscreen] = useState(false),
     [fullscreenSupported, setFullscreenSupported] = useState(false);
   const [exportError, setExportError] = useState("");
@@ -107,14 +114,11 @@ export default function SkyViewer({
   const exportController = useRef<AbortController | null>(null);
   useEffect(() => () => exportController.current?.abort(), []);
   const current = frames[index];
-  const urls = useMemo(
-    () =>
-      frames
-        .slice(Math.max(0, index - 2), index + 3)
-        .filter((f) => !f.canvas)
-        .map((f) => f.url),
-    [frames, index],
-  );
+  const urls = useMemo(() => {
+    const neighbors = frames.slice(Math.max(0, index - 2), index + 3);
+    return [current, ...neighbors.filter(f => f !== current)]
+      .filter(f => f && !f.canvas).map(f => f.url);
+  }, [frames, current, index]);
   const { assets, retry } = useAssets(urls, loadPreview, 12);
   const entry =
     current && !current.canvas ? assets.get(current.url) : undefined;
@@ -123,8 +127,7 @@ export default function SkyViewer({
   const loaded = !!currentImage;
   useEffect(() => {
     onReady(loaded);
-    if (entry?.error) onFailure();
-  }, [current?.url, entry?.error, loaded, onReady, onFailure]);
+  }, [loaded, onReady]);
   const transform = useRef<ViewTransform>({
     scale: magnification,
     x: display.panX,
@@ -256,6 +259,22 @@ export default function SkyViewer({
       ctx.restore();
     }
   }
+  function pixelBox(from: Point, to: Point): PixelBox | null {
+    const rect = canvas.current?.getBoundingClientRect();
+    if (!currentImage || !rect?.width || !rect.height) return null;
+    const g = geometry(currentImage, rect.width, rect.height);
+    const x = (v: number) =>
+      Math.floor(((v - rect.left - g.x) * currentImage.width) / g.w);
+    const y = (v: number) =>
+      Math.floor(((v - rect.top - g.y) * currentImage.height) / g.h);
+    const area: PixelBox = [
+      Math.max(0, x(Math.min(from.x, to.x))),
+      Math.max(0, y(Math.min(from.y, to.y))),
+      Math.min(currentImage.width - 1, x(Math.max(from.x, to.x))),
+      Math.min(currentImage.height - 1, y(Math.max(from.y, to.y))),
+    ];
+    return area[0] <= area[2] && area[1] <= area[3] ? area : null;
+  }
   async function exportImage(animated: boolean) {
     if (!query || !box.current || !current || exportController.current) return;
     const controller = new AbortController();
@@ -266,18 +285,12 @@ export default function SkyViewer({
       const rect = box.current.getBoundingClientRect();
       const width = Math.round(rect.width),
         height = Math.round(rect.height);
-      const numeric = !!frames[index].pixels;
-      const scale = frames[index].previewScale ?? {
-        bounds,
-        stretch: display.stretch,
-        units: "MJy/sr",
-      };
-      const rgb = numeric && display.mode === "rgb";
       const exportFrames = animated ? frames : [frames[index]];
       const qualityLegend =
         display.markFlagged &&
         exportFrames.some((f) => f.warningPixels?.length);
-      const scaleHeight = rgb ? 72 : 48;
+      const scaleHeight =
+        38 * Math.max(1, ...exportFrames.map((f) => f.mapScales?.length ?? 0));
       const legendHeight = display.legend
         ? scaleHeight + (qualityLegend ? 18 : 0)
         : 0;
@@ -303,8 +316,10 @@ export default function SkyViewer({
           ));
 
         ctx.filter = "none";
+        ctx.clearRect(0, 0, out.width, out.height);
         ctx.fillStyle = "#000";
-        ctx.fillRect(0, 0, out.width, out.height);
+        if (animated) ctx.fillRect(0, 0, out.width, out.height);
+        else if (legendHeight) ctx.fillRect(0, height, out.width, legendHeight);
         ctx.save();
         ctx.beginPath();
         ctx.rect(0, 0, width, height);
@@ -320,41 +335,53 @@ export default function SkyViewer({
             18,
           );
         if (display.legend) {
-          const { bounds: legendBounds, stretch, units } = scale;
-          for (let channel = 0; channel < (rgb ? 3 : 1); channel++) {
-            const gradient = ctx.createLinearGradient(30, 0, width - 8, 0);
+          const scales = frame.mapScales?.length
+            ? frame.mapScales
+            : [
+                {
+                  name: "Intensity",
+                  bounds: frame.previewScale?.bounds ?? bounds,
+                  stretch: frame.previewScale?.stretch ?? display.stretch,
+                  stops: undefined,
+                },
+              ];
+          for (const [row, scale] of scales.entries()) {
+            const legendBounds = scale.bounds;
+            const lut = scale.stops
+              ? palette(scale.stops)
+              : frame.canvas
+                ? colors
+                : null;
+            const gradient = ctx.createLinearGradient(8, 0, width - 8, 0);
             for (let i = 0; i < 256; i++) {
               const intensity =
                 legendBounds[0] +
                 (i / 255) * (legendBounds[1] - legendBounds[0]);
-              const byte = intensityByte(intensity, legendBounds, stretch);
-              const color = rgb
-                ? [0, 1, 2].map((k) => (k === channel ? byte : 0))
-                : numeric
-                  ? colors[byte]
-                  : [byte, byte, byte];
+              const byte = intensityByte(
+                intensity,
+                legendBounds,
+                scale.stretch,
+              );
+              const color = lut?.[byte] ?? [byte, byte, byte, 255];
               gradient.addColorStop(
                 i / 255,
-                `rgb(${color.map((v) => (invert ? 255 - v : v)).join(",")})`,
+                `rgba(${color
+                  .slice(0, 3)
+                  .map((v) => (invert ? 255 - v : v))
+                  .join(",")},${(color[3] ?? 255) / 255})`,
               );
             }
-            if (rgb) {
-              ctx.fillStyle = "white";
-              ctx.fillText("RGB"[channel], 8, height + 15 + channel * 14);
-            }
             ctx.fillStyle = gradient;
-            ctx.fillRect(30, height + 5 + channel * 14, width - 38, 12);
+            ctx.fillRect(8, height + 4 + row * 38, width - 16, 11);
+            ctx.fillStyle = "white";
+            const units = frame.previewScale?.units ?? "MJy/sr";
+            ctx.fillText(
+              `${scale.name} · ${legendBounds.map((v) => v.toPrecision(4)).join(" … ")} ${units} · ${scale.stretch}`,
+              8,
+              height + 30 + row * 38,
+              width - 16,
+            );
           }
-          ctx.fillStyle = "white";
-          ctx.fillText(
-            legendBounds.map((v) => v.toPrecision(4)).join(" … ") +
-              " " +
-              units +
-              " · " +
-              stretch,
-            8,
-            height + scaleHeight - 8,
-          );
           if (qualityLegend) {
             ctx.fillStyle = "#ffbd45";
             ctx.fillRect(9, height + scaleHeight + 3, 7, 7);
@@ -409,6 +436,23 @@ export default function SkyViewer({
       ctx.clearRect(0, 0, rect.width, rect.height);
       if (!currentImage) return;
       paint(ctx, currentImage, rect.width, rect.height, currentWarnings);
+      const area = dragBox ?? selection;
+      if (area) {
+        const g = geometry(currentImage, rect.width, rect.height);
+        const w = g.w / currentImage.width,
+          h = g.h / currentImage.height;
+        ctx.save();
+        ctx.filter = "none";
+        ctx.strokeStyle = "#85e3bd";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(
+          g.x + area[0] * w,
+          g.y + area[1] * h,
+          (area[2] - area[0] + 1) * w,
+          (area[3] - area[1] + 1) * h,
+        );
+        ctx.restore();
+      }
       if (query) onPaint(query);
     };
     draw();
@@ -429,6 +473,8 @@ export default function SkyViewer({
     invert,
     currentWarnings,
     display.markFlagged,
+    dragBox,
+    selection,
   ]);
   function endPointer(
     event: React.PointerEvent<HTMLCanvasElement>,
@@ -439,27 +485,10 @@ export default function SkyViewer({
     if (event.currentTarget.hasPointerCapture(event.pointerId))
       event.currentTarget.releasePointerCapture(event.pointerId);
     if (pointers.current.size) return;
-    if (
-      !cancelled &&
-      !multiTouch.current &&
-      start.current &&
-      currentImage &&
-      Math.hypot(
-        event.clientX - start.current.x,
-        event.clientY - start.current.y,
-      ) < 4
-    ) {
-      const r = event.currentTarget.getBoundingClientRect();
-      const g = geometry(currentImage, r.width, r.height);
-      const x = Math.floor(
-        ((event.clientX - r.left - g.x) * currentImage.width) / g.w,
-      );
-      const y = Math.floor(
-        ((event.clientY - r.top - g.y) * currentImage.height) / g.h,
-      );
-      if (x >= 0 && y >= 0 && x < currentImage.width && y < currentImage.height)
-        onPixel(x, y);
-    }
+    const area =
+      !cancelled && !multiTouch.current && start.current && !panGesture.current
+        ? pixelBox(start.current, { x: event.clientX, y: event.clientY })
+        : null;
     if (
       !cancelled &&
       !multiTouch.current &&
@@ -480,10 +509,17 @@ export default function SkyViewer({
         transform.current.scale > 1.01
           ? fit()
           : zoom(2, anchor(point.x, point.y));
+        if (tapSelection.current !== null) clearTimeout(tapSelection.current);
         tap.current = null;
-      } else tap.current = { point, time: now };
-    }
+      } else {
+        tap.current = { point, time: now };
+        if (tapSelection.current !== null) clearTimeout(tapSelection.current);
+        // On a narrow screen Details covers the canvas. Let a second tap reach it first.
+        if (area) tapSelection.current = setTimeout(() => onSelect(area), 310);
+      }
+    } else if (area) onSelect(area);
     multiTouch.current = false;
+    setDragBox(null);
     start.current = null;
   }
   return (
@@ -496,7 +532,10 @@ export default function SkyViewer({
           ref={canvas}
           tabIndex={0}
           role="img"
-          aria-description="Select a pixel to inspect. Drag to pan. Pinch or scroll to zoom. Plus and minus zoom; F fits the image; 1 shows native pixels."
+          aria-description="Click to inspect a pixel or left-drag a region. Right-drag to pan. Use two fingers or scroll to pan and zoom."
+          onContextMenu={(event) => {
+            if (loaded) event.preventDefault();
+          }}
           aria-label={
             current
               ? `Observation ${index + 1} of ${frames.length}. ${current.observed_at}`
@@ -505,7 +544,9 @@ export default function SkyViewer({
           onPointerDown={(event) => {
             if (
               !loaded ||
-              (event.pointerType === "mouse" && event.button !== 0)
+              (event.pointerType === "mouse" &&
+                event.button !== 0 &&
+                event.button !== 2)
             )
               return;
             lastPointerType.current = event.pointerType;
@@ -518,10 +559,15 @@ export default function SkyViewer({
               x: event.clientX,
               y: event.clientY,
             });
-            if (pointers.current.size === 1)
+            if (pointers.current.size === 1) {
+              panGesture.current = event.button === 2;
               start.current = { x: event.clientX, y: event.clientY };
+            }
             if (pointers.current.size > 1) {
+              if (tapSelection.current !== null)
+                clearTimeout(tapSelection.current);
               multiTouch.current = true;
+              setDragBox(null);
               tap.current = null;
             }
           }}
@@ -548,12 +594,16 @@ export default function SkyViewer({
                     midpoint(next),
                   ),
                 );
-            } else
+            } else if (panGesture.current || multiTouch.current)
               commit({
                 ...transform.current,
                 x: transform.current.x + event.clientX - before.x,
                 y: transform.current.y + event.clientY - before.y,
               });
+            else if (start.current)
+              setDragBox(
+                pixelBox(start.current, { x: event.clientX, y: event.clientY }),
+              );
           }}
           onPointerUp={(event) => endPointer(event)}
           onPointerCancel={(event) => endPointer(event, true)}
@@ -584,14 +634,17 @@ export default function SkyViewer({
           }}
         />
         {current && loaded && (
-          <div className="image-readout">
+          <div className="image-readout" role="group" aria-label="Displayed image">
             {fullscreen && unmatchedFrames && (
               <span>Browse / unmatched observations</span>
             )}
 
             <span>
-              {current.detector}
-              {current.wavelength_um != null
+              {current.visit_id && current.observation_id === current.visit_id
+                ? "Visit composite"
+                : (current.previewScale ? "Exposure PNG preview" : "Calibrated exposure") + " · " + current.detector}
+              {current.observation_id !== current.visit_id &&
+              current.wavelength_um != null
                 ? ` / ${current.wavelength_um.toFixed(3)} µm`
                 : ""}
             </span>
@@ -643,7 +696,7 @@ export default function SkyViewer({
           PNG
         </button>
         <button
-          disabled={!loaded || exporting || frames.length < 2}
+          disabled={!loaded || exporting || !cycleView || frames.length < 2}
           onClick={() => void exportImage(true)}
         >
           GIF
@@ -679,7 +732,7 @@ export default function SkyViewer({
       </div>
       <div className="sky-bottom">
         <span className="gesture-hint">
-          Drag to pan · Scroll or pinch to zoom
+          Left-drag to select · Right-drag to pan · Scroll to zoom
         </span>
         <div className="zoom-buttons">
           <button

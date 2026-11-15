@@ -16,6 +16,9 @@ CATALOGS = tuple(
 )
 FIELDS = np.dtype([("DEC", "<f8"), ("RA", "<f8"), ("TARGETID", "<i8"), ("Z", "<f8")])
 
+class MissingCatalog(FileNotFoundError):
+    """The local DESI installation lacks at least one required tracer catalog."""
+
 
 def prepare_catalog(folder: Path, catalog: str, client: httpx.Client):
     """Build one declination-sorted index atomically, outside the request path."""
@@ -28,11 +31,12 @@ def prepare_catalog(folder: Path, catalog: str, client: httpx.Client):
         path = Path(raw.name)
     temp = None
     try:
-        with path.open("wb") as stream, client.stream("GET", url) as response:
+        with path.open("wb") as stream, client.stream("GET", url, headers={"Accept-Encoding": "identity"}) as response:
             response.raise_for_status()
             for part in response.iter_bytes(1024 * 1024):
                 stream.write(part)
-            if stream.tell() != int(response.headers["content-length"]):
+            expected = response.headers.get("content-length")
+            if expected is not None and stream.tell() != int(expected):
                 raise ValueError("Incomplete DESI catalog download")
         with fits.open(path, memmap=True) as hdus:
             rows = hdus[1].data
@@ -57,7 +61,7 @@ def galaxies(folder: Path, ra: float, dec: float) -> list[dict]:
     for catalog in CATALOGS:
         path = folder / f"{catalog}.npy"
         if not path.is_file():
-            raise FileNotFoundError("DESI index is not installed. Run scripts/prepare_desi.py.")
+            raise MissingCatalog(f"Missing DESI DR1 catalog index: {catalog}")
         index = np.load(path, mmap_mode="r", allow_pickle=False)
         start = np.searchsorted(index["DEC"], dec - radius)
         end = np.searchsorted(index["DEC"], dec + radius, side="right")

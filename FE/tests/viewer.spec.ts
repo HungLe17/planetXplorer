@@ -7,13 +7,19 @@ const grid = Buffer.from(
 );
 const frames = Array.from({ length: 3 }, (_, i) => ({
   id: `f${i}`,
-  url: `http://127.0.0.1:3000/test-frames/f${i}.png`,
+  url: `http://127.0.0.1:${process.env.PLAYWRIGHT_PORT ?? 3000}/test-frames/f${i}.png`,
   observation_id: `obs${i}`,
-  observed_at: `2026-01-0${i + 1}T00:00:00Z`,
+  observed_at: ["2025-07-01", "2026-01-02", "2026-07-03"][i] + "T00:00:00Z",
   detector: `D${i + 1}`,
   wavelength_um: i + 1,
   sequence_id: `s${i}`,
 }));
+function visitsFor(catalog: typeof frames) {
+  return catalog.map(f => ({
+    id: "visit-" + f.observation_id, start_utc: f.observed_at, end_utc: f.observed_at,
+    observation_ids: [f.observation_id], status: "pending", issues: [],
+  }));
+}
 async function setup(page: Page) {
   await page.route("**/api/presets", (r) =>
     r.fulfill({ json: { presets: [] } }),
@@ -27,6 +33,7 @@ async function setup(page: Page) {
         status: "complete",
         manifest: {
           frames,
+          visits: visitsFor(frames),
           sequences: frames.map((f, i) => ({
             id: f.sequence_id,
             detector: f.detector,
@@ -66,13 +73,11 @@ test("zoom geometry preserves the anchored image coordinate during pinch transla
   expect(zoomAt(before, 1e6, from).scale).toBe(32);
 });
 
-test("browse plays single-frame wavelength groups; matched mode explains why it cannot", async ({
+test("cycle playback advances from a raw selection and stops at the last cycle with looping off", async ({
   page,
 }) => {
   await setup(page);
-  await expect(
-    page.getByText("Unmatched observations; brightness is not directly comparable."),
-  ).toBeVisible();
+  await page.getByRole("button", { name: "Browse", exact: true }).click();
   await page.locator("#speed").selectOption("4");
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect
@@ -82,18 +87,11 @@ test("browse plays single-frame wavelength groups; matched mode explains why it 
   await page.getByRole("button", { name: "Matched", exact: true }).click();
   await expect(
     page.getByRole("button", { name: "Play", exact: true }),
-  ).toBeDisabled();
-  await expect(page.getByText("One matched frame loaded.")).toBeVisible();
-  await page
-    .getByRole("button", { name: "Browse all 3 images", exact: true })
-    .click();
-  await expect(
-    page.getByRole("button", { name: "Play", exact: true }),
   ).toBeEnabled();
   await page
     .getByRole("button", { name: "Loop playback", exact: true })
     .click();
-  await page.getByRole("button", { name: "Last frame", exact: true }).click();
+  await page.getByRole("button", { name: "Last cycle", exact: true }).click();
   await page.getByRole("button", { name: "Play", exact: true }).click();
   await expect(
     page.getByRole("button", { name: "Play", exact: true }),
@@ -118,16 +116,16 @@ test("wheel, drag, native scale, fit, and fullscreen work without changing frame
       );
     });
   const before = await pixel();
-  await page.mouse.down();
+  await page.mouse.down({ button: "right" });
   await page.mouse.move(r.x + r.width / 2, r.y + r.height / 2 + 65, {
     steps: 8,
   });
-  await page.mouse.up();
+  await page.mouse.up({ button: "right" });
   await expect.poll(pixel).not.toEqual(before);
   const scale = await zoomValue(page);
   await page.setViewportSize({ width: 720, height: 600 });
   await expect.poll(async () => (await pixel())[3]).toBe(255);
-  await page.getByRole("button", { name: "Next frame", exact: true }).click();
+  await page.getByRole("button", { name: "Next cycle", exact: true }).click();
   await expect(page.getByLabel("Viewport zoom", { exact: true })).toHaveText(
     `${scale}%`,
   );
@@ -226,6 +224,7 @@ test("one failed image does not block other frames, and can be retried", async (
       json: {
         status: "complete",
         manifest: {
+          visits: visitsFor(frames),
           frames: frames.map((f, i) =>
             i === 1 ? { ...f, url: f.url + "?fresh=1" } : f,
           ),
@@ -235,16 +234,16 @@ test("one failed image does not block other frames, and can be retried", async (
   );
   await page.reload();
   await expect(
-    page.getByRole("button", { name: "Next frame", exact: true }),
+    page.getByRole("button", { name: "Next cycle", exact: true }),
   ).toBeEnabled();
-  await page.getByRole("button", { name: "Next frame", exact: true }).click();
+  await page.getByRole("button", { name: "Next cycle", exact: true }).click();
   await expect(page.getByText("This image could not be loaded.")).toBeVisible();
-  await page.getByRole("button", { name: "Next frame", exact: true }).click();
+  await page.getByRole("button", { name: "Next cycle", exact: true }).click();
   await expect(
     page.getByRole("button", { name: "Zoom in", exact: true }),
   ).toBeEnabled();
   await page
-    .getByRole("button", { name: "Previous frame", exact: true })
+    .getByRole("button", { name: "Previous cycle", exact: true })
     .click();
   await expect(
     page.getByRole("button", { name: "Retry image", exact: true }),
@@ -273,7 +272,7 @@ test("new arrivals keep the selected observation and zoom, without reloading cac
       json: {
         status: finished ? "complete" : "running",
         stage: "fetch:3/8",
-        manifest: { frames: list },
+        manifest: { frames: list, visits: visitsFor(list) },
       },
     }),
   );
@@ -286,13 +285,13 @@ test("new arrivals keep the selected observation and zoom, without reloading cac
   await expect(
     page.getByRole("button", { name: "Play", exact: true }),
   ).toBeEnabled();
-  await page.getByRole("button", { name: "Last frame", exact: true }).click();
+  await page.getByRole("button", { name: "Last cycle", exact: true }).click();
   await page.getByRole("button", { name: "Zoom in", exact: true }).click();
   list.push({
     ...frames[0],
     id: "earlier",
     observation_id: "earlier",
-    url: "http://127.0.0.1:3000/test-frames/earlier.png",
+    url: `http://127.0.0.1:${process.env.PLAYWRIGHT_PORT ?? 3000}/test-frames/earlier.png`,
     observed_at: "2025-01-01T00:00:00Z",
   });
   finished = true;

@@ -1,76 +1,192 @@
-import { inspectBand, type Product } from "@/lib/imaging";
+import { useId, useMemo } from "react";
+import { useSpectralPlanes } from "@/lib/use-images";
+import {
+  detectors,
+  measureSpectrum,
+  spectrumBins,
+  type SpectrumBin,
+  type PixelRect as Rect,
+  type Plane,
+} from "@/lib/imaging";
+
+const nfmt = (v: number) =>
+  Number.isFinite(v) ? Number(v.toPrecision(5)).toString() : "—";
+function Graph({
+  title,
+  rows,
+  domain,
+}: {
+  title: string;
+  rows: SpectrumBin[];
+  domain: number[];
+}) {
+  const clip = useId();
+  const [xmin, xmax, ymin, ymax] = domain;
+  const pts = rows.filter(
+    (p) => Number.isFinite(p.wave) && Number.isFinite(p.mean),
+  );
+  const x = (v: number) => 49 + ((v - xmin) / (xmax - xmin)) * 229;
+  const y = (v: number) => 107 - ((v - ymin) / (ymax - ymin)) * 87;
+  return (
+    <figure className="spectrum-chart" aria-label={title + " spectrum"}>
+      <figcaption>{title}</figcaption>
+      <svg
+        viewBox="0 0 300 146"
+        role="img"
+        aria-label={title + " · surface brightness versus wavelength"}
+      >
+        <g fill="currentColor" fontSize="10">
+          <path d="M49 20 V107 H278" fill="none" stroke="currentColor" />
+          {[0, 0.5, 1].map((t) => (
+            <g key={t}>
+              <text x={49 + t * 229} y="121" textAnchor="middle">
+                {nfmt(xmin + t * (xmax - xmin))}
+              </text>
+              <text x="45" y={110 - t * 87} textAnchor="end">
+                {nfmt(ymin + t * (ymax - ymin))}
+              </text>
+            </g>
+          ))}
+          <text x="162" y="141" textAnchor="middle">
+            Wavelength (µm)
+          </text>
+          <text x="49" y="13">
+            Intensity (MJy/sr)
+          </text>
+        </g>
+        <defs><clipPath id={clip}><rect x="48" y="18" width="232" height="89" /></clipPath></defs>
+        <g clipPath={`url(#${clip})`}>
+          <polyline points={pts.map(p => `${x(p.wave)},${y(p.mean)}`).join(" ")}
+            fill="none" stroke="currentColor" strokeWidth="1" />
+          {pts.map(({ wave, mean, detector, finite }) => (
+            <circle key={detector + ":" + wave} cx={x(wave)} cy={y(mean)} r="1.5" fill="currentColor">
+              <title>{detector} · {nfmt(wave)} µm · {nfmt(mean)} MJy/sr · {finite} pixels</title>
+            </circle>
+          ))}
+        </g>
+      </svg>
+      {!pts.length && <p>No finite spectral samples available.</p>}
+    </figure>
+  );
+}
 export default function Spectrum({
-  product,
+  planes: brightness,
   pixel,
+  region,
   width,
   height,
-  inspectFlagged,
+  pending = false,
 }: {
-  product: Product;
+  planes: Plane[];
   pixel: [number, number] | null;
+  region?: Rect | null;
   width: number;
   height: number;
-  inspectFlagged: boolean;
+  pending?: boolean;
 }) {
-  const [x, y] = pixel ?? [Math.floor(width / 2), Math.floor(height / 2)];
-  const index = y * width + x;
-  const rgb = product.planes.length === 3;
-  const points = product.inputs.map((f, i) => ({
-    id: f.observation_id,
-    wave: f.wavelength_um,
-    value: product.planes[i][index],
-    details: product.sourcePlanes?.[i]?.quality
-      ? inspectBand(product.sourcePlanes[i], index, inspectFlagged)
-      : undefined,
-    color: ["#ff6666", "#66cc77", "#6699ff"][i],
-  }));
-  const valid = points.filter((p) => p.wave != null && Number.isFinite(p.value));
-  const lo = Math.min(...valid.map((p) => p.value)),
-    hi = Math.max(...valid.map((p) => p.value));
-  const left = Math.min(...valid.map((p) => p.wave!)),
-    right = Math.max(...valid.map((p) => p.wave!));
+  const wavelengths = useSpectralPlanes(brightness, width * height);
+  const planes = wavelengths.planes;
+  const bins = useMemo(() => spectrumBins(planes), [planes]);
+  const full = useMemo(
+    () =>
+      measureSpectrum(
+        planes,
+        bins,
+        width,
+        [0, 0, width - 1, height - 1],
+        false,
+      ),
+    [planes, bins, width, height],
+  );
+  const px = pixel?.[0] ?? Math.floor(width / 2),
+    py = pixel?.[1] ?? Math.floor(height / 2);
+  const x0 = Math.max(
+    0,
+    Math.min(width - 1, Math.min(region?.[0] ?? px, region?.[2] ?? px)),
+  );
+  const y0 = Math.max(
+    0,
+    Math.min(height - 1, Math.min(region?.[1] ?? py, region?.[3] ?? py)),
+  );
+  const x1 = Math.max(
+    0,
+    Math.min(width - 1, Math.max(region?.[0] ?? px, region?.[2] ?? px)),
+  );
+  const y1 = Math.max(
+    0,
+    Math.min(height - 1, Math.max(region?.[1] ?? py, region?.[3] ?? py)),
+  );
+  const selected = useMemo(
+    () => measureSpectrum(planes, bins, width, [x0, y0, x1, y1], true),
+    [planes, bins, width, x0, y0, x1, y1],
+  );
+  const regionSelected = x1 !== x0 || y1 !== y0;
+  const acquired = [...new Set(planes.map((p) => p.frame.detector))].sort();
+  const missing = detectors.filter((detector) => !acquired.includes(detector));
+  const title = regionSelected ? "Selected region" : "Selected pixel";
   return (
-    <figure className="pixel-inspector" aria-label="Selected pixel">
-      <figcaption>
-        {rgb ? "Brightness vs wavelength" : "Pixel measurement"} · pixel {x + 1}, {y + 1}
-      </figcaption>
-      {rgb && <svg
-        viewBox="0 0 180 80"
-        role="img"
-        aria-label="Three wavelength brightness measurements"
-      >
-        <path d="M8 5 V72 H175" stroke="currentColor" fill="none" />
-        {valid.map((p, i) => (
-          <circle
-            key={i}
-            cx={12 + (155 * (p.wave! - left)) / (right - left || 1)}
-            cy={68 - (60 * (p.value - lo)) / (hi - lo || 1)}
-            r="4"
-            fill={p.color}
-          />
-        ))}
-      </svg>}
-      {points.map((p, i) => {
-        const d = p.details;
-        return (
-          <div className="pixel-band" key={p.id}>
-            <strong style={rgb ? { color: p.color } : undefined}>
-              {rgb && ["Red · ", "Green · ", "Blue · "][i]}
-              {p.wave != null ? p.wave.toFixed(4) + " µm" : p.id}
+    <section className="spectra-panels" aria-label="Visit spectra">
+      {width > 0 && height > 0 && <p>
+        {regionSelected
+          ? `Region (${x0 + 1}, ${y0 + 1}) – (${x1 + 1}, ${y1 + 1})`
+          : `Pixel (${x0 + 1}, ${y0 + 1})`}
+      </p>}
+      <p>
+        {planes.length} loaded exposure{planes.length !== 1 ? "s" : ""}
+        {acquired.length ? " · " + acquired.join(", ") : ""}
+        {pending ? " · further coverage pending" : ""}
+      </p>
+      {wavelengths.loading && <p role="status">Loading per-pixel wavelengths…</p>}
+      {wavelengths.failed > 0 && <p role="status">Per-pixel wavelengths unavailable.{" "}
+        <button className="button" onClick={wavelengths.retry}>Retry wavelengths</button>
+      </p>}
+      <Graph title="Whole field" rows={full.bins} domain={full.domain} />
+      <Graph title={title} rows={selected.bins} domain={full.domain} />
+      {!!planes.length && !!missing.length && (
+        <p>No loaded exposures for {missing.join(", ")}.</p>
+      )}
+      {planes.some((p) => !p.frame.spectral && !p.wavelengths) && (
+        <p>Legacy frames use the field-center wavelength.</p>
+      )}
+      {!!selected.samples.length && <details open>
+        <summary>Selection measurements and flags</summary>
+        {selected.samples.map((row) => (
+          <div className="pixel-band" key={row.plane.frame.observation_id}>
+            <strong>
+              {row.plane.frame.detector} · {nfmt(row.wave)} µm
             </strong>
-            {d ? (
-              <>
-                <span>Archived brightness · {Number.isFinite(d.archived) ? d.archived.toPrecision(5) + " MJy/sr" : String(d.archived)}</span>
-                <span className={d.warning ? "pixel-warning" : undefined}>{d.treatment}</span>
-                {d.uncertaintyUnavailable && <span>Uncertainty unavailable</span>}
-                {d.flags.length > 0 && <span className="pixel-flags">Flags · {d.flags.join(", ")}</span>}
-              </>
-            ) : (
-              <span>{Number.isFinite(p.value) ? p.value.toPrecision(5) + " MJy/sr" : "No valid measurement"}</span>
+            <span>
+              {regionSelected ? "Mean intensity" : "Archived intensity"} ·{" "}
+              {Number.isFinite(row.mean)
+                ? nfmt(row.mean) + " MJy/sr"
+                : "NaN / unavailable"}
+            </span>
+            {regionSelected && (
+              <span>
+                Finite samples · {row.finite} / {row.total}
+              </span>
+            )}
+            <span>
+              {row.plane.quality
+                ? "Flags · " +
+                  ([...row.flags]
+                    .map(([k, n]) => (regionSelected ? k + " (" + n + ")" : k))
+                    .join(", ") || "none")
+                : "Archive flags unavailable"}
+            </span>
+            {row.overflow > 0 && (
+              <span>
+                {row.overflow} overflow{" "}
+                {row.overflow === 1 ? "marker" : "markers"} · excluded from
+                means
+              </span>
+            )}
+            {row.negative > 0 && (
+              <span>{row.negative} negative · blank on image</span>
             )}
           </div>
-        );
-      })}
-    </figure>
+        ))}
+      </details>}
+    </section>
   );
 }

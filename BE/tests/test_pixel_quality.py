@@ -75,6 +75,18 @@ def test_png_renders_max_without_changing_scale_or_numeric_samples(tmp_path):
     rgba = np.asarray(Image.open(path))
     assert rgba[-1, 0].tolist() == [255, 255, 255, 255]
     assert 0 < rgba[-1, 2, 0] < 255 and rgba[-1, 2, 3] == 255
-    assert rgba[0, 1, 3] == rgba[0, 2, 3] == 0
-    assert bounds["vmax"] == pytest.approx(np.percentile([0, .5, 1.], 99.5))
+    assert rgba[0, 1, 3] == rgba[0, 2, 3] == 255
+    assert bounds["vmax"] == pytest.approx(np.percentile([0, .5, 1., 2.], 99.5))
     assert np.isnan(science[0, 0]) and np.isnan(q.values[0, 0])
+
+
+def test_overflow_only_field_gets_a_marker_without_painting_negative_samples(tmp_path):
+    values = np.array([[np.nan, -1.], [np.nan, np.nan]])
+    flags = np.array([[2, 1 << 21], [0, 0]], dtype=np.uint32)
+    quality = PixelQuality.from_detector(values, flags, np.ones_like(values))
+    path = tmp_path / "overflow.png"
+    render_pngs([values], [path], [quality])
+    rgba = np.asarray(Image.open(path))
+    assert rgba[-1, 0].tolist() == [255, 255, 255, 255]
+    assert np.count_nonzero(rgba[:, :, 3]) == 1
+    assert np.isnan(quality.values[0, 0]) and quality.values[0, 1] == -1

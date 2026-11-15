@@ -1,6 +1,7 @@
-import { defaults, type Display } from "./imaging";
+import { defaults, readMaps, type Display } from "./imaging";
 import type { Query, Manifest } from "./types";
 import { parseQuery } from "./view-url";
+import { readBands } from "./search-bands";
 
 export const storageKey = "planetXplorer.workspace.v1";
 export type Snapshot = Record<string, string>;
@@ -14,7 +15,7 @@ export type Entry = {
   id: string;
   name: string;
   note: string;
-  flag: string;
+  fields: { name: string; value: string }[];
   config: Config;
   position: { ra_deg: number; dec_deg: number };
   sources: string[];
@@ -23,7 +24,7 @@ export type Entry = {
   snapshotComplete?: boolean;
 };
 export type Backup = {
-  version: 1;
+  version: 2;
   exported: string;
   config?: Config;
   locations?: Entry[];
@@ -110,9 +111,15 @@ export function readDisplay(v: unknown): Display {
     !between(s.zoom, 0.02, 32) ||
     !between(s.speed, 0.1, 10) ||
     ![s.windowDays, s.exclusionDays].every((n) => between(n, 0, 1e6)) ||
-    ![s.invert, s.coords, s.legend, s.difference, s.markFlagged, s.inspectFlagged].every(
-      (x) => typeof x === "boolean",
-    ) ||
+    ![
+      s.invert,
+      s.coords,
+      s.legend,
+      s.difference,
+      s.markFlagged,
+      s.inspectFlagged,
+      s.prefetchBands,
+    ].every((x) => typeof x === "boolean") ||
     ![s.panX, s.panY].every(Number.isFinite) ||
     ![s.low, s.high].every(
       (x) => typeof x === "string" && Number.isFinite(Number(x)),
@@ -134,7 +141,7 @@ export function readDisplay(v: unknown): Display {
     !Object.values(s.operands).every((x) => x === 1 || x === -1)
   )
     throw Error("Invalid display settings.");
-  return s;
+  return { ...s, maps: readMaps(v.maps, s) };
 }
 function config(v: unknown): Config {
   if (!object(v) || !between(v.fov, 30, 1800) || typeof v.frame !== "string")
@@ -161,7 +168,7 @@ function config(v: unknown): Config {
     );
     const fov = q.fov_arcsec === undefined ? v.fov : q.fov_arcsec;
     if (!between(fov, 30, 1800)) throw Error("Invalid saved field of view.");
-    query = { ...bounds, fov_arcsec: fov };
+    query = { ...bounds, fov_arcsec: fov, ...(Array.isArray(q.detectors) && q.detectors.length ? readBands(q) : {}) };
   }
   return { query, frame: v.frame, fov: v.fov, display: readDisplay(v.display) };
 }
@@ -169,13 +176,13 @@ export function readBackup(raw: string): Backup {
   const b: unknown = JSON.parse(raw);
   if (
     !object(b) ||
-    b.version !== 1 ||
+    (b.version !== 1 && b.version !== 2) ||
     typeof b.exported !== "string" ||
     !Number.isFinite(Date.parse(b.exported)) ||
     (b.config === undefined && !Array.isArray(b.locations))
   )
     throw Error("Unsupported workspace JSON.");
-  const result: Backup = { version: 1, exported: b.exported };
+  const result: Backup = { version: 2, exported: b.exported };
   if (b.config !== undefined) result.config = config(b.config);
   if (b.snapshot !== undefined) {
     if (!strings(b.snapshot)) throw Error("Invalid archive snapshot.");
@@ -197,7 +204,6 @@ export function readBackup(raw: string): Backup {
         !e.id ||
         seen.has(e.id) ||
         typeof e.name !== "string" ||
-        typeof e.flag !== "string" ||
         typeof e.note !== "string" ||
         !position(e.position) ||
         !Array.isArray(e.sources) ||
@@ -209,11 +215,31 @@ export function readBackup(raw: string): Backup {
       )
         throw Error("Invalid or duplicate location entry.");
       seen.add(e.id);
+      let fields: Entry["fields"];
+      if (Array.isArray(e.fields)) {
+        fields = e.fields.map((field: unknown) => {
+          if (
+            !object(field) ||
+            typeof field.name !== "string" ||
+            typeof field.value !== "string"
+          )
+            throw Error("Invalid saved-location field.");
+          return { name: field.name, value: field.value };
+        });
+      } else if (
+        b.version === 1 &&
+        e.fields === undefined &&
+        typeof e.flag === "string"
+      ) {
+        fields = e.flag ? [{ name: "Personal flag", value: e.flag }] : [];
+      } else {
+        throw Error("Invalid saved-location fields.");
+      }
       return {
         id: e.id,
         name: e.name,
         note: e.note,
-        flag: e.flag,
+        fields,
         position: e.position,
         sources: e.sources,
         metadata: e.metadata,
@@ -283,7 +309,11 @@ export async function checkImportedFields(
   for (const { query, entries } of fields.values()) {
     if (signal.aborted) return;
     try {
-      const now = await lookup({ ...query, live: true }, signal);
+      const { ra_deg, dec_deg, fov_arcsec, start_utc, end_utc } = query;
+      const now = await lookup(
+        { ra_deg, dec_deg, fov_arcsec, start_utc, end_utc, live: true },
+        signal,
+      );
       if (signal.aborted) return;
       // Entries for the same field may have been recorded at different times.
       const summaries = new Map<string, string[]>();

@@ -17,7 +17,7 @@ from .config import ROOT, Settings
 from . import desi, surveys
 from .jobs import CapacityError, Jobs, prepared_manifest
 from .pipeline import Pipeline
-from .schemas import Job, Query, Submitted, LoadRequest
+from .schemas import Detector, Job, Query, Submitted, LoadRequest
 
 
 def create_app(settings: Settings | None = None, pipeline=None):
@@ -86,7 +86,7 @@ def create_app(settings: Settings | None = None, pipeline=None):
         try:
             return Submitted(
                 job_id=request.app.state.jobs.load_more(
-                    job_id, body.observation_ids, body.detector
+                    job_id, body.observation_ids, body.detector, body.channels
                 )
             )
         except KeyError as exc:
@@ -95,6 +95,47 @@ def create_app(settings: Settings | None = None, pipeline=None):
             raise HTTPException(422, str(exc)) from exc
         except CapacityError as exc:
             raise HTTPException(429, str(exc), headers={"Retry-After": "10"}) from exc
+
+    @app.post("/api/jobs/{job_id}/priority/{obs_id}", response_model=Submitted, status_code=202)
+    def prioritize(job_id: str, obs_id: str, request: Request):
+        if not valid_id(job_id):
+            raise HTTPException(404, "Unknown field")
+        try:
+            return Submitted(job_id=request.app.state.jobs.prioritize(job_id, obs_id))
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except CapacityError as exc:
+            raise HTTPException(429, str(exc), headers={"Retry-After": "2"}) from exc
+
+    @app.get("/api/jobs/{job_id}/channels/{detector}")
+    def channels(job_id: str, detector: Detector, request: Request, cursor: int = 0):
+        if not valid_id(job_id):
+            raise HTTPException(404, "Unknown field")
+        if cursor < 0:
+            raise HTTPException(422, "Invalid channel cursor")
+        try:
+            return request.app.state.jobs.channel_options(job_id, detector, cursor)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except CapacityError as exc:
+            raise HTTPException(429, str(exc), headers={"Retry-After": "2"}) from exc
+
+    @app.post("/api/archive/channels/{detector}")
+    def field_channels(query: Query, detector: Detector, request: Request, cursor: int = 0):
+        if cursor < 0:
+            raise HTTPException(422, "Invalid channel cursor")
+        if request.app.state.archive is None:
+            raise HTTPException(503, "Archive metadata service unavailable")
+        try:
+            return request.app.state.jobs.field_channels(query, detector, cursor)
+        except ArchiveError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        except CapacityError as exc:
+            raise HTTPException(429, str(exc), headers={"Retry-After": "2"}) from exc
 
     @app.get("/api/assets/{job_id}/{asset_id}")
     def asset(job_id: str, asset_id: str, request: Request):
@@ -162,8 +203,11 @@ def create_app(settings: Settings | None = None, pipeline=None):
                 return fetch(client, query.ra_deg, query.dec_deg)
         try:
             return await asyncio.to_thread(lookup)
-        except FileNotFoundError as exc:
-            raise HTTPException(503, "DESI catalog index is unavailable") from exc
+        except desi.MissingCatalog as exc:
+            raise HTTPException(503, detail={
+                "code": "desi_index_missing",
+                "message": "The DESI DR1 galaxy index is not installed on this server.",
+            }) from exc
         except (ValueError, OSError, httpx.HTTPError) as exc:
             raise HTTPException(502, f"{survey.upper()} lookup unavailable") from exc
 

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { request } from "@/lib/api";
+import { request, ServiceError } from "@/lib/api";
 import type { Query } from "@/lib/types";
 
 type Infrared = {
@@ -18,19 +18,25 @@ type Catalog = {
 
 function useSurvey<T>(name: string, ra: number, dec: number) {
   const [data, setData] = useState<T | null>(null);
-  const [error, setError] = useState("");
+  const [error, setError] = useState<Error | null>(null);
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     const controller = new AbortController();
-    setError("");
+    setError(null);
     setData(null);
     request<T>(`/api/surveys/${name}`, controller.signal, { ra_deg: ra, dec_deg: dec }, 180000)
       .then((result) => { if (!controller.signal.aborted) setData(result); })
-      .catch(() => { if (!controller.signal.aborted) setError("Lookup unavailable."); });
+      .catch(reason => {
+        if (!controller.signal.aborted)
+          setError(reason instanceof Error ? reason : new Error("Lookup unavailable."));
+      });
     return () => controller.abort();
   }, [name, ra, dec, attempt]);
-  const status = error ? (
-    <p role="status">{error} <button className="button" onClick={() => setAttempt(n => n + 1)}>Retry</button></p>
+  const missingIndex = error instanceof ServiceError && error.code === "desi_index_missing";
+  const status = missingIndex ? (
+    <p role="status">{error.message} Run <code>python scripts/prepare_desi.py</code> from the backend directory, then reopen Surveys.</p>
+  ) : error ? (
+    <p role="status">Lookup unavailable. <button className="button" onClick={() => setAttempt(n => n + 1)}>Retry</button></p>
   ) : !data ? <p role="status">Loading…</p> : null;
   return { data, status };
 }
@@ -75,7 +81,7 @@ export default function FieldSurveys({ query }: { query: Query }) {
         <h3>DESI</h3><p>DR1 LSS galaxies · 2.5′ radius</p>
         {desi.status}
         {desi.data && <>
-          <p>{desi.data.galaxies.length} matching galaxies</p>
+          <p>{desi.data.galaxies.length} matching {desi.data.galaxies.length === 1 ? "galaxy" : "galaxies"}</p>
           {desi.data.galaxies.map(g => <div className="survey-row" key={g.id}>
             <strong>{g.tracers.join(", ")}</strong><span>z {g.redshift.toFixed(5)}</span>
             <small>{g.id} · {g.ra_deg.toFixed(5)}°, {g.dec_deg.toFixed(5)}°</small>

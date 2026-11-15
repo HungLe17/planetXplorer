@@ -1,5 +1,8 @@
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from email.utils import formatdate
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
@@ -285,12 +288,13 @@ def test_candidate_arrives_before_slower_preferred_collection_and_discovery():
     from astropy.table import Table
 
     offered = threading.Event()
+    catalog_finished = threading.Event()
     seen = []
     timings = []
 
     def handler(request):
         if request.url.path != "/SIA":
-            assert offered.wait(5), "discovery must not delay the first cutout"
+            assert catalog_finished.wait(5), "An informational collection list held up the catalog"
             return httpx.Response(200, text="SIA2 Collection\tDescription\n")
         collection = request.url.params["COLLECTION"]
         if collection == "spherex_dr1":
@@ -313,6 +317,7 @@ def test_candidate_arrives_before_slower_preferred_collection_and_discovery():
         result, _ = archive.search(Query(ra_deg=0, dec_deg=0, live=True), time.monotonic()+15,
                                    on_candidate=first_candidate, timing=lambda *event: timings.append(event))
     finally:
+        catalog_finished.set()
         archive.close()
     assert len(seen) == len(result) == 1
     assert seen[0].identity == result[0].identity
@@ -349,6 +354,152 @@ def test_cutout_retry_and_first_byte_measure_separate_attempts(tmp_path):
     assert [(stage, identity, outcome) for stage, _, identity, outcome in timings] == [
         ("cutout_retry", obs.identity, "HTTP 503"), ("cutout_first_byte", obs.identity, "ok")
     ]
+
+
+@pytest.fixture
+def retry_clock(monkeypatch):
+    seconds = [0.0]
+
+    def advance(delay):
+        assert delay > 0
+        seconds[0] += delay
+
+    clock = SimpleNamespace(monotonic=lambda: seconds[0], sleep=advance,
+                            time=lambda: 1_800_000_000 + seconds[0])
+    monkeypatch.setattr("app.archive.time", clock)
+    monkeypatch.setattr("app.archive.random.uniform", lambda low, high: 0.0)
+    return clock
+
+
+def test_cutout_retries_share_server_cooldown_and_respect_deadline(tmp_path, retry_clock):
+    sends = []
+
+    def handler(request):
+        sends.append(retry_clock.monotonic())
+        if len(sends) == 1:
+            return httpx.Response(503, headers={"Retry-After": "5"})
+        if len(sends) == 2:
+            return httpx.Response(429, headers={"Retry-After": formatdate(retry_clock.time() + 7, usegmt=True)})
+        return httpx.Response(200, content=b"good")
+
+    archive = archive_with(handler)
+    obs = Observation("first", "https://irsa.ipac.caltech.edu/" + uri(), 60800, "D2", "DR1")
+    other = Observation("other", "https://irsa.ipac.caltech.edu/" + uri(identity="other"), 60801, "D2", "DR1")
+    query = Query(ra_deg=0, dec_deg=0)
+    try:
+        with pytest.raises(ArchiveError, match="503"):
+            archive.fetch(obs, query, tmp_path / "first", 3)
+        assert not (tmp_path / "first").exists()
+        assert sends == [0] and retry_clock.monotonic() == 0
+        archive.fetch(other, query, tmp_path / "other", 20)
+        assert sends == [0, 5, 12]
+        assert (tmp_path / "other").read_bytes() == b"good"
+    finally:
+        archive.close()
+
+
+@pytest.mark.parametrize(("status", "times"), [(404, [0]), (501, [0]), (502, [0, 1, 3, 7])])
+def test_cutout_http_attempt_bounds(tmp_path, retry_clock, status, times):
+    sends = []
+
+    def handler(req):
+        sends.append(retry_clock.monotonic())
+        return httpx.Response(status, headers={"Retry-After": "malformed"})
+
+    archive = archive_with(handler)
+    obs = Observation("test", "https://irsa.ipac.caltech.edu/" + uri(), 60800, "D2", "DR1")
+    try:
+        with pytest.raises(ArchiveError, match=str(status)):
+            archive.fetch(obs, Query(ra_deg=0, dec_deg=0), tmp_path / "failed", 30)
+        assert sends == times and not (tmp_path / "failed").exists()
+    finally:
+        archive.close()
+
+
+def test_partial_cutout_is_removed_before_retry(tmp_path, retry_clock):
+    sends = []
+    path = tmp_path / "x.fits"
+
+    class Interrupted(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"truncated"
+            raise httpx.ReadError("connection dropped")
+
+    def handler(req):
+        sends.append(retry_clock.monotonic())
+        assert not path.exists()
+        return httpx.Response(200, stream=Interrupted()) if len(sends) == 1 else httpx.Response(200, content=b"whole")
+
+    archive = archive_with(handler)
+    obs = Observation("test", "https://irsa.ipac.caltech.edu/" + uri(), 60800, "D2", "DR1")
+    try:
+        archive.fetch(obs, Query(ra_deg=0, dec_deg=0), path, 30)
+        assert sends == [0, 1] and path.read_bytes() == b"whole"
+    finally:
+        archive.close()
+
+
+def test_cutout_backoff_allows_job_cancellation(tmp_path, retry_clock):
+    sends = []
+
+    def handler(req):
+        sends.append(req)
+        return httpx.Response(503, headers={"Retry-After": "30"})
+
+    def check_cancelled():
+        raise RuntimeError("Search cancelled")
+
+    archive = archive_with(handler)
+    obs = Observation("test", "https://irsa.ipac.caltech.edu/" + uri(), 60800, "D2", "DR1")
+    try:
+        with pytest.raises(RuntimeError, match="Search cancelled"):
+            archive.fetch(obs, Query(ra_deg=0, dec_deg=0), tmp_path / "cancelled",
+                          90, on_wait=check_cancelled)
+        assert len(sends) == 1 and retry_clock.monotonic() == 0
+        assert not (tmp_path / "cancelled").exists()
+    finally:
+        archive.close()
+
+
+def test_two_cutout_slots_are_shared_without_blocking_metadata(tmp_path):
+    inside = 0
+    both_started = threading.Event()
+    finish = threading.Event()
+    lock = threading.Lock()
+
+    def handler(req):
+        nonlocal inside
+        if req.url.path == "/TAP/sync":
+            return httpx.Response(200, text="uri,time_bounds_lower,energy_bandpassname\n")
+        with lock:
+            inside += 1
+            assert inside <= 2
+            if inside == 2:
+                both_started.set()
+        try:
+            assert finish.wait(5)
+            return httpx.Response(200, content=b"ok")
+        finally:
+            with lock:
+                inside -= 1
+
+    archive = archive_with(handler)
+    query = Query(ra_deg=0, dec_deg=0)
+    deadline = time.monotonic() + 10
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(archive.fetch,
+                                   Observation(str(i), "https://irsa.ipac.caltech.edu/" + uri(), 60800, "D2", "DR1"),
+                                   query, tmp_path / str(i), deadline) for i in range(4)]
+            try:
+                assert both_started.wait(5)
+                assert archive._search_tap(query, deadline) == ([], [])
+            finally:
+                finish.set()
+            for f in futures:
+                f.result()
+    finally:
+        archive.close()
 
 
 def test_catalog_keeps_all_six_detectors_without_100_row_or_24_candidate_sampling():

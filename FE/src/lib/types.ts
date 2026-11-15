@@ -1,4 +1,7 @@
+export type Detector = "D1" | "D2" | "D3" | "D4" | "D5" | "D6";
 export type Query = {
+  detectors?: Detector[];
+  channels?: Partial<Record<Detector, string[]>>;
   fov_arcsec?: number;
   live?: boolean;
   ra_deg: number;
@@ -17,6 +20,8 @@ export type Frame = {
   sequence_id?: string;
   pixels?: string;
   quality?: string;
+  spectral?: string;
+  visit_id?: string;
   channel?: string;
   processing_version?: string;
   exposure_flags?: Record<string, string | number>;
@@ -26,10 +31,15 @@ export type Frame = {
   warnings?: string[];
 };
 export type Observation = {
+  selection?: "matched" | "excluded" | "unknown" | "unavailable";
+  visit_id?: string;
+  channel?: string;
+  wavelength_um?: number;
+  bandwidth_um?: number;
   id: string;
   source_url: string;
   observed_at: string;
-  detector: string;
+  detector: Detector;
   release: string;
   status: "pending" | "loading" | "ready" | "failed";
   reason?: string;
@@ -43,7 +53,17 @@ export type Sequence = {
   frame_ids: string[];
   stretch: { vmin?: number; vmax?: number; units?: string };
 };
+export type Visit = {
+  id: string;
+  kind?: "cycle" | "supplemental";
+  start_utc: string;
+  end_utc: string;
+  observation_ids: string[];
+  status: "pending" | "complete" | "invalid";
+  issues: string[];
+};
 export type Manifest = {
+  visits?: Visit[];
   observations?: Observation[];
   sequences?: Sequence[];
   discovery_complete?: boolean;

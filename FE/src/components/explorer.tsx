@@ -32,12 +32,23 @@ import {
   Minimize2,
   Maximize2,
   Repeat,
-} from "lucide-react";
-import SkyViewer from "./sky-viewer";
+} from "./icons";
+import SkyViewer, { type PixelBox } from "./sky-viewer";
 import Spectrum from "./spectrum";
 import ImageControls from "./image-controls";
 import WorkspacePanel from "./workspace-panel";
-import { defaults, skyPixel, skyPosition, type Display } from "@/lib/imaging";
+import { CycleCatalog, ExposureTable } from "./observation-catalog";
+import SearchBands from "./search-bands";
+import { draftBands, fieldKey, inSearch, readBands, selectedBands, type BandDraft } from "@/lib/search-bands";
+import {
+  activeChannels,
+  activeDetectors,
+  defaults,
+  matchesChannel,
+  skyPixel,
+  skyPosition,
+  type Display,
+} from "@/lib/imaging";
 import { useImages } from "@/lib/use-images";
 import {
   storageKey,
@@ -49,7 +60,7 @@ import {
   type Entry,
 } from "@/lib/workspace";
 import FieldSurveys from "./field-surveys";
-import { presets, Frame, Manifest, Query, Preset } from "@/lib/types";
+import { presets, Frame, Manifest, Query, Preset, Observation } from "@/lib/types";
 import {
   poll,
   submit,
@@ -67,8 +78,17 @@ type LoadBatch = {
   all?: boolean;
   recordIds?: string[];
   size: number;
+  automatic?: boolean;
+  resume?: boolean;
+  channels?: Query["channels"];
 };
 const empty: Frame[] = [];
+function mapRequest(display: Display) {
+  return {
+    detectors: activeDetectors(display),
+    channels: activeChannels(display),
+  };
+}
 const stamp = (date?: string) =>
   date
     ? new Date(date).toLocaleString("en-GB", {
@@ -111,7 +131,9 @@ export default function Explorer() {
   const [settingsOpen, setSettingsOpen] = useState(true);
   const [fieldJobId, setFieldJobId] = useState("");
   const [sequenceId, setSequenceId] = useState("");
-  const [viewMode, setViewMode] = useState<"browse" | "matched">("browse");
+  const [viewMode, setViewMode] = useState<"visits" | "browse" | "matched">(
+    "visits",
+  );
   const [loop, setLoop] = useState(true);
   const [statusFilter, setStatusFilter] = useState("");
   const [recordSearch, setRecordSearch] = useState("");
@@ -127,9 +149,30 @@ export default function Explorer() {
   const setInvert = (invert: boolean) => update({ invert });
   const { speed, zoom, invert } = display;
   const [fov, setFov] = useState("300");
+  const [bandDraft, setBandDraft] = useState<BandDraft>({ D1: null });
+  const field = useMemo(() => {
+    try { return { ...parseQuery(ra, dec, start, end), fov_arcsec: angularWidth(fov) }; }
+    catch { return null; }
+  }, [ra, dec, start, end, fov]);
+  const searchBands = selectedBands(bandDraft, fieldKey(field));
   const [entries, setEntries] = useState<Entry[]>([]);
   const [consent, setConsent] = useState<boolean | null>(null);
-  const [pixel, setPixel] = useState<[number, number] | null>(null);
+  const [selection, setSelection] = useState<PixelBox | null>(null);
+  const pixel: [number, number] | null = selection
+    ? [
+        Math.floor((selection[0] + selection[2]) / 2),
+        Math.floor((selection[1] + selection[3]) / 2),
+      ]
+    : null;
+  const [spectrumVisit, setSpectrumVisit] = useState("");
+  const [autoBusy, setAutoBusy] = useState(false);
+  const [autoPaused, setAutoPaused] = useState(false);
+  const attempted = useRef(new Set<string>());
+  const priorityRequests = useRef(new Map<string, Promise<void>>());
+  const priorityAcknowledged = useRef(0);
+  const priorityController = useRef<AbortController | null>(null);
+  const announcedCycles = useRef(new Set<string>());
+  const visitDialog = useRef<HTMLDialogElement>(null);
   const restoreFrame = useRef("");
   const restorePosition = useRef<Entry["position"] | null>(null);
   const timing = useRef<{
@@ -139,9 +182,14 @@ export default function Explorer() {
     painted: boolean;
   } | null>(null);
   const lastSaved = useRef<Backup | null>(null);
-  const science = useImages(manifest, display);
+  const hasCycles = !!manifest?.visits?.some(v => v.kind !== "supplemental");
+  const science = useImages(manifest, display, viewMode !== "visits" || !hasCycles);
   const [dockOpen, setDockOpen] = useState(true);
   const [committed, setCommitted] = useState<Query | null>(null);
+  const bandsEdited = !!committed?.live && (
+    !searchBands || JSON.stringify(searchBands.detectors) !== JSON.stringify(committed.detectors) ||
+    JSON.stringify(searchBands.channels) !== JSON.stringify(committed.channels ?? {})
+  );
   const controller = useRef<AbortController | null>(null),
     generation = useRef(0),
     activeJob = useRef<string | null>(null);
@@ -155,10 +203,7 @@ export default function Explorer() {
   const sequence =
     sequences.find((s) => s.id === sequenceId) ||
     [...sequences].sort((a, b) => b.frame_ids.length - a.frame_ids.length)[0];
-  const derived =
-    display.mode === "rgb" ||
-    display.difference ||
-    Object.keys(display.operands).length > 0;
+  const derived = viewMode === "visits" && hasCycles;
   const matched = viewMode === "matched" && !derived;
   const frames = useMemo(
       () =>
@@ -171,25 +216,25 @@ export default function Explorer() {
     ),
     index = Math.max(
       0,
-      frames.findIndex((f) => f.observation_id === selectedFrame),
+      frames.findIndex((f) => f.observation_id === selectedFrame || (derived && f.visit_id === selectedFrame)),
     ),
     frame = frames[index];
-  const setIndex = useCallback(
-    (value: number | ((current: number) => number)) => {
-      restoreFrame.current = "";
-      setSelectedFrame((selected) => {
-        const old = Math.max(
-          0,
-          frames.findIndex((f) => f.observation_id === selected),
-        );
-        return (
-          frames[typeof value === "number" ? value : value(old)]
-            ?.observation_id ?? ""
-        );
-      });
-    },
-    [frames],
-  );
+  const isVisitMap = !!frame?.visit_id && frame.observation_id === frame.visit_id;
+  const steps = science.steps;
+  const cycleIndex = frame ? steps.findIndex(({ visit }) =>
+    frame.visit_id === visit.id || visit.observation_ids.includes(frame.observation_id)) : -1;
+  const selectCycle = useCallback((position: number) => {
+    const step = steps[position];
+    if (!step) return;
+    restoreFrame.current = step.visit.id;
+    setViewMode("visits");
+    setSelectedFrame(step.visit.id);
+  }, [steps]);
+  // A raw exposure outside a cycle can jump to the nearest cycle in either direction.
+  const previousCycle = cycleIndex >= 0 ? cycleIndex - 1
+    : steps.findLastIndex(s => frame && Date.parse(s.visit.end_utc) < Date.parse(frame.observed_at));
+  const nextCycle = cycleIndex >= 0 ? cycleIndex + 1
+    : steps.findIndex(s => !frame || Date.parse(s.visit.start_utc) > Date.parse(frame.observed_at));
   const product = frame
     ? science.result[science.frames.indexOf(frame)]
     : undefined;
@@ -204,6 +249,95 @@ export default function Explorer() {
   const observations = manifest?.observations?.length
     ? manifest.observations
     : undefined;
+  const catalogVisits = manifest?.visits;
+  const catalogRecords = useMemo<Observation[]>(() => observations ?? allFrames.map(f => ({
+    id: f.observation_id,
+    visit_id: f.visit_id,
+    observed_at: f.observed_at,
+    detector: f.detector as Observation["detector"],
+    release: f.release ?? "—",
+    source_url: f.source_url ?? "",
+    status: "ready",
+  })), [observations, allFrames]);
+  const cycleCount = catalogVisits?.filter(v => v.kind !== "supplemental").length ?? 0;
+  const visibleMaps = useMemo(() => new Set(steps.map(s => s.visit.id)), [steps]);
+  function inspectRecord(record: Observation) {
+    const raw = frameByObservation.get(record.id);
+    setDockExpanded(false);
+    if (raw) {
+      setSequenceId(raw.sequence_id ?? "");
+      restoreFrame.current = raw.observation_id;
+      setViewMode("browse");
+      setSelectedFrame(raw.observation_id);
+      setPlaying(false);
+    } else if (fieldJobId && displayedQuery && inSearch(record, displayedQuery)) {
+      restoreFrame.current = record.id;
+      setViewMode("browse");
+      setSelectedFrame(record.id);
+      setPlaying(false);
+      const key = fieldJobId + "/" + record.id;
+      if (priorityRequests.current.has(key)) return;
+      if (!priorityController.current || priorityController.current.signal.aborted)
+        priorityController.current = new AbortController();
+      const signal = priorityController.current.signal;
+      const accepted = request(`/api/jobs/${encodeURIComponent(fieldJobId)}/priority/${encodeURIComponent(record.id)}`,
+        signal, {}).then(() => {
+        if (signal.aborted) return;
+        priorityAcknowledged.current++;
+        if (!activeJob.current)
+          void load(displayedQuery, "", null, {jobId: fieldJobId, size: batchSize, resume: true});
+      }).catch(err => {
+        if (!signal.aborted) setError(err.message);
+      }).finally(() => {
+        if (priorityRequests.current.get(key) === accepted) priorityRequests.current.delete(key);
+      });
+      priorityRequests.current.set(key, accepted);
+    }
+  }
+  function openCycle(id: string) {
+    setDockExpanded(false);
+    restoreFrame.current = id;
+    setMode("visits");
+    setSelectedFrame(id);
+  }
+  const visit =
+    manifest?.visits?.find(
+      (v) => v.id === (frame?.visit_id ?? frame?.observation_id),
+    ) ??
+    manifest?.visits?.find((v) =>
+      v.observation_ids.includes(frame?.observation_id ?? ""),
+    ) ??
+    manifest?.visits?.find((v) => v.kind !== "supplemental" && v.status !== "invalid");
+  const visitMembers = useMemo(
+    () => new Set(visit?.observation_ids ?? []),
+    [visit],
+  );
+  const requestSpectra = !!visit && spectrumVisit === visit.id;
+  const pendingSpectrumInputs = observations?.filter(o => visitMembers.has(o.id) &&
+    (o.status === "pending" || o.status === "loading") && inSearch(o, displayedQuery)) ?? [];
+  const detailPlanes = useMemo(
+    () =>
+      science.data.filter((p) =>
+        visit
+          ? visitMembers.has(p.frame.observation_id)
+          : p.frame.observation_id === frame?.observation_id,
+      ),
+    [science.data, visit, visitMembers, frame?.observation_id],
+  );
+  const conflicts = useMemo(() => (manifest?.visits ?? []).filter(v =>
+    v.kind !== "supplemental" && v.status === "invalid"), [manifest?.visits]);
+  const cycleMembers = useMemo(() => new Set(manifest?.visits?.filter(v =>
+    v.kind !== "supplemental" && v.status !== "invalid").flatMap(v => v.observation_ids)), [manifest?.visits]);
+  const requestedId = restoreFrame.current;
+  useEffect(() => {
+    const dialog = visitDialog.current;
+    if (!dialog) return;
+    const keys = conflicts.map(v => fieldJobId + "/" + v.id);
+    if (keys.some(key => !announcedCycles.current.has(key))) {
+      keys.forEach(key => announcedCycles.current.add(key));
+      if (!dialog.open) dialog.showModal();
+    } else if (!keys.length && dialog.open) dialog.close();
+  }, [conflicts, fieldJobId]);
   const filteredObservations = useMemo(
     () =>
       (observations || []).filter(
@@ -217,10 +351,12 @@ export default function Explorer() {
       ),
     [observations, detectorFilter, statusFilter, recordSearch],
   );
-  const pendingCount = filteredObservations.filter(
+  const selectable = filteredObservations.filter(o => inSearch(o, displayedQuery));
+  const canRequest = (record: Observation) => (!busy || fieldJobId === activeJob.current) && inSearch(record, displayedQuery);
+  const pendingCount = selectable.filter(
     (o) => o.status === "pending",
   ).length;
-  const failedRecords = filteredObservations.filter(
+  const failedRecords = selectable.filter(
     (o) => o.status === "failed",
   );
   const unmatchedFrames =
@@ -228,9 +364,8 @@ export default function Explorer() {
     !derived &&
     new Set(frames.map((f) => f.sequence_id || f.channel || f.detector)).size >
       1;
-  function setMode(mode: "browse" | "matched") {
+  function setMode(mode: "visits" | "browse" | "matched") {
     setPlaying(false);
-    if (derived) update({ mode: "single", difference: false, operands: {} });
     setViewMode(mode);
     if (mode === "matched" && sequence) setSequenceId(sequence.id);
   }
@@ -285,7 +420,7 @@ export default function Explorer() {
         : (displayedQuery?.fov_arcsec ?? 300),
   };
   const backup: Backup = {
-    version: 1,
+    version: 2,
     exported: new Date().toISOString(),
     locations: entries,
     config: configuration,
@@ -313,17 +448,25 @@ export default function Explorer() {
   useEffect(() => {
     if (!frame) return;
     const wanted = frames.find(
-      (f) => f.observation_id === restoreFrame.current,
+      (f) => f.observation_id === restoreFrame.current || (derived && f.visit_id === restoreFrame.current),
     );
+    const key = (f: typeof frame) => derived && f.visit_id ? f.visit_id : f.observation_id;
     if (wanted) {
       restoreFrame.current = "";
-      setSelectedFrame(wanted.observation_id);
+      setSelectedFrame(key(wanted));
     } else {
-      if (!busy && science.settled) restoreFrame.current = "";
-      if (frame.observation_id !== selectedFrame)
-        setSelectedFrame(frame.observation_id);
+      if (
+        !busy &&
+        science.settled &&
+        !observations?.some(
+          (o) => o.status === "pending" || o.status === "loading",
+        )
+      )
+        restoreFrame.current = "";
+      if (key(frame) !== selectedFrame)
+        setSelectedFrame(key(frame));
     }
-  }, [frames, frame, selectedFrame, busy, science.settled]);
+  }, [frames, frame, selectedFrame, derived, busy, science.settled, observations]);
   useEffect(() => {
     if (consent === true)
       try {
@@ -347,14 +490,13 @@ export default function Explorer() {
   }, [consent, display, displayedQuery, entries, fov, frame, manifest]);
   useEffect(() => {
     if (restorePosition.current && displayedQuery && science.width) {
-      setPixel(
-        skyPixel(
-          displayedQuery,
-          restorePosition.current,
-          science.width,
-          science.height,
-        ),
+      const point = skyPixel(
+        displayedQuery,
+        restorePosition.current,
+        science.width,
+        science.height,
       );
+      if (point) setSelection([point[0], point[1], point[0], point[1]]);
       restorePosition.current = null;
     }
   }, [displayedQuery, science.width, science.height]);
@@ -367,7 +509,7 @@ export default function Explorer() {
     }
   }
   const canPlay =
-    ready && frames.length > 1 && (!busy || committed === displayedQuery);
+    ready && steps.length > 1 && (!busy || committed === displayedQuery);
   const load = useCallback(
     async (
       query: Query,
@@ -389,23 +531,34 @@ export default function Explorer() {
       const before = new Set(
         observedFrames.current.map((f) => f.observation_id),
       );
-      timing.current = null;
+      if (!more) timing.current = null;
       setBusy(true);
+      setAutoBusy(more?.automatic === true);
+      if (!more) {
+        priorityController.current?.abort();
+        priorityRequests.current.clear();
+        attempted.current.clear();
+        setAutoPaused(false);
+        setSpectrumVisit("");
+      }
       setError("");
       setNotice("");
       if (!more) setPlaying(false);
       setCommitted(query);
       setStage(more ? "Loading images" : "Finding observations");
-      restorePosition.current = null;
-      restoreFrame.current = "";
+      if (!more) {
+        restorePosition.current = null;
+        restoreFrame.current = "";
+      }
       if (!more) window.history.replaceState({}, "", queryUrl(query));
       try {
-        const id = more
+        const id = more?.resume ? more.jobId : more
           ? await loadObservations(
               more.jobId,
               abort.signal,
               more.ids ?? more.recordIds?.slice(0, more.size),
               more.detector,
+              more.channels,
             )
           : await submit(query, abort.signal);
         let deadline = Date.now() + 180000;
@@ -414,7 +567,7 @@ export default function Explorer() {
           return;
         }
         activeJob.current = id;
-        timing.current = { query, job: id, start: started, painted: false };
+        if (!more) timing.current = { query, job: id, start: started, painted: false };
         while (!abort.signal.aborted) {
           if (Date.now() > deadline) {
             void cancelJob(id).catch(() => {});
@@ -422,6 +575,7 @@ export default function Explorer() {
               "Search timed out. Narrow the date range or try again later.",
             );
           }
+          const acknowledgedBeforePoll = priorityAcknowledged.current;
           const job = await poll(id, abort.signal);
           if (abort.signal.aborted || current !== generation.current) return;
           const progress = job.stage?.match(/^fetch:(\d+)\/(\d+)$/);
@@ -432,6 +586,11 @@ export default function Explorer() {
           );
           const finished =
             job.status === "complete" || job.status === "partial";
+          if (finished) {
+            await Promise.all(priorityRequests.current.values());
+            if (abort.signal.aborted || current !== generation.current) return;
+            if (acknowledgedBeforePoll !== priorityAcknowledged.current) continue;
+          }
           if (
             job.manifest &&
             (finished ||
@@ -452,10 +611,14 @@ export default function Explorer() {
                 if (!more) {
                   restoreFrame.current = wantedFrame;
                   restorePosition.current = wantedPosition;
-                  setPixel(null);
+                  setSelection(null);
                   setSelectedFrame("");
                   setSequenceId("");
-                  setViewMode("browse");
+                  const restoreRaw = wantedFrame && (
+                    result.frames.some(f => f.observation_id === wantedFrame) ||
+                    result.observations?.some(o => o.id === wantedFrame)
+                  );
+                  setViewMode(!query.live || restoreRaw ? "browse" : "visits");
                   setDetectorFilter("");
                   setRecordSearch("");
                   setStatusFilter("");
@@ -471,6 +634,7 @@ export default function Explorer() {
               }
               if (
                 more &&
+                !more.automatic &&
                 !targetSelected &&
                 (more.ids?.length === 1 || more.detector)
               ) {
@@ -483,12 +647,6 @@ export default function Explorer() {
                 if (wanted) {
                   setViewMode("browse");
                   setSequenceId(wanted.sequence_id ?? "");
-                  setDisplay((previous) => ({
-                    ...previous,
-                    mode: "single",
-                    operands: {},
-                    difference: false,
-                  }));
                   restoreFrame.current = wanted.observation_id;
                   setSelectedFrame(wanted.observation_id);
                   targetSelected = true;
@@ -517,7 +675,7 @@ export default function Explorer() {
             if (more?.all) {
               const remaining = (job.manifest.observations ?? []).filter(
                 (o) =>
-                  o.status === "pending" &&
+                  o.status === "pending" && o.selection !== "unavailable" && inSearch(o, query) &&
                   (!more.detector || o.detector === more.detector) &&
                   (!more.recordIds || more.recordIds.includes(o.id)),
               );
@@ -568,11 +726,15 @@ export default function Explorer() {
               abort.signal.removeEventListener("abort", done);
               resolve();
             };
-            const timer = setTimeout(done, 500);
+            const timer = setTimeout(done, firstFramePublished ? 400 : 120);
             abort.signal.addEventListener("abort", done, { once: true });
           });
         }
       } catch (e) {
+        if (more?.automatic && current === generation.current) {
+          attempted.current.clear();
+          if (!abort.signal.aborted) setAutoPaused(true);
+        }
         if (!abort.signal.aborted && current === generation.current)
           setError(
             e instanceof TypeError
@@ -584,12 +746,88 @@ export default function Explorer() {
       } finally {
         if (current === generation.current) {
           setBusy(false);
+          setAutoBusy(false);
           activeJob.current = null;
         }
       }
     },
     [],
   );
+  useEffect(() => {
+    if (
+      busy ||
+      autoPaused || priorityRequests.current.size ||
+      !observations ||
+      !displayedQuery?.live ||
+      displayedQuery !== committed ||
+      !fieldJobId || !manifest?.visits?.length
+    )
+      return;
+    const detectors = activeDetectors(display);
+    const channels = activeChannels(display);
+    const pinnedIds = new Set(
+      display.maps.flatMap(m => Object.keys(m.operands))
+        .filter(key => key.startsWith("exposure:"))
+        .map(key => key.slice(9)),
+    );
+    const wanted = observations.filter((o) => o.status === "pending" && o.selection !== "unavailable" && inSearch(o, displayedQuery));
+    const needed = (o: (typeof wanted)[number]) => {
+      if (pinnedIds.has(o.id)) return true;
+      const detector = detectors.find((d) => d === o.detector);
+      if (!detector) return false;
+      const restriction = channels[detector];
+      return (
+        !restriction?.length ||
+        !o.channel ||
+        restriction.some((name) => matchesChannel(name, o))
+      );
+    };
+    const priority = (o: (typeof wanted)[number]) => {
+      if (requestedId === o.id || pinnedIds.has(o.id)) return -2;
+      if (
+        requestedId &&
+        manifest.visits?.some(
+          (v) => v.id === requestedId && v.observation_ids.includes(o.id),
+        ) &&
+        needed(o)
+      )
+        return -1;
+      if (visitMembers.has(o.id) && cycleMembers.has(o.id) && needed(o)) return 0;
+      if (requestSpectra && inspectorOpen && visitMembers.has(o.id)) return 1;
+      if ((cycleMembers.has(o.id) || !hasCycles) && needed(o)) return 2;
+      return display.prefetchBands ? 3 : 4;
+    };
+    const queued = wanted
+      .filter((o) => priority(o) < 4 && !attempted.current.has(o.id))
+      .sort((a, b) => priority(a) - priority(b));
+    if (!queued.length) return;
+    const batch = queued.slice(0, batchSize);
+    batch.forEach((o) => attempted.current.add(o.id));
+    void load(displayedQuery, "", null, {
+      jobId: fieldJobId,
+      ids: batch.map((o) => o.id),
+      size: batchSize,
+      automatic: true,
+    });
+  }, [
+    busy,
+    autoPaused,
+    observations,
+    displayedQuery,
+    committed,
+    fieldJobId,
+    manifest?.visits,
+    display.maps,
+    display.prefetchBands,
+    requestSpectra,
+    inspectorOpen,
+    visitMembers,
+    cycleMembers,
+    hasCycles,
+    batchSize,
+    load,
+    requestedId,
+  ]);
   function loadBatch(batch: Omit<LoadBatch, "jobId" | "size">) {
     if (displayedQuery && fieldJobId)
       void load(displayedQuery, "", null, {
@@ -599,6 +837,11 @@ export default function Explorer() {
       });
   }
   function cancelSearch() {
+    priorityController.current?.abort();
+    priorityRequests.current.clear();
+    attempted.current.clear();
+    setAutoPaused(true);
+    setAutoBusy(false);
     const id = activeJob.current;
     controller.current?.abort();
     const current = ++generation.current;
@@ -627,6 +870,7 @@ export default function Explorer() {
     const abort = new AbortController();
     const params = new URLSearchParams(window.location.search);
     let saved: Backup | undefined;
+    let openingDisplay = defaults;
     try {
       const viaUrl = params.has("ra") || params.has("dec");
       const raw = localStorage.getItem(storageKey);
@@ -637,8 +881,9 @@ export default function Explorer() {
         setConsent(true);
       }
       const state = params.get("view");
-      if (state) setDisplay(readDisplay(JSON.parse(state)));
-      else if (!viaUrl && saved?.config) setDisplay(saved.config.display);
+      if (state) openingDisplay = readDisplay(JSON.parse(state));
+      else if (!viaUrl && saved?.config) openingDisplay = saved.config.display;
+      setDisplay(openingDisplay);
       if (!params.has("ra") && saved?.config?.query) {
         const q = saved.config.query;
         params.set("ra", String(q.ra_deg));
@@ -647,6 +892,7 @@ export default function Explorer() {
         if (q.start_utc) params.set("start", q.start_utc.slice(0, 10));
         if (q.end_utc) params.set("end", q.end_utc.slice(0, 10));
         params.set("frame", saved.config.frame);
+        if (q.detectors?.length) params.set("bands", JSON.stringify({detectors:q.detectors,channels:q.channels ?? {}}));
       }
       setFov(
         viaUrl
@@ -721,11 +967,15 @@ export default function Explorer() {
       setEnd(e);
       if (s || e) setDatesOpen(true);
       try {
+        const bands = params.has("bands") ? readBands(JSON.parse(params.get("bands")!)) : mapRequest(openingDisplay);
+        if (!bands.detectors.length) bands.detectors = ["D1"];
         const query = {
           ...parseQuery(r, d, s, e),
           fov_arcsec: angularWidth(params.get("fov") ?? "300"),
           live: true,
+          ...bands,
         };
+        setBandDraft(draftBands(bands, fieldKey(query)));
         // Strict Mode cleans up its first mount before this task runs.
         queueMicrotask(() => {
           if (!abort.signal.aborted)
@@ -738,19 +988,20 @@ export default function Explorer() {
     return () => {
       abort.abort();
       controller.current?.abort();
+      priorityController.current?.abort();
     };
   }, [load]);
   useEffect(() => {
     if (!playing || !canPlay) return;
     const timer = setTimeout(() => {
-      if (!loop && index === frames.length - 1) {
+      if (!loop && (nextCycle < 0 || nextCycle >= steps.length)) {
         setPlaying(false);
         return;
       }
-      setIndex((i) => (i + 1) % frames.length);
+      selectCycle(nextCycle >= 0 && nextCycle < steps.length ? nextCycle : 0);
     }, 1000 / speed);
     return () => clearTimeout(timer);
-  }, [playing, canPlay, speed, frames.length, index, loop, setIndex]);
+  }, [playing, canPlay, speed, steps.length, nextCycle, loop, selectCycle]);
   useEffect(() => {
     const hide = () => {
       if (document.hidden) setPlaying(false);
@@ -758,6 +1009,7 @@ export default function Explorer() {
     document.addEventListener("visibilitychange", hide);
     const keys = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        if (document.querySelector("dialog[open]")) return;
         setInspectorOpen(false);
       }
       if ((e.target as HTMLElement).closest("input,select,textarea,button,a"))
@@ -767,16 +1019,16 @@ export default function Explorer() {
         e.preventDefault();
         setPlaying((p) => !p);
       }
-      if (!frames.length) return;
+      if (steps.length < 2) return;
       if (e.key === "ArrowRight") {
         e.preventDefault();
         setPlaying(false);
-        setIndex((i) => (i + 1) % frames.length);
+        selectCycle(nextCycle >= 0 && nextCycle < steps.length ? nextCycle : 0);
       }
       if (e.key === "ArrowLeft") {
         e.preventDefault();
         setPlaying(false);
-        setIndex((i) => (i - 1 + frames.length) % frames.length);
+        selectCycle(previousCycle >= 0 ? previousCycle : steps.length - 1);
       }
     };
     window.addEventListener("keydown", keys);
@@ -784,13 +1036,8 @@ export default function Explorer() {
       document.removeEventListener("visibilitychange", hide);
       window.removeEventListener("keydown", keys);
     };
-  }, [canPlay, frames.length, playing, setIndex]);
+  }, [canPlay, steps.length, playing, selectCycle, nextCycle, previousCycle]);
   const onReady = useCallback((value: boolean) => setReady(value), []);
-  const onFailure = useCallback(() => {
-    setError(
-      "An observation image could not be loaded. Search again to refresh the sequence.",
-    );
-  }, []);
   const onPaint = useCallback((query: Query) => {
     const run = timing.current;
     if (run && run.query === query && !run.painted) {
@@ -813,12 +1060,14 @@ export default function Explorer() {
   }
   function search(e: FormEvent) {
     e.preventDefault();
-    if (busy) return;
+    if (busy && !autoBusy) return;
     try {
+      if (!searchBands) throw Error("Choose at least one detector and confirm its subbands for this field.");
       void load({
         ...parseQuery(ra, dec, start, end),
         fov_arcsec: angularWidth(fov),
         live: true,
+        ...searchBands,
       });
     } catch (err) {
       setError((err as Error).message);
@@ -832,12 +1081,19 @@ export default function Explorer() {
     setFov(String(c.fov));
     if (c.query) {
       const q = c.query;
+      const bands = q.detectors?.length ? readBands(q) : mapRequest(c.display);
+      if (!bands.detectors.length) bands.detectors = ["D1"];
+      setBandDraft(draftBands(bands, fieldKey({ ...q, fov_arcsec: c.fov })));
       setRa(String(q.ra_deg));
       setDec(String(q.dec_deg));
       setStart(q.start_utc?.slice(0, 10) ?? "");
       setEnd(q.end_utc?.slice(0, 10) ?? "");
       setSelected("");
-      void load({ ...q, live: true }, c.frame, wantedPosition);
+      void load(
+        { ...q, fov_arcsec: c.fov, live: true, ...bands },
+        c.frame,
+        wantedPosition,
+      );
     }
   }
   function importBackup(b: Backup) {
@@ -874,9 +1130,9 @@ export default function Explorer() {
       setNotice("Copy the address from your browser to share this field.");
     }
   }
-  function step(n: number) {
+  function jumpToCycle(position: number) {
     setPlaying(false);
-    setIndex((i) => Math.max(0, Math.min(frames.length - 1, i + n)));
+    selectCycle(position);
   }
   return (
     <div className={"app-layout" + (settingsOpen ? "" : " settings-collapsed")}>
@@ -917,7 +1173,7 @@ export default function Explorer() {
           {["Settings", "Surveys", "Links", "Help", "About"].map((value) => (
             <button
               key={value}
-              onClick={() => setTab(value)}
+              onClick={() => setTab(tab === value ? "" : value)}
               aria-pressed={tab === value}
               className={tab === value ? "active" : ""}
             >
@@ -926,8 +1182,9 @@ export default function Explorer() {
           ))}
         </nav>
         <div className="settings-scroll">
-          {tab === "Settings" ? (
-            <>
+          <div hidden={tab !== "Settings"}>
+            <details className="sidebar-section" open>
+              <summary>Search</summary>
               <form className="search-panel" onSubmit={search} noValidate>
                 <div className="control-section-heading">
                   <span>Sky coordinates</span>
@@ -1035,18 +1292,19 @@ export default function Explorer() {
                     </label>
                   </div>
                 )}
+                <SearchBands query={field} draft={bandDraft} change={setBandDraft} />
                 <div className="query-actions">
                   <button
                     className="button primary"
                     type="submit"
-                    disabled={busy}
+                    disabled={(busy && !autoBusy) || !searchBands}
                   >
                     {busy ? (
                       <LoaderCircle size={14} className="spin" />
                     ) : (
                       <Search size={14} />
                     )}
-                    {busy ? "Searching" : "Search observations"}
+                    {busy && !autoBusy ? "Searching" : "Search observations"}
                   </button>
                   {busy ? (
                     <button
@@ -1071,6 +1329,7 @@ export default function Explorer() {
                         setEnd("");
                         setSelected("");
                         setDisplay(defaults);
+                        setBandDraft({ D1: null });
                         setFov("300");
                         setError("");
                         setNotice("");
@@ -1081,20 +1340,43 @@ export default function Explorer() {
                   )}
                 </div>
               </form>
-              {manifest?.frames.length && !science.numeric ? (
+              <label className="prefetch-option">
+                <input
+                  type="checkbox"
+                  checked={display.prefetchBands}
+                  onChange={(e) => {
+                    setAutoPaused(false);
+                    update({ prefetchBands: e.target.checked });
+                  }}
+                />
+                Load remaining selected bands in background
+              </label>
+            </details>
+            <details className="sidebar-section" open>
+              <summary>Spectrum</summary>
+              {frame?.previewScale ||
+              (manifest?.frames.length && !science.numeric) ? (
                 <p className="preview-note">
-                  Prepared PNG preview. Search observations to load calibrated
-                  brightness values for color and band controls.
+                  {frame?.quality || frame?.pixels
+                    ? "Exposure PNG preview. Color and band controls use calibrated brightness when available."
+                    : "Prepared PNG preview. Search observations to load calibrated brightness values for color and band controls."}
                 </p>
               ) : null}
-              {science.numeric && (
-                <ImageControls
-                  s={display}
-                  update={update}
-                  frames={manifest?.frames ?? empty}
-                  bounds={science.bounds}
-                />
-              )}
+              <ImageControls
+                fieldJobId={fieldJobId}
+                s={display}
+                update={(patch) => {
+                  setAutoPaused(false);
+                  setViewMode("visits");
+                  update(patch);
+                }}
+                frames={manifest?.frames ?? empty}
+                observations={observations}
+                bounds={science.bounds}
+              />
+            </details>
+            <details className="sidebar-section">
+              <summary>Saved locations</summary>
               <WorkspacePanel
                 backup={backup}
                 saveEntries={setEntries}
@@ -1105,6 +1387,9 @@ export default function Explorer() {
                 reopen={(e) => restoreConfig(e.config, e.position)}
                 onError={setError}
               />
+            </details>
+            <details className="sidebar-section">
+              <summary>Playback and appearance</summary>
               <section className="control-section">
                 <div className="control-section-heading">
                   <span>Playback & scale</span>
@@ -1129,7 +1414,7 @@ export default function Explorer() {
                 <div className="control-section-heading">
                   <span>Image appearance</span>
                 </div>
-                {!science.numeric && (
+                {!frame?.canvas && (
                   <>
                     <label className="slider-label" htmlFor="stretch">
                       Display stretch <span>Shared</span>
@@ -1170,11 +1455,12 @@ export default function Explorer() {
                     onChange={(e) => setInvert(e.target.checked)}
                     disabled={!ready}
                   />
-                  {science.numeric ? "Invert colors" : "Invert grayscale"}
+                  {frame?.canvas ? "Invert colors" : "Invert grayscale"}
                 </label>
               </section>
-            </>
-          ) : tab === "Surveys" ? (
+            </details>
+          </div>
+          {tab === "Surveys" ? (
             displayedQuery ? (
               <FieldSurveys
                 key={`${displayedQuery.ra_deg},${displayedQuery.dec_deg}`}
@@ -1185,7 +1471,7 @@ export default function Explorer() {
                 Search a sky position to load survey data.
               </p>
             )
-          ) : (
+          ) : tab && tab !== "Settings" ? (
             <section className="panel-copy">
               {tab === "Links" ? (
                 <>
@@ -1214,16 +1500,17 @@ export default function Explorer() {
                   </p>
                   <p>
                     The field of view defines the sky area retrieved. Zoom only
-                    magnifies the displayed pixels. Drag the image to pan.
+                    magnifies the displayed pixels. Click a pixel or left-drag a
+                    region for Details. Right-drag to pan and use two fingers to
+                    pan or zoom on touchscreens.
                   </p>
                   <p>
                     Play blinks between loaded observations in acquisition
                     order. Use Space to play or pause and arrow keys to step.
                   </p>
                   <p>
-                    Inversion changes the grayscale display only. Compare
-                    matching wavelengths before interpreting changes in
-                    brightness.
+                    Inversion changes the displayed colors. Compare matching
+                    wavelengths before interpreting changes in brightness.
                   </p>
                 </>
               ) : (
@@ -1244,16 +1531,46 @@ export default function Explorer() {
                 </>
               )}
             </section>
-          )}
+          ) : null}
         </div>
       </aside>
       <main id="workspace">
         <div className="content">
           <h1 className="sr-only">Planet X</h1>
           <div className="feedback" aria-live="polite">
+            {conflicts.length > 0 && (
+              <button
+                className="button"
+                onClick={() => visitDialog.current?.showModal()}
+              >
+                Review visit errors ({conflicts.length})
+              </button>
+            )}
+            <dialog
+              className="visit-dialog"
+              aria-labelledby="visit-error-title"
+              ref={visitDialog}
+            >
+              <h2 id="visit-error-title">Incomplete or conflicting visits</h2>
+              <ul>
+                {conflicts.map((v) => (
+                  <li key={v.id}>
+                    <strong>{stamp(v.start_utc)}{v.start_utc !== v.end_utc && ` – ${stamp(v.end_utc)}`}</strong>
+                    <ul>{v.issues.map(issue => <li key={issue}>{issue}</li>)}</ul>
+                  </li>
+                ))}
+              </ul>
+              <p>
+                Inspect individual exposures in Browse or in the observation
+                table.
+              </p>
+              <form method="dialog">
+                <button className="button">Close</button>
+              </form>
+            </dialog>
             {committed &&
               !busy &&
-              (Number(ra) !== committed.ra_deg ||
+              (bandsEdited || Number(ra) !== committed.ra_deg ||
                 Number(dec) !== committed.dec_deg ||
                 Number(fov) !== (committed.fov_arcsec ?? 300) ||
                 start !== (committed.start_utc?.slice(0, 10) || "") ||
@@ -1303,6 +1620,17 @@ export default function Explorer() {
                 {notice}
               </p>
             )}
+            {autoPaused && !busy && displayedQuery?.live && (
+              <button
+                className="button"
+                onClick={() => {
+                  attempted.current.clear();
+                  setAutoPaused(false);
+                }}
+              >
+                Resume band loading
+              </button>
+            )}
           </div>
           <div
             className={
@@ -1323,7 +1651,10 @@ export default function Explorer() {
                     }
                     aria-label="Toggle frame details"
                     aria-expanded={inspectorOpen}
-                    onClick={() => setInspectorOpen(!inspectorOpen)}
+                    onClick={() => {
+                      setInspectorOpen(!inspectorOpen);
+                      if (inspectorOpen) setSpectrumVisit("");
+                    }}
                   >
                     <PanelRight size={14} />
                     <span>Details</span>
@@ -1335,12 +1666,20 @@ export default function Explorer() {
                   <div
                     className="view-modes"
                     role="group"
-                    aria-label="Playback mode"
+                    aria-label="Image view"
                   >
+                    {hasCycles && (
+                      <button
+                        aria-pressed={derived}
+                        onClick={() => setMode("visits")}
+                      >
+                        Visits
+                      </button>
+                    )}
                     <button
                       aria-pressed={!matched && !derived}
                       onClick={() => setMode("browse")}
-                      title="Browse loaded observations in acquisition order"
+                      title="Inspect a single exposure"
                     >
                       Browse
                     </button>
@@ -1348,7 +1687,7 @@ export default function Explorer() {
                       aria-pressed={matched}
                       disabled={!sequences.some((s) => s.frame_ids.length)}
                       onClick={() => setMode("matched")}
-                      title="Play observations with compatible wavelength and calibration"
+                      title="Inspect exposures with compatible wavelength and calibration"
                     >
                       Matched
                     </button>
@@ -1391,22 +1730,22 @@ export default function Explorer() {
                     >
                       {unmatchedFrames
                         ? "Unmatched observations; brightness is not directly comparable."
-                        : derived
-                          ? String(frames.length) +
-                            (frames.length === 1
-                              ? " derived image"
-                              : " derived images")
+                        : derived && frame && !isVisitMap
+                          ? "Cycle exposure · selected map inputs pending or unavailable"
+                          : derived
+                          ? `${frames.length} mapped visit${frames.length === 1 ? "" : "s"}`
                           : `${allFrames.length} loaded image${allFrames.length === 1 ? "" : "s"}`}
+                      {isVisitMap && visit?.status === "pending" && " · Provisional"}
                     </span>
                   )}
                 </div>
               )}
               <SkyViewer
+                cycleView={derived}
                 unmatchedFrames={unmatchedFrames}
                 frames={frames}
                 index={index}
                 onReady={onReady}
-                onFailure={onFailure}
                 onPaint={onPaint}
                 zoom={zoom}
                 invert={invert}
@@ -1414,34 +1753,35 @@ export default function Explorer() {
                 update={update}
                 query={displayedQuery}
                 bounds={
-                  science.numeric
-                    ? science.bounds
+                  frame?.mapScales?.length
+                    ? frame.mapScales[0].bounds
                     : [
                         manifest?.processing?.stretch?.vmin ?? 0,
                         manifest?.processing?.stretch?.vmax ?? 1,
                       ]
                 }
                 colors={science.colors}
-                onPixel={(x, y) => setPixel([x, y])}
+                selection={selection}
+                onSelect={(box) => {
+                  setSelection(box);
+                  setInspectorOpen(true);
+                }}
                 message={science.message}
                 grid={manifest?.grid}
               />
               <div className="playback">
                 <div className="transport">
                   <button
-                    aria-label="First frame"
-                    disabled={frames.length < 2}
-                    onClick={() => {
-                      setPlaying(false);
-                      setIndex(0);
-                    }}
+                    aria-label="First cycle"
+                    disabled={steps.length < 2}
+                    onClick={() => jumpToCycle(0)}
                   >
                     <SkipBack size={15} />
                   </button>
                   <button
-                    aria-label="Previous frame"
-                    disabled={frames.length < 2}
-                    onClick={() => step(-1)}
+                    aria-label="Previous cycle"
+                    disabled={previousCycle < 0}
+                    onClick={() => jumpToCycle(previousCycle)}
                   >
                     <ChevronLeft size={17} />
                   </button>
@@ -1454,19 +1794,16 @@ export default function Explorer() {
                     {playing ? <Pause size={16} /> : <Play size={16} />}
                   </button>
                   <button
-                    aria-label="Next frame"
-                    disabled={frames.length < 2}
-                    onClick={() => step(1)}
+                    aria-label="Next cycle"
+                    disabled={nextCycle < 0 || nextCycle >= steps.length}
+                    onClick={() => jumpToCycle(nextCycle)}
                   >
                     <ChevronRight size={17} />
                   </button>
                   <button
-                    aria-label="Last frame"
-                    disabled={frames.length < 2}
-                    onClick={() => {
-                      setPlaying(false);
-                      setIndex(frames.length - 1);
-                    }}
+                    aria-label="Last cycle"
+                    disabled={steps.length < 2}
+                    onClick={() => jumpToCycle(steps.length - 1)}
                   >
                     <SkipForward size={15} />
                   </button>
@@ -1498,56 +1835,40 @@ export default function Explorer() {
                 >
                   <Repeat size={14} />
                 </button>
-                <span className="frame-counter">
-                  {frames.length ? String(index + 1).padStart(2, "0") : "—"}{" "}
+                <span className="frame-counter" aria-label="Current cycle">
+                  {cycleIndex >= 0 ? String(cycleIndex + 1).padStart(2, "0") : "—"}{" "}
                   <span>
                     /{" "}
-                    {frames.length
-                      ? String(frames.length).padStart(2, "0")
+                    {steps.length
+                      ? String(steps.length).padStart(2, "0")
                       : "—"}
                   </span>
                 </span>
               </div>
               <div className="timeline">
                 <input
-                  aria-label="Observation timeline"
+                  aria-label="Cycle timeline"
                   type="range"
                   min={0}
-                  max={Math.max(1, frames.length - 1)}
-                  value={index}
-                  disabled={frames.length < 2}
-                  onChange={(e) => {
-                    setPlaying(false);
-                    setIndex(Number(e.target.value));
-                  }}
+                  max={Math.max(1, steps.length - 1)}
+                  value={Math.max(0, cycleIndex)}
+                  disabled={steps.length < 2}
+                  onChange={(e) => jumpToCycle(Number(e.target.value))}
                 />
                 <div>
                   <span>
-                    {frames.length ? stamp(frames[0].observed_at) : ""}
+                    {steps.length ? stamp(steps[0].visit.start_utc) : ""}
                   </span>
                   <span>
-                    {frames.length
-                      ? stamp(frames[frames.length - 1].observed_at)
+                    {steps.length
+                      ? stamp(steps[steps.length - 1].visit.end_utc)
                       : ""}
                   </span>
                 </div>
               </div>
-              {frames.length === 1 && (
+              {allFrames.length > 0 && steps.length < 2 && (
                 <div className="playback-guidance">
-                  {matched ? (
-                    <>
-                      <span>One matched frame loaded.</span>
-                      {allFrames.length > 1 && (
-                        <button onClick={() => setMode("browse")}>
-                          Browse all {allFrames.length} images
-                        </button>
-                      )}
-                    </>
-                  ) : (
-                    <span>
-                      One image loaded. Load more observations to play.
-                    </span>
-                  )}
+                  {steps.length ? "One cycle available." : "No playable cycles."} Inspect individual exposures in Observations.
                 </div>
               )}
             </section>
@@ -1563,6 +1884,47 @@ export default function Explorer() {
                     <X size={14} />
                   </button>
                 </div>
+                <Spectrum
+                  planes={detailPlanes}
+                  pixel={pixel}
+                  region={
+                    selection &&
+                    (selection[0] !== selection[2] ||
+                      selection[1] !== selection[3])
+                      ? selection
+                      : null
+                  }
+                  width={science.width}
+                  height={science.height}
+                  pending={pendingSpectrumInputs.length > 0}
+                />
+                {visit && (
+                  <div className="detail-group">
+                    <h3>{visit.kind === "supplemental" ? "Additional exposures" : "Observation cycle"}</h3>
+                    <p>
+                      {stamp(visit.start_utc)} – {stamp(visit.end_utc)}
+                    </p>
+                    <p>
+                      {visit.kind === "supplemental" ? "Outside the identified cycles" : visit.status} · {detailPlanes.length} of{" "}
+                      {visit.observation_ids.length} exposures loaded
+                    </p>
+                    {visit.issues.map((issue) => (
+                      <p key={issue}>{issue}</p>
+                    ))}
+                    {pendingSpectrumInputs.some(o => o.status === "pending" && o.selection !== "unavailable") && (
+                      <button
+                        className="button"
+                        disabled={busy && !autoBusy}
+                        onClick={() => {
+                          setSpectrumVisit(visit.id);
+                          setAutoPaused(false);
+                        }}
+                      >
+                        Load selected bands for this spectrum
+                      </button>
+                    )}
+                  </div>
+                )}
                 {!frame ? (
                   <p className="inspector-empty">Select an observation.</p>
                 ) : (
@@ -1578,56 +1940,97 @@ export default function Explorer() {
                         {product.reference.map((f) => (
                           <p key={f.id}>Reference · {stamp(f.observed_at)}</p>
                         ))}
-                        {(display.mode === "rgb" ||
-                          product.sourcePlanes?.some((p) => p.quality)) && (
-                          <Spectrum
-                            product={product}
-                            pixel={pixel}
-                            width={science.width}
-                            height={science.height}
-                            inspectFlagged={display.inspectFlagged}
-                          />
-                        )}
                       </div>
                     )}
                     <div className="detail-group">
                       <h3>Acquisition</h3>
                       <dl>
+                        {displayedQuery && (
+                          <>
+                            <dt>Field center (ICRS)</dt>
+                            <dd>
+                              {displayedQuery.ra_deg.toFixed(6)}°,{" "}
+                              {displayedQuery.dec_deg.toFixed(6)}°
+                            </dd>
+                            <dt>Field width</dt>
+                            <dd>{displayedQuery.fov_arcsec ?? 300}″</dd>
+                          </>
+                        )}
+                        {science.width > 0 && (
+                          <>
+                            <dt>Image dimensions</dt>
+                            <dd>
+                              {science.width} × {science.height} pixels
+                            </dd>
+                          </>
+                        )}
+                        {product && isVisitMap && (
+                          <>
+                            <dt>Map layers</dt>
+                            <dd>
+                              {product.layers.length} of {display.maps.length}{" "}
+                              available
+                            </dd>
+                          </>
+                        )}
                         <dt>Observed at</dt>
-                        <dd>{stamp(frame?.observed_at)}</dd>
+                        <dd>
+                          {isVisitMap && visit
+                            ? `${stamp(visit.start_utc)} – ${stamp(visit.end_utc)}`
+                            : stamp(frame?.observed_at)}
+                        </dd>
                         <dt>Detector</dt>
-                        <dd>{frame?.detector || "—"}</dd>
+                        <dd>
+                          {isVisitMap && product
+                            ? [
+                                ...new Set(
+                                  product.inputs.map((f) => f.detector),
+                                ),
+                              ].join(", ")
+                            : frame?.detector || "—"}
+                        </dd>
                         <dt>Release</dt>
-                        <dd>{frame?.release || "—"}</dd>
-                      </dl>
-                    </div>
-                    <div className="detail-group">
-                      <h3>Spectral information</h3>
-                      <dl>
-                        <dt>Wavelength</dt>
                         <dd>
-                          {frame?.wavelength_um != null
-                            ? `${frame.wavelength_um.toFixed(3)} μm`
-                            : "—"}
-                        </dd>
-                        <dt>Bandwidth</dt>
-                        <dd>
-                          {frame?.bandwidth_um != null
-                            ? `${frame.bandwidth_um.toFixed(3)} μm`
-                            : "—"}
-                        </dd>
-                        <dt>Display stretch</dt>
-                        <dd>
-                          {science.numeric
-                            ? display.stretch
-                            : manifest?.stretch || "—"}
+                          {isVisitMap && product
+                            ? [
+                                ...new Set(
+                                  product.inputs.map((f) => f.release),
+                                ),
+                              ].join(", ")
+                            : frame?.release || "—"}
                         </dd>
                       </dl>
                     </div>
+                    {!isVisitMap && (
+                      <div className="detail-group">
+                        <h3>Spectral information</h3>
+                        <dl>
+                          <dt>Wavelength</dt>
+                          <dd>
+                            {frame?.wavelength_um != null
+                              ? `${frame.wavelength_um.toFixed(3)} μm`
+                              : "—"}
+                          </dd>
+                          <dt>Bandwidth</dt>
+                          <dd>
+                            {frame?.bandwidth_um != null
+                              ? `${frame.bandwidth_um.toFixed(3)} μm`
+                              : "—"}
+                          </dd>
+                          <dt>Display stretch</dt>
+                          <dd>
+                            {frame.mapScales?.[0]?.stretch ??
+                              frame.previewScale?.stretch ??
+                              manifest?.stretch ??
+                              "—"}
+                          </dd>
+                        </dl>
+                      </div>
+                    )}
                     <div className="detail-group">
                       <h3>Provenance</h3>
                       <dl>
-                        <dt>Observation ID</dt>
+                        <dt>{isVisitMap ? "Visit ID" : "Observation ID"}</dt>
                         <dd className="mono break">
                           {frame?.observation_id || "—"}
                         </dd>
@@ -1644,7 +2047,8 @@ export default function Explorer() {
                             : "—"}
                         </dd>
                       </dl>
-                      {frame?.source_url &&
+                      {!isVisitMap &&
+                        frame?.source_url &&
                         /^https?:\/\//.test(frame.source_url) && (
                           <a
                             className="source-link"
@@ -1690,7 +2094,9 @@ export default function Explorer() {
                 <Layers size={14} />
                 <strong>Observations</strong>
                 <span className="count-badge">
-                  {observations?.length ?? allFrames.length}
+                  {catalogVisits?.length
+                    ? `${cycleCount} cycle${cycleCount === 1 ? "" : "s"} · ${observations?.length ?? allFrames.length} exposures`
+                    : observations?.length ?? allFrames.length}
                 </span>
                 <ChevronDown size={14} />
               </button>
@@ -1779,7 +2185,7 @@ export default function Explorer() {
                         onClick={() => {
                           loadBatch({
                             detector: detectorFilter || undefined,
-                            ids: filteredObservations
+                            ids: selectable
                               .filter((o) => o.status === "pending")
                               .slice(0, batchSize)
                               .map((o) => o.id),
@@ -1797,7 +2203,7 @@ export default function Explorer() {
                           loadBatch({
                             detector: detectorFilter || undefined,
                             all: true,
-                            recordIds: filteredObservations
+                            recordIds: selectable
                               .filter((o) => o.status === "pending")
                               .map((o) => o.id),
                           });
@@ -1846,7 +2252,15 @@ export default function Explorer() {
                   </>
                 )}
                 <div className="table-scroll">
-                  <table>
+                  {catalogVisits?.length ? (
+                    <CycleCatalog key={fieldJobId} visits={catalogVisits} records={catalogRecords}
+                      filtered={observations ? filteredObservations : catalogRecords} selectedId={frame?.observation_id}
+                      selectedVisitId={frame ? visit?.id : undefined} visibleMaps={visibleMaps}
+                      openCycle={openCycle} busy={busy} canRequest={canRequest} inspect={inspectRecord} stamp={stamp} />
+                  ) : observations ? (
+                    <ExposureTable records={filteredObservations} selectedId={frame?.observation_id}
+                      busy={busy} canRequest={canRequest} inspect={inspectRecord} stamp={stamp} />
+                  ) : <table>
                     <thead>
                       <tr>
                         <th>Frame</th>
@@ -1857,71 +2271,7 @@ export default function Explorer() {
                       </tr>
                     </thead>
                     <tbody>
-                      {observations
-                        ? filteredObservations.map((o) => {
-                            const f = frameByObservation.get(o.id);
-                            return (
-                              <tr
-                                key={o.id}
-                                className={
-                                  frame?.observation_id === o.id ? "active" : ""
-                                }
-                              >
-                                <td>
-                                  <button
-                                    disabled={busy && !f}
-                                    title={
-                                      o.reason ||
-                                      (f
-                                        ? "Inspect observation"
-                                        : "Load this observation")
-                                    }
-                                    onClick={() => {
-                                      setDockExpanded(false);
-                                      if (f) {
-                                        setSequenceId(f.sequence_id || "");
-                                        setViewMode("browse");
-                                        update({
-                                          mode: "single",
-                                          difference: false,
-                                          operands: {},
-                                        });
-                                        setSelectedFrame(f.observation_id);
-                                        setPlaying(false);
-                                      } else if (fieldJobId)
-                                        loadBatch({
-                                          ids: [o.id],
-                                        });
-                                    }}
-                                  >
-                                    {f
-                                      ? "View"
-                                      : o.status === "failed"
-                                        ? "Retry"
-                                        : o.status === "loading"
-                                          ? "Loading"
-                                          : "Load"}
-                                  </button>
-                                </td>
-                                <td>
-                                  {stamp(o.observed_at).replace(" UTC", "")}
-                                </td>
-                                <td>{o.detector}</td>
-                                <td>{o.release}</td>
-                                <td>
-                                  <span
-                                    className="observation-status"
-                                    title={o.reason || ""}
-                                  >
-                                    {o.status}
-                                    {o.reason ? `: ${o.reason}` : ""}
-                                  </span>
-                                  <span className="mono">{o.id}</span>
-                                </td>
-                              </tr>
-                            );
-                          })
-                        : frames.map((f, i) => (
+                      {frames.map((f, i) => (
                             <tr
                               key={f.id}
                               className={i === index ? "active" : ""}
@@ -1931,7 +2281,8 @@ export default function Explorer() {
                                   aria-label={`Select frame ${i + 1}`}
                                   onClick={() => {
                                     setPlaying(false);
-                                    setIndex(i);
+                                    restoreFrame.current = "";
+                                    setSelectedFrame(f.observation_id);
                                   }}
                                 >
                                   {String(i + 1).padStart(2, "0")}
@@ -1947,7 +2298,7 @@ export default function Explorer() {
                             </tr>
                           ))}
                     </tbody>
-                  </table>
+                  </table>}
                   {!!observations?.length && !filteredObservations.length && (
                     <div className="table-empty">
                       <span>No matching observations</span>

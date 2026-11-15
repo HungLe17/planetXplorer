@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { newMap } from "../src/lib/imaging";
 const png =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
 test.beforeEach(async ({ page }) => {
@@ -6,21 +7,71 @@ test.beforeEach(async ({ page }) => {
     r.fulfill({ json: { presets: [] } }),
   );
 });
-test("renders and inspects Barnard-like flagged bands and exports their display values", async ({ page }) => {
+test("renders and inspects Barnard-like flagged bands and exports their display values", async ({
+  page,
+}) => {
   const bands = [
-    { id: "red", wave: 2.31, archived: NaN, flags: 69206022, status: 131 },
-    { id: "green", wave: 4.72, archived: 50, flags: 69206018, status: 2 },
-    { id: "blue", wave: 2.27, archived: NaN, flags: 69206022, status: 131 },
+    {
+      id: "red",
+      detector: "D3",
+      wave: 2.31,
+      archived: NaN,
+      flags: 69206022,
+      status: 131,
+    },
+    {
+      id: "green",
+      detector: "D6",
+      wave: 4.72,
+      archived: 50,
+      flags: 69206018,
+      status: 2,
+    },
+    {
+      id: "blue",
+      detector: "D2",
+      wave: 1.27,
+      archived: -5,
+      flags: 69206022,
+      status: 4,
+    },
   ];
   const frames = bands.map((b, i) => ({
-    id: b.id, observation_id: b.id, observed_at: `2026-01-0${i + 1}T00:00:00Z`,
-    detector: "D3", channel: "D3 " + b.wave + " µm", wavelength_um: b.wave,
-    url: "/api/assets/flags/" + b.id + ".png", pixels: b.id + ".bin", quality: b.id + "-quality.bin",
+    id: b.id,
+    observation_id: b.id,
+    observed_at: `2026-01-0${i + 1}T00:00:00Z`,
+    detector: b.detector,
+    channel: b.detector + " " + b.wave + " µm",
+    wavelength_um: b.wave,
+    visit_id: "jan",
+    url: "/api/assets/flags/" + b.id + ".png",
+    pixels: b.id + ".bin",
+    quality: b.id + "-quality.bin",
   }));
-  await page.route("**/api/jobs", (r) => r.fulfill({ json: { job_id: "flags" } }));
-  await page.route("**/api/jobs/flags", (r) => r.fulfill({ json: {
-    status: "complete", manifest: { frames, processing: { output_shape: [3, 3] } },
-  } }));
+  await page.route("**/api/jobs", (r) =>
+    r.fulfill({ json: { job_id: "flags" } }),
+  );
+  await page.route("**/api/jobs/flags", (r) =>
+    r.fulfill({
+      json: {
+        status: "complete",
+        manifest: {
+          frames,
+          processing: { output_shape: [3, 3] },
+          visits: [
+            {
+              id: "jan",
+              start_utc: frames[0].observed_at,
+              end_utc: frames[2].observed_at,
+              observation_ids: frames.map((f) => f.observation_id),
+              status: "complete",
+              issues: [],
+            },
+          ],
+        },
+      },
+    }),
+  );
   await page.route("**/api/assets/flags/*.bin", (r) => {
     const name = new URL(r.request().url()).pathname.split("/").pop()!;
     const b = bands.find((v) => name.startsWith(v.id))!;
@@ -36,24 +87,57 @@ test("renders and inspects Barnard-like flagged bands and exports their display 
     }
     return r.fulfill({ contentType: "application/octet-stream", body });
   });
-  await page.goto("/explore?ra=269.4462685&dec=4.7682045");
-  await expect(page.getByLabel("Selected pixel")).toContainText("Overflow · shown at maximum");
-  await page.getByLabel("Display mode").selectOption("rgb");
-  for (const [i, color] of ["Red", "Green", "Blue"].entries())
-    await page.getByLabel(color + " wavelength and exposure").selectOption(bands[i].id);
-  await page.getByLabel("Intensity stretch").selectOption("linear");
-  const inspector = page.getByLabel("Selected pixel");
-  await expect(inspector.getByText("Overflow · shown at maximum")).toHaveCount(2);
-  await expect(inspector).toContainText("50.000 MJy/sr");
+  const maps = bands.map((b, i) => ({
+    ...newMap(b.id, b.id),
+    stretch: "linear",
+    low: "0",
+    high: "100",
+    operands: { [b.detector]: 1 },
+    stops: [
+      { at: 0, color: "#00000000" },
+      { at: 1, color: ["#ff0000", "#00ff00", "#0000ff"][i] },
+    ],
+  }));
+  await page.goto(
+    "/explore?ra=269.4462685&dec=4.7682045&view=" +
+      encodeURIComponent(JSON.stringify({ maps })),
+  );
+  const inspector = page.getByLabel("Visit spectra");
+  await expect(inspector).toContainText("1 overflow marker");
+  await expect(inspector).toContainText("50 MJy/sr");
+  await expect(inspector).toContainText("-5 MJy/sr");
+  await expect(inspector).toContainText("negative · blank on image");
   await expect(inspector).toContainText("OVERFLOW, SUR_ERROR, SOURCE, BLOOM");
-  await expect(inspector.locator("circle")).toHaveCount(0);
+  await expect(
+    inspector
+      .getByLabel("Selected pixel spectrum", { exact: true })
+      .locator("circle"),
+  ).toHaveCount(2);
+  await expect(
+    inspector
+      .getByLabel("Whole field spectrum", { exact: true })
+      .locator("circle"),
+  ).toHaveCount(3);
   await expect(page.getByLabel("Mark flagged pixels (1)")).toBeChecked();
 
   const canvas = page.locator("canvas");
-  const expected = [255, 128, 255, 255];
-  await expect.poll(() => canvas.evaluate((c: HTMLCanvasElement) => {
-    return [...c.getContext("2d")!.getImageData(Math.floor(c.width / 2), Math.floor(c.height / 2), 1, 1).data];
-  })).toEqual(expected);
+  const expected = [255, 128, 0, 255];
+  await expect
+    .poll(() =>
+      canvas.evaluate((c: HTMLCanvasElement) => {
+        return [
+          ...c
+            .getContext("2d")!
+            .getImageData(
+              Math.floor(c.width / 2),
+              Math.floor(c.height / 2),
+              1,
+              1,
+            ).data,
+        ];
+      }),
+    )
+    .toEqual(expected);
   const [download] = await Promise.all([
     page.waitForEvent("download"),
     page.getByRole("button", { name: "PNG", exact: true }).click(),
@@ -70,7 +154,14 @@ test("renders and inspects Barnard-like flagged bands and exports their display 
     out.height = image.height;
     const ctx = out.getContext("2d")!;
     ctx.drawImage(image, 0, 0);
-    return [...ctx.getImageData(Math.floor(out.width / 2), Math.floor(out.height / 2), 1, 1).data];
+    return [
+      ...ctx.getImageData(
+        Math.floor(out.width / 2),
+        Math.floor(out.height / 2),
+        1,
+        1,
+      ).data,
+    ];
   }, Buffer.concat(chunks).toString("base64"));
   expect(pixel).toEqual(expected);
 });
@@ -146,6 +237,8 @@ test("draws a live cutout before a slow asset and preserves selection on earlier
       body: Buffer.from(new Float32Array([1, 2, 3, 4]).buffer),
     });
   });
+  await page.route("**/api/assets/progressive/*.png", r =>
+    r.fulfill({ contentType: "image/png", body: Buffer.from(png, "base64") }));
   try {
     await page.goto("/explore?ra=20&dec=2");
     const details = page.getByLabel("Frame details", { exact: true });
@@ -155,7 +248,7 @@ test("draws a live cutout before a slow asset and preserves selection on earlier
     ).toBeEnabled();
     await expect(page.locator("canvas")).toHaveAttribute(
       "aria-label",
-      /Observation 1 of 1/,
+      /Observation 1 of 2/,
     );
     expect(
       await page.evaluate(
@@ -167,14 +260,14 @@ test("draws a live cutout before a slow asset and preserves selection on earlier
     includeEarly = true;
     await expect(page.locator("canvas")).toHaveAttribute(
       "aria-label",
-      /Observation 2 of 2/,
+      /Observation 2 of 3/,
     );
     await expect(details).toContainText("late");
     await expect(
       page.getByRole("button", { name: "Play", exact: true }),
-    ).toBeEnabled();
+    ).toBeDisabled();
     await page
-      .getByRole("button", { name: "Previous frame", exact: true })
+      .getByRole("button", { name: "Select frame 1", exact: true })
       .click();
     await expect(details).toContainText("early");
     releaseSlow();
@@ -193,6 +286,57 @@ test("draws a live cutout before a slow asset and preserves selection on earlier
   }
 });
 
+test("exposure PNG and calibrated brightness paint before lazy wavelength data", async ({ page }) => {
+  const frame = { id: "d6", observation_id: "d6", detector: "D6", observed_at: "2026-01-01T00:00:00Z",
+    wavelength_um: 4.5, url: "/api/assets/lazy/d6.png", quality: "quality.bin", spectral: "wave.bin" };
+  const visits = [{id:"cycle",start_utc:frame.observed_at,end_utc:frame.observed_at,
+    observation_ids:["d6"],status:"pending",issues:[]}];
+  let brightness!: () => void, wavelengths!: () => void;
+  const brightnessGate = new Promise<void>(r => { brightness = r; });
+  const spectralGate = new Promise<void>(r => { wavelengths = r; });
+  let waveRequests = 0;
+  const warnings: string[] = [];
+  page.on("console", message => {
+    if (/changed size|order of Hooks/.test(message.text())) warnings.push(message.text());
+  });
+  await page.route("**/api/jobs", r => r.fulfill({json:{job_id:"lazy"}}));
+  await page.route("**/api/jobs/lazy", r => r.fulfill({json:{status:"complete",manifest:{
+    frames:[frame], visits, processing:{output_shape:[1,1]},
+  }}}));
+  await page.route("**/api/assets/lazy/d6.png", r => r.fulfill({contentType:"image/png",body:Buffer.from(png,"base64")}));
+  await page.route("**/api/assets/lazy/quality.bin", async r => {
+    await brightnessGate;
+    const payload = Buffer.alloc(9);
+    payload.writeFloatLE(42,0);
+    payload.writeUInt8(1,8);
+    await r.fulfill({body:payload});
+  });
+  await page.route("**/api/assets/lazy/wave.bin", async r => {
+    waveRequests++;
+    await spectralGate;
+    await r.fulfill({body:Buffer.from(new Float32Array([4.52,0.03]).buffer)});
+  });
+  try {
+    const bands = encodeURIComponent(JSON.stringify({detectors:["D6"],channels:{}}));
+    await page.goto("/explore?ra=2&dec=3&bands="+bands);
+    await expect(page.locator(".image-readout")).toContainText("Exposure PNG preview");
+    await page.getByRole("button",{name:"Close frame details"}).click();
+    brightness();
+    await expect(page.locator(".image-readout")).toContainText("Calibrated exposure");
+    expect(waveRequests).toBe(0);
+    await page.getByRole("button",{name:"Toggle frame details"}).click();
+    await expect(page.getByLabel("Visit spectra")).toContainText("42 MJy/sr");
+    await expect(page.getByText("Loading per-pixel wavelengths…")).toBeVisible();
+    await expect(page.getByLabel("Whole field spectrum",{exact:true}).locator("circle")).toHaveCount(0);
+    wavelengths();
+    await expect(page.getByLabel("Whole field spectrum",{exact:true}).locator("circle")).toHaveCount(1);
+    expect(waveRequests).toBe(1);
+    expect(warnings).toEqual([]);
+  } finally {
+    brightness();
+    wavelengths();
+  }
+});
 test("shows cached pixels during refresh and replaces a revised exposure in place", async ({
   page,
 }) => {
@@ -252,7 +396,7 @@ test("shows cached pixels during refresh and replaces a revised exposure in plac
   expect(loaded).toEqual(["r1.bin", "r2.bin"]);
 });
 
-test("loads frames in timestamp order, steps, and restores a shared field", async ({
+test("loads legacy exposures for direct inspection without inventing cycles and restores a shared field", async ({
   page,
 }) => {
   await page.route("**/api/jobs", (r) =>
@@ -290,11 +434,12 @@ test("loads frames in timestamp order, steps, and restores a shared field", asyn
   await page.goto("/explore?ra=133.795129&dec=-7.245147");
   await expect(
     page.getByRole("button", { name: "Play", exact: true }),
-  ).toBeEnabled();
+  ).toBeDisabled();
   await expect(page.getByLabel("Frame details", { exact: true })).toContainText(
     "first-observation",
   );
-  await page.getByRole("button", { name: "Next frame", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Next cycle" })).toBeDisabled();
+  await page.getByRole("button", { name: "Select frame 2", exact: true }).click();
   await expect(page.getByLabel("Frame details", { exact: true })).toContainText(
     "second-observation",
   );
@@ -307,6 +452,10 @@ test("loads frames in timestamp order, steps, and restores a shared field", asyn
   await expect(page.getByLabel("Frame details", { exact: true })).toContainText(
     "first-observation",
   );
+  await page
+    .locator("summary")
+    .filter({ hasText: "Playback and appearance" })
+    .click();
   await page.getByLabel("Blink interval").focus();
   await page.keyboard.press("Home");
   await page.keyboard.press("ArrowRight");
@@ -331,7 +480,7 @@ test("loads frames in timestamp order, steps, and restores a shared field", asyn
   await page.reload();
   await expect(
     page.getByRole("button", { name: "Play", exact: true }),
-  ).toBeEnabled();
+  ).toBeDisabled();
   await expect(page.getByLabel("Frame details", { exact: true })).toContainText(
     "first-observation",
   );
@@ -556,7 +705,14 @@ test("opens an available archive field on startup and honors shared coordinates"
   ).toBeEnabled();
   expect(submitted).toEqual([
     { ra_deg: 269.4462685, dec_deg: 4.7682045 },
-    { ra_deg: 12, dec_deg: -4, fov_arcsec: 300, live: true },
+    {
+      ra_deg: 12,
+      dec_deg: -4,
+      fov_arcsec: 300,
+      live: true,
+      detectors: ["D1"],
+      channels: {},
+    },
   ]);
 });
 
@@ -722,8 +878,8 @@ test("streams the catalog, separates wavelengths, and loads another detector", a
     r.fulfill({ contentType: "image/png", body: Buffer.from(png, "base64") }),
   );
   let requested: unknown;
-  await page.route("**/api/jobs/catalog/load", (r) => {
-    requested = r.request().postDataJSON();
+  await page.route("**/api/jobs/catalog/priority/*", (r) => {
+    requested = r.request().url().split("/").pop();
     records[6].status = "ready";
     frames.push(frame("d6", "D6", "s6"));
     sequences.push({
@@ -736,7 +892,7 @@ test("streams the catalog, separates wavelengths, and loads another detector", a
     });
     return r.fulfill({ status: 202, json: { job_id: "catalog" } });
   });
-  await page.goto("/explore?ra=330&dec=-50");
+  await page.goto("/explore?ra=330&dec=-50&bands=" + encodeURIComponent(JSON.stringify({detectors:["D1","D2","D6"]})));
   await expect(
     page.getByRole("button", { name: "Zoom in", exact: true }),
   ).toBeEnabled();
@@ -747,9 +903,10 @@ test("streams the catalog, separates wavelengths, and loads another detector", a
     "d6",
   );
   complete = true;
+  await expect(page.getByRole("button", { name: "Search observations", exact: true })).toBeEnabled();
   await expect(
     page.getByRole("button", { name: "Play", exact: true }),
-  ).toBeEnabled();
+  ).toBeDisabled();
   await page.getByRole("button", { name: "Matched", exact: true }).click();
   await page.getByLabel("Wavelength sequence").selectOption("s2");
   await expect(
@@ -762,7 +919,7 @@ test("streams the catalog, separates wavelengths, and loads another detector", a
   await page.getByRole("button", { name: "Load", exact: true }).click();
   await page.getByRole("button", { name: "Matched", exact: true }).click();
   await page.getByLabel("Wavelength sequence").selectOption("s6");
-  expect(requested).toEqual({ observation_ids: ["d6"] });
+  expect(requested).toBe("d6");
   await expect(page.getByLabel("Frame details", { exact: true })).toContainText(
     "D6",
   );
@@ -772,7 +929,7 @@ test("streams the catalog, separates wavelengths, and loads another detector", a
   await page.getByLabel("Wavelength sequence").selectOption("s1");
   await expect(
     page.getByRole("button", { name: "Play", exact: true }),
-  ).toBeEnabled();
+  ).toBeDisabled();
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.screenshot({
     path: "test-results/catalog-desktop.png",
@@ -807,13 +964,22 @@ test("field size is submitted independently of image magnification", async ({
   await page.goto("/");
   await page.getByRole("textbox", { name: "Right ascension" }).fill("330");
   await page.getByRole("textbox", { name: "Declination" }).fill("-50");
-  await page.getByRole("spinbutton", { name: "Field of view (arcsec)" }).fill("600");
+  await page
+    .getByRole("spinbutton", { name: "Field of view (arcsec)" })
+    .fill("600");
   await page
     .getByRole("button", { name: "Search observations", exact: true })
     .click();
   await expect
     .poll(() => query)
-    .toEqual({ ra_deg: 330, dec_deg: -50, fov_arcsec: 600, live: true });
+    .toEqual({
+      ra_deg: 330,
+      dec_deg: -50,
+      fov_arcsec: 600,
+      live: true,
+      detectors: ["D1"],
+      channels: {},
+    });
   await expect(page).toHaveURL(/fov=600/);
 });
 
@@ -844,7 +1010,7 @@ test("load all continues through batches until the selected detector is exhauste
     records[calls++].status = "ready";
     return r.fulfill({ status: 202, json: { job_id: "loadall" } });
   });
-  await page.goto("/explore?ra=330&dec=-50");
+  await page.goto("/explore?ra=330&dec=-50&bands=" + encodeURIComponent(JSON.stringify({detectors:["D6"]})));
   await page.getByLabel("Detector", { exact: true }).selectOption("D6");
   await page.getByRole("button", { name: "Load all D6", exact: true }).click();
   await expect.poll(() => calls).toBe(3);

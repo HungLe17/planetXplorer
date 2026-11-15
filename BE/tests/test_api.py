@@ -357,7 +357,7 @@ def test_running_frame_and_timings_survive_late_download(tmp_path, cancel):
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 current = client.get(endpoint).json()
-                if current.get("manifest"):
+                if current.get("manifest", {}).get("frames"):
                     break
                 time.sleep(.02)
             assert current["status"] == "running"
@@ -463,3 +463,124 @@ def test_catalog_preview_assets_and_incremental_load_endpoint(tmp_path):
             )
         finally:
             release.set()
+
+
+def test_clicked_catalog_exposure_gets_next_slot_once(tmp_path):
+    import shutil
+    from pathlib import Path
+    from app.archive import Archive, Observation
+    from app.pipeline import Pipeline, decode
+
+    seen = []
+    active = set()
+    started = threading.Condition()
+    release = {f"field-{i}": threading.Event() for i in range(7)}
+    rows = [Observation(key, "https://irsa.ipac.caltech.edu/" + key, 60800 + i, "D6", "DR1")
+            for i, key in enumerate(release)]
+    rows.append(Observation("outside", "https://irsa.ipac.caltech.edu/outside", 60800, "D3", "DR1"))
+    field = Query(ra_deg=133.795129, dec_deg=-7.245147, fov_arcsec=30, live=True)
+    fixture = Path(__file__).parent / "fixtures" / "wise-d6.fits"
+    sample = decode(fixture, rows[0], field, rows[0].uri)
+    info = {"wavelength_um": float(sample.wavelengths[0]), "bandwidth_um": float(sample.bandwidths[0]),
+            "processing_version": sample.version}
+    label = f"D6 {sample.wavelengths[0]:.6f} µm ({sample.version})"
+    probed = []
+    probe_started = threading.Event()
+
+    class DelayedArchive(Archive):
+        def __init__(self):
+            pass
+
+        def search(self, *args, **kwargs):
+            return rows, []
+
+        def cached_spectral(self, uri, query):
+            return None if uri.endswith("field-1") else info
+
+        def probe_spectral(self, obs, query, deadline):
+            probed.append(obs.identity)
+            probe_started.set()
+            return info
+
+        def fetch(self, obs, query, path, deadline, **kwargs):
+            with started:
+                seen.append(obs.identity)
+                active.add(obs.identity)
+                started.notify_all()
+                assert len(active) <= 2
+            try:
+                assert release[obs.identity].wait(15)
+                shutil.copyfile(fixture, path)
+                return obs.uri
+            finally:
+                with started:
+                    active.remove(obs.identity)
+
+    cfg = settings(tmp_path, max_candidates=4)
+    with TestClient(create_app(cfg, Pipeline(cfg, DelayedArchive()))) as client:
+        query = {**field.model_dump(mode="json"), "detectors": ["D6"], "channels": {"D6": [label]}}
+        job = client.post("/api/jobs", json=query).json()["job_id"]
+        endpoint = f"/api/jobs/{job}"
+        try:
+            with started:
+                assert started.wait_for(lambda: len(seen) == 2, 5)
+            catalog = client.get(endpoint).json()["manifest"]
+            assert len(catalog["observations"]) == 8 and not catalog["frames"]
+            clicked = "field-1"  # Both active slots are busy and its wavelength is still unknown.
+            assert clicked not in seen
+            assert client.post(f"{endpoint}/priority/outside").status_code == 422
+            for _ in range(2):
+                assert client.post(f"{endpoint}/priority/{clicked}").status_code == 202
+            assert probe_started.wait(2) and probed == [clicked]
+            release[seen[0]].set()
+            with started:
+                assert started.wait_for(lambda: len(seen) == 3, 5)
+                assert seen[2] == clicked and seen[1] in active
+        finally:
+            for event in release.values():
+                event.set()
+        assert len(finished(client, job)["manifest"]["frames"]) == 5
+        assert client.post(f"{endpoint}/priority/{clicked}").status_code == 202
+        assert seen.count(clicked) == 1 and "outside" not in seen
+
+
+def test_click_during_final_render_is_preserved(tmp_path, monkeypatch):
+    import shutil
+    from pathlib import Path
+    from app.archive import Observation
+    from app.pipeline import Pipeline, _FrameJob
+
+    rendering, release = threading.Event(), threading.Event()
+    original = _FrameJob.finalize
+
+    def delayed_finalize(self):
+        rendering.set()
+        assert release.wait(10)
+        return original(self)
+
+    monkeypatch.setattr(_FrameJob, "finalize", delayed_finalize)
+    seen = []
+
+    class Archive:
+        def search(self, *_):
+            return [Observation(str(i), f"https://irsa.ipac.caltech.edu/{i}", 60800 + i, "D6", "DR1")
+                    for i in range(3)], []
+
+        def fetch(self, obs, query, path, deadline):
+            seen.append(obs.identity)
+            shutil.copyfile(Path(__file__).parent / "fixtures" / "wise-d6.fits", path)
+            return obs.uri
+
+    cfg = settings(tmp_path, max_candidates=2)
+    with TestClient(create_app(cfg, Pipeline(cfg, Archive()))) as client:
+        job = client.post("/api/jobs", json={"ra_deg": 133.795129, "dec_deg": -7.245147,
+                                            "live": True, "fov_arcsec": 30}).json()["job_id"]
+        try:
+            assert rendering.wait(6)
+            assert set(seen) == {"0", "2"}
+            for _ in range(2):
+                assert client.post(f"/api/jobs/{job}/priority/1").status_code == 202
+        finally:
+            release.set()
+        assert len(finished(client, job)["manifest"]["frames"]) == 3
+        assert seen.count("1") == 1
