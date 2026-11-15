@@ -802,6 +802,8 @@ export default function SkyViewer({
             <span>
               {current.subtraction
                 ? `Cycle difference · reference ${current.subtraction.referenceDate.slice(0, 10)}`
+                : current.matchedMap ? "Matched spectrum map · " + current.detector
+                : current.matchedMap === false ? "Calibrated exposure · no complete map for this epoch"
                 : current.visit_id && current.observation_id === current.visit_id
                 ? "Visit composite"
                 : (current.previewScale ? "Exposure PNG preview" : "Calibrated exposure") + " · " + current.detector}

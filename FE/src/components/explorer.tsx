@@ -202,8 +202,6 @@ export default function Explorer() {
   const [referenceCycle, setReferenceCycle] = useState<string | null>(null);
   const [differenceMapId, setDifferenceMapId] = useState("");
   const subtracting = viewMode === "visits" && hasCycles && referenceCycle !== null;
-  const science = useImages(manifest, display, viewMode !== "visits" || !hasCycles, timelineChoices, displayedQuery,
-    subtracting ? referenceCycle : null, differenceMapId);
   const [dockOpen, setDockOpen] = useState(true);
   const [committed, setCommitted] = useState<Query | null>(null);
   const bandsEdited = !!committed?.live && (
@@ -224,6 +222,8 @@ export default function Explorer() {
   const derived = viewMode === "visits" && hasCycles;
   const matched = viewMode === "matched" && !derived;
   const matchedSteps = sequence?.epochs;
+  const science = useImages(manifest, display, !derived, timelineChoices, displayedQuery,
+    subtracting ? referenceCycle : null, differenceMapId, matched ? matchedSteps : undefined);
   const frames = useMemo(() => {
     if (!matched) return science.frames;
     const byId = new Map(science.frames.map(f => [f.observation_id, f]));
@@ -258,7 +258,7 @@ export default function Explorer() {
     ? product.layers[0].values[pixel[1] * science.width + pixel[0]] : undefined;
   const contributors = useMemo(() => {
     if (!frame) return empty;
-    if (!isVisitMap) return [frame];
+    if (!isVisitMap && !product?.matchedMap) return [frame];
     const members = [...(product?.inputs ?? []), ...(product?.reference ?? [])];
     return [...new Map(members.map(f => [f.observation_id, f])).values()];
   }, [frame, isVisitMap, product]);
@@ -1547,7 +1547,7 @@ export default function Explorer() {
                 manifest={manifest}
                 update={(patch, keepView) => {
                   setAutoPaused(false);
-                  if (!keepView) setViewMode("visits");
+                  if (!keepView && !matched) setViewMode("visits");
                   update(patch);
                 }}
               />
@@ -2173,7 +2173,7 @@ export default function Explorer() {
                             </dd>
                           </>
                         )}
-                        {product && isVisitMap && !product.subtraction && (
+                        {product && (isVisitMap || product.matchedMap) && !product.subtraction && (
                           <>
                             <dt>Map layers</dt>
                             <dd>

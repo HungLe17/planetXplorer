@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { matchedSpectra } from "../src/lib/matched-spectra";
+import { newMap } from "../src/lib/imaging";
 
 test("published detector channel groups different measured centers and separates adjacent stripes", () => {
   const frames = [4.960624,4.968150,4.975530].map((w,i) => ({
@@ -34,7 +35,9 @@ test("Matched groups the two June and December D6 exposures despite different mi
   await page.route("**/api/jobs/field", r => r.fulfill({json:{status:"complete",manifest:{frames,visits,sequences,processing:{output_shape:[2,2]}}}}));
   await page.route("**/api/assets/field/*.png", r => r.fulfill({body:Buffer.from(png,"base64"),contentType:"image/png"}));
   await page.route("**/api/assets/field/*.bin", r => r.fulfill({body:Buffer.from(new Float32Array([0,1,2,4]).buffer),contentType:"application/octet-stream"}));
-  await page.goto("/explore?ra=150&dec=5");
+  const maps = ["Red","Green"].map((name,i) => ({...newMap(name,name), operands:{D6:1}, low:"0", high:"4",
+    stops:[{at:0,color:"#000000"},{at:1,color:i ? "#00ff00" : "#ff0000"}]}));
+  await page.goto("/explore?ra=150&dec=5&view="+encodeURIComponent(JSON.stringify({maps})));
   const mode = page.getByRole("button",{name:"Matched",exact:true});
   await mode.click();
   const picker = page.getByLabel("Matched spectra",{exact:true});
@@ -46,10 +49,24 @@ test("Matched groups the two June and December D6 exposures despite different mi
   await expect(track.getByRole("button")).toHaveCount(2);
   await track.getByRole("button",{name:/16 Dec/}).click();
   await expect(page.locator(".frame-counter")).toHaveText(/02\s*\/\s*02/);
+  await page.getByRole("checkbox",{name:"Color scale",exact:true}).check();
+  const legend = page.getByRole("group",{name:"Displayed color scale"});
+  await expect(legend).toContainText("Green");
+  await expect(legend).toContainText("Red");
+  await page.getByRole("button",{name:"Colors",exact:true}).nth(1).click();
+  await page.getByRole("button",{name:"Blue for stop 2",exact:true}).click();
+  await page.getByRole("button",{name:"Close editor",exact:true}).click();
+  await expect(mode).toHaveAttribute("aria-pressed","true");
+  await expect(page.locator(".frame-counter")).toHaveText(/02\s*\/\s*02/);
+  await expect.poll(() => page.locator("canvas").first().evaluate((canvas: HTMLCanvasElement) => {
+    const pixels = canvas.getContext("2d")!.getImageData(0,0,canvas.width,canvas.height).data;
+    for (let i=0; i<pixels.length; i+=4)
+      if (pixels[i]===255 && pixels[i+1]===0 && pixels[i+2]===255) return true;
+    return false;
+  })).toBe(true);
   await page.getByRole("button",{name:"Previous cycle",exact:true}).click();
   await expect(page.locator(".frame-counter")).toHaveText(/01\s*\/\s*02/);
   const stretch = page.locator(".map-stretch select").first();
-  await page.getByRole("checkbox",{name:"Color scale",exact:true}).check();
   for (const value of ["sqrt","log"]) {
     await stretch.selectOption(value);
     await expect(page.getByRole("group",{name:"Displayed color scale"})).toContainText(value);

@@ -186,6 +186,7 @@ export type Plane = {
   bandwidths?: Float32Array;
 };
 export type Product = {
+  matchedMap?: boolean;
   frame: Frame;
   layers: { map: SpectralMap; values: Float32Array }[];
   sourcePlanes: Plane[];
@@ -202,6 +203,7 @@ export type MapScale = {
   signed?: boolean;
 };
 export type RenderedFrame = Frame & {
+  matchedMap?: boolean;
   subtraction?: Product["subtraction"];
   canvas?: HTMLCanvasElement;
   sourceDates?: string[];
@@ -216,7 +218,7 @@ export function frameAsset(frame: Frame, path: string, base: string) {
   return url.href;
 }
 type CycleStep = { visit: Visit; source: Frame };
-type CycleInput = CycleStep & { members: Frame[] };
+export type CycleInput = CycleStep & { members: Frame[] };
 
 function spacedSteps(available: CycleInput[], choices: Record<string, boolean>, minimumDays?: number) {
   if (!minimumDays || available.length < 2) return available;
@@ -569,6 +571,7 @@ export function products(
   s: Display,
   visits: Visit[] = [],
   raw = false,
+  matchedSteps?: CycleInput[],
 ): Product[] {
   const displays = new Map<Plane, Float32Array>();
   function values(p: Plane) {
@@ -587,7 +590,7 @@ export function products(
       return plane ? [plane] : [];
     }),
   }));
-  if (raw || !visits.length) {
+  if (raw || (!matchedSteps && !visits.length)) {
     const lookup = new Map(
       groups.flatMap((g) =>
         g.visit.observation_ids.map((id) => [id, g.planes] as const),
@@ -608,10 +611,21 @@ export function products(
     });
   }
   const output: Product[] = [];
-  const cycles = groups.filter(({ visit }) =>
-    visit.kind !== "supplemental" && visit.status !== "invalid");
+  const cycles = matchedSteps ? matchedSteps.flatMap(({visit, source, members}) => {
+    const anchor = byId.get(source.observation_id);
+    if (!anchor) return [];
+    const repeats = new Set(members.map(f => f.observation_id));
+    // Keep one representative of the selected spectrum per epoch. Other map
+    // operands can use loaded measurements assigned to this observing window.
+    const peers = visit.status === "invalid" ? [] : visit.observation_ids.flatMap(id => {
+      const plane = byId.get(id);
+      return plane && !repeats.has(id) ? [plane] : [];
+    });
+    return [{visit, planes:[anchor, ...peers], anchor}];
+  }) : groups.filter(({ visit }) => visit.kind !== "supplemental" && visit.status !== "invalid")
+    .map(group => ({...group, anchor:undefined}));
   const comparison = cycles.flatMap(g => g.planes);
-  for (const { visit, planes } of cycles) {
+  for (const { visit, planes, anchor } of cycles) {
     if (!planes.length) continue;
     const layers: Product["layers"] = [],
       inputs = new Set<Frame>(),
@@ -635,7 +649,8 @@ export function products(
     }
     if (layers.length)
       output.push({
-        frame: {
+        matchedMap: anchor ? true : undefined,
+        frame: anchor?.frame ?? {
           ...planes[0].frame,
           visit_id: visit.id,
           observation_id: visit.id,
@@ -646,6 +661,12 @@ export function products(
         inputs: [...inputs],
         reference: [...reference],
       });
+    else if (anchor) {
+      // An incomplete expression has no map value. Keep its exposure inspectable.
+      const appearance = {...(s.maps[0] ?? defaults.maps[0]), name:anchor.frame.detector};
+      output.push({frame:anchor.frame, matchedMap:false, layers:[{map:appearance, values:values(anchor)}],
+        sourcePlanes:planes, inputs:[anchor.frame], reference:[]});
+    }
   }
   return output;
 }

@@ -15,6 +15,7 @@ import {
   archivedAt,
   grey,
   type Display,
+  type CycleInput,
   type Plane,
   type PixelQuality,
   type RenderedFrame,
@@ -35,7 +36,7 @@ async function fetchBytes(
   return buffer;
 }
 export function useImages(manifest: Manifest | null, s: Display, raw: boolean, choices: Record<string, boolean>, query: Query | null,
-  referenceId: string | null = null, differenceMapId = "") {
+  referenceId: string | null = null, differenceMapId = "", matchedSteps?: CycleInput[]) {
   const source = manifest?.frames ?? empty;
   const [height, width] = manifest?.processing?.output_shape ?? [0, 0];
   const count = width * height;
@@ -140,12 +141,13 @@ export function useImages(manifest: Manifest | null, s: Display, raw: boolean, c
   const shown = useMemo(() => series.steps.length ? series.steps : plan.preview ? [plan.preview] : [], [series.steps, plan.preview]);
   const result = useMemo(() => {
     if (difference) return difference.products;
+    if (matchedSteps) return products(data, s, manifest?.visits, false, matchedSteps);
     if (raw || !manifest?.visits?.length) return products(data, s, manifest?.visits, true);
     const mapped = series.mapped;
     const represented = new Set(mapped.map(p => p.frame.observation_id));
     const fallback = new Set(shown.filter(step => !represented.has(step.visit.id)).map(step => step.source.observation_id));
     return [...mapped, ...products(data.filter(p => fallback.has(p.frame.observation_id)), s, [], true)];
-  }, [difference, series.mapped, shown, raw, data, s.maps, manifest?.visits]);
+  }, [difference, series.mapped, shown, raw, data, s.maps, manifest?.visits, matchedSteps]);
   const rendered = useMemo<RenderedFrame[]>(
     () =>
       result.map((p) => {
@@ -176,6 +178,7 @@ export function useImages(manifest: Manifest | null, s: Display, raw: boolean, c
         }
         return {
           ...p.frame,
+          matchedMap:p.matchedMap,
           subtraction: p.subtraction,
           canvas: renderProduct(p, width, height, scales),
           mapScales: scales,

@@ -58,6 +58,22 @@ function visit(id, planes, status = "complete") {
     issues: [],
   };
 }
+test("Matched composes signed map rows from the selected epoch and counts its representative once", () => {
+  const repeat = exposure("D1", 1, "2026-01-03", [90,90]);
+  const steps = [
+    {visit:visit("jan",[a,b,repeat]), source:a.frame, members:[a.frame,repeat.frame]},
+    {visit:visit("jun",[c]), source:c.frame, members:[c.frame]},
+  ];
+  const difference = {...newMap("contrast","D1 minus D2"), operands:{D1:1,D2:-1}};
+  const d1 = {...newMap("d1","D1"), operands:{D1:1}};
+  const [jan,jun] = products([a,b,c,repeat], {...defaults,maps:[difference,d1]}, [], false, steps);
+  assert.equal(jan.frame.observation_id,a.frame.observation_id);
+  assert.deepEqual(jan.layers.map(l => [...l.values]),[[-3,6],[2,8]]);
+  assert.equal(jun.frame.observation_id,c.frame.observation_id);
+  assert.deepEqual(jun.layers.map(l => l.map.id),["d1"]);
+  assert.deepEqual([...jun.layers[0].values],[20,10]);
+});
+
 test("fixed-cycle subtraction preserves both residual signs and uses measured pixels on a common response", () => {
   const fields = [
     ["reference", "2025-05-01", "same", [9, 1, 4, NaN, 4], [0,0,0,2,0]],
