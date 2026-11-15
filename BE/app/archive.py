@@ -186,24 +186,39 @@ class Archive:
         if info := self.cached_spectral(uri, query):
             return info
 
-        def read_range(spec, byte_limit):
+        prefix_bytes, tail_bytes = 92160, 28800
+
+        def read_range(byte_limit, *, tail=False):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ArchiveError("Spectral metadata deadline reached")
+            spec = f"bytes=-{byte_limit}" if tail else f"bytes=0-{byte_limit - 1}"
             with self.client.stream("GET", checked_url(uri),
                                     headers={"Range": spec, "Accept-Encoding": "identity"},
                                     timeout=min(self.settings.request_seconds, remaining)) as response:
-                if response.status_code != 206 or not response.headers.get("Content-Range"):
+                content_range = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
+                if response.status_code != 206 or not content_range or response.headers.get("Content-Encoding", "identity") != "identity":
                     raise ArchiveError("Spectral header byte ranges unavailable")
+                start, end, total = map(int, content_range.groups())
+                expected = total - byte_limit if tail else 0
+                # Reject whole-file replies, including small files covered by the
+                # two ranges together, before reading a single body chunk.
+                if (total <= prefix_bytes + tail_bytes or start != expected
+                        or end != expected + byte_limit - 1):
+                    raise ArchiveError("Archive did not return the requested metadata range")
+                length = response.headers.get("Content-Length")
+                if length is not None and int(length) != byte_limit:
+                    raise ArchiveError("Spectral metadata length disagrees with the requested range")
                 data = bytearray()
                 for chunk in response.iter_bytes(8192):
                     if len(data) + len(chunk) > byte_limit or time.monotonic() >= deadline:
                         raise ArchiveError("Spectral metadata read exceeded its limit")
                     data.extend(chunk)
+                if len(data) != byte_limit:
+                    raise ArchiveError("Incomplete spectral metadata range")
                 return bytes(data)
         try:
-            info = spectral_header_index(read_range("bytes=0-92159", 92160),
-                                         read_range("bytes=-28800", 28800), query)
+            info = spectral_header_index(read_range(prefix_bytes), read_range(tail_bytes, tail=True), query)
         except (ArchiveError, httpx.HTTPError, ValueError, TypeError, IndexError, KeyError, OSError):
             return None
         with self.spectral_lock:
@@ -310,86 +325,86 @@ class Archive:
                     f"IRSA image search is unavailable. {tap_error}"
                 ) from sia_error
 
+    def _sia_collection(self, name, position, lo, hi, deadline, timing=None, *, footprints=False):
+        params = {"COLLECTION": name, "POS": position, "MAXREC": self.settings.metadata_limit + 1}
+        if lo is not None or hi is not None:
+            params["TIME"] = f"{lo if lo is not None else '-Inf'} {hi if hi is not None else '+Inf'}"
+        try:
+            chunks, total = [], 0
+            started = time.monotonic()
+            with self.client.stream(
+                "GET",
+                ORIGIN + "/SIA",
+                params=params,
+                timeout=max(
+                    0.1,
+                    min(self.settings.request_seconds, deadline - time.monotonic()),
+                ),
+            ) as response:
+                response.raise_for_status()
+                for chunk in response_chunks(response, started, timing, "sia_first_byte"):
+                    if time.monotonic() >= deadline:
+                        raise ArchiveError("IRSA SIA metadata search timed out")
+                    total += len(chunk)
+                    if total > 32_000_000:
+                        raise ArchiveError(
+                            "IRSA SIA metadata exceeded the response limit"
+                        )
+                    chunks.append(chunk)
+            payload = b"".join(chunks)
+            overflow = False
+            root = ET.fromstring(payload)
+            for info in root.iter():
+                if (
+                    info.tag.rsplit("}", 1)[-1] == "INFO"
+                    and info.attrib.get("name") == "QUERY_STATUS"
+                ):
+                    if info.attrib.get("value") == "ERROR":
+                        raise ArchiveError("IRSA SIA returned a query error")
+                    overflow |= info.attrib.get("value") == "OVERFLOW"
+            table = parse_single_table(io.BytesIO(payload)).to_table(
+                use_names_over_ids=True
+            )
+            if not {"access_url", "t_min"}.issubset(table.colnames):
+                raise ArchiveError("IRSA SIA returned unexpected metadata columns")
+            result = []
+            for row in table:
+                uri = str(row["access_url"])
+                detector = re.search(r"level2_.+?(D[1-6])_spx", uri)
+                if not detector:
+                    continue
+                mjd = float(row["t_min"])
+                if lo is not None and mjd < lo:
+                    continue
+                if hi is not None and mjd > hi:
+                    continue
+                result.append(
+                    {
+                        "uri": uri,
+                        "time_bounds_lower": str(mjd),
+                        "energy_bandpassname": "SPHEREx-" + detector[1],
+                        **({"footprint": str(row["s_region"])} if footprints and "s_region" in table.colnames else {}),
+                    }
+                )
+            return result, overflow or len(table) >= self.settings.metadata_limit + 1
+        except (
+            httpx.HTTPError,
+            ValueError,
+            IndexError,
+            TypeError,
+            ET.ParseError,
+        ) as exc:
+            raise ArchiveError("IRSA SIA metadata service is unavailable") from exc
+
     def _search_sia(
         self, query: Query, deadline: float, offer=None, timing: Timing | None = None,
     ) -> tuple[list[Observation], list[str]]:
-        # Official collections and on-premises access_url contract:
-        # https://caltech-ipac.github.io/spherex-archive-documentation/spherex-data-access/
+        position = f"CIRCLE {query.ra_deg} {query.dec_deg} 0"
+        lo = float(Time(query.start_utc).mjd) if query.start_utc else None
+        hi = float(Time(query.end_utc).mjd) if query.end_utc else None
+
         def collection(name):
-            params = {
-                "COLLECTION": name,
-                "POS": f"CIRCLE {query.ra_deg} {query.dec_deg} 0",
-                "MAXREC": self.settings.metadata_limit + 1,
-            }
-            if query.start_utc or query.end_utc:
-                lo = Time(query.start_utc).mjd if query.start_utc else "-Inf"
-                hi = Time(query.end_utc).mjd if query.end_utc else "+Inf"
-                params["TIME"] = f"{lo} {hi}"
-            try:
-                chunks, total = [], 0
-                started = time.monotonic()
-                with self.client.stream(
-                    "GET",
-                    ORIGIN + "/SIA",
-                    params=params,
-                    timeout=max(
-                        0.1,
-                        min(self.settings.request_seconds, deadline - time.monotonic()),
-                    ),
-                ) as response:
-                    response.raise_for_status()
-                    for chunk in response_chunks(response, started, timing, "sia_first_byte"):
-                        if time.monotonic() >= deadline:
-                            raise ArchiveError("IRSA SIA metadata search timed out")
-                        total += len(chunk)
-                        if total > 32_000_000:
-                            raise ArchiveError(
-                                "IRSA SIA metadata exceeded the response limit"
-                            )
-                        chunks.append(chunk)
-                payload = b"".join(chunks)
-                overflow = False
-                root = ET.fromstring(payload)
-                for info in root.iter():
-                    if (
-                        info.tag.rsplit("}", 1)[-1] == "INFO"
-                        and info.attrib.get("name") == "QUERY_STATUS"
-                    ):
-                        if info.attrib.get("value") == "ERROR":
-                            raise ArchiveError("IRSA SIA returned a query error")
-                        overflow |= info.attrib.get("value") == "OVERFLOW"
-                table = parse_single_table(io.BytesIO(payload)).to_table(
-                    use_names_over_ids=True
-                )
-                if not {"access_url", "t_min"}.issubset(table.colnames):
-                    raise ArchiveError("IRSA SIA returned unexpected metadata columns")
-                result = []
-                for row in table:
-                    uri = str(row["access_url"])
-                    detector = re.search(r"level2_.+?(D[1-6])_spx", uri)
-                    if not detector:
-                        continue
-                    mjd = float(row["t_min"])
-                    if query.start_utc and mjd < Time(query.start_utc).mjd:
-                        continue
-                    if query.end_utc and mjd > Time(query.end_utc).mjd:
-                        continue
-                    result.append(
-                        {
-                            "uri": uri,
-                            "time_bounds_lower": str(mjd),
-                            "energy_bandpassname": "SPHEREx-" + detector[1],
-                        }
-                    )
-                return result, overflow or len(table) >= self.settings.metadata_limit + 1
-            except (
-                httpx.HTTPError,
-                ValueError,
-                IndexError,
-                TypeError,
-                ET.ParseError,
-            ) as exc:
-                raise ArchiveError("IRSA SIA metadata service is unavailable") from exc
+            return self._sia_collection(name, position, lo, hi, deadline, timing)
 
         names = [n for _, collections in RELEASES.values() for n in collections]
         rows, failures = [], []
@@ -425,14 +440,12 @@ class Archive:
             notes = []
         return self._select_rows(rows), notes
 
-    def _search_tap(
-        self, query: Query, deadline: float, offer=None, timing: Timing | None = None,
-    ) -> tuple[list[Observation], list[str]]:
+    def _tap_prefix(self, spatial_filter: str, query: Query):
         detector_names = ",".join(f"'SPHEREx-{d}'" for d in DETECTORS)
         root = ASSET_PREFIX.lstrip("/")
         releases = " OR ".join(f"a.uri LIKE '%{root}{release}/level2/%'" for release in RELEASES)
         filters = [
-            f"1=CONTAINS(POINT('ICRS',{query.ra_deg:.10f},{query.dec_deg:.10f}),p.poly)",
+            spatial_filter,
             f"p.energy_bandpassname IN ({detector_names})",
             f"({releases})",
         ]
@@ -440,13 +453,41 @@ class Archive:
             filters.append(f"p.time_bounds_lower >= {Time(query.start_utc).mjd:.10f}")
         if query.end_utc:
             filters.append(f"p.time_bounds_lower <= {Time(query.end_utc).mjd:.10f}")
-        deadline = min(deadline, time.monotonic() + self.settings.metadata_seconds)
-        limit = self.settings.metadata_limit
-        prefix = (
-            f"SELECT TOP {limit + 1} a.uri,p.time_bounds_lower,p.energy_bandpassname "
+        return (
+            f"SELECT TOP {self.settings.metadata_limit + 1} a.uri,p.time_bounds_lower,p.energy_bandpassname "
             "FROM spherex.artifact a JOIN spherex.plane p ON a.planeid=p.planeid WHERE "
             + " AND ".join(filters)
         )
+
+    @staticmethod
+    def _after_row(last):
+        stamp = float(last["time_bounds_lower"])
+        safe_uri = last["uri"].replace("'", "''")
+        return (f" AND (p.time_bounds_lower < {stamp!r} OR "
+                f"(p.time_bounds_lower = {stamp!r} AND a.uri < '{safe_uri}'))")
+
+    def region_page(self, position, window, intersects):
+        name, lo, hi = window
+        rows, capped = self._sia_collection(
+            name, position, lo, hi, time.monotonic() + self.settings.metadata_seconds, footprints=True,
+        )
+        if not capped:
+            return self._select_rows(row for row in rows if intersects(row.get("footprint", ""))), []
+        # Inclusive subwindows can share records. Release reconciliation removes duplicates.
+        dates = sorted({float(row["time_bounds_lower"]) for row in rows
+                        if (lo is None or float(row["time_bounds_lower"]) > lo)
+                        and (hi is None or float(row["time_bounds_lower"]) < hi)})
+        if not dates:
+            raise ArchiveError(f"{name} exceeded the archive limit at one epoch. Coverage is incomplete.")
+        mid = dates[len(dates) // 2]
+        return [], [(name, lo, mid), (name, mid, hi)]
+
+    def _search_tap(
+        self, query: Query, deadline: float, offer=None, timing: Timing | None = None,
+    ) -> tuple[list[Observation], list[str]]:
+        prefix = self._tap_prefix(f"1=CONTAINS(POINT('ICRS',{query.ra_deg:.10f},{query.dec_deg:.10f}),p.poly)", query)
+        deadline = min(deadline, time.monotonic() + self.settings.metadata_seconds)
+        limit = self.settings.metadata_limit
         cursor = ""
         rows, notes = [], []
         for _ in range(METADATA_PAGES):
@@ -465,11 +506,7 @@ class Archive:
                 offer(batch[:limit])
             if len(batch) <= limit:
                 break
-            last = batch[limit - 1]
-            stamp = float(last["time_bounds_lower"])
-            safe_uri = last["uri"].replace("'", "''")
-            next_cursor = (f" AND (p.time_bounds_lower < {stamp!r} OR "
-                           f"(p.time_bounds_lower = {stamp!r} AND a.uri < '{safe_uri}'))")
+            next_cursor = self._after_row(batch[limit - 1])
             if cursor == next_cursor:
                 notes.append("Partial metadata: archive returned a repeated page.")
                 break

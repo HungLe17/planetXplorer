@@ -166,6 +166,87 @@ def test_filtered_search_checks_metadata_first_and_followups_cannot_expand_it(tm
     assert next(r for r in m.observations if r.id == "unknown").status == "ready"
 
 
+@pytest.mark.parametrize("live", [True, False])
+def test_image_traffic_for_subband_only_queries_across_initial_and_followup_loads(tmp_path, live):
+    import httpx
+    from astropy.io import fits
+
+    fixture = Path(__file__).parent / "fixtures" / "wise-d6.fits"
+    base = Observation("match", "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/match.fits",
+                       60800.7, "D6", "DR1")
+    field = dict(ra_deg=133.795129, dec_deg=-7.245147, live=live)
+    calibration = decode(fixture, base, Query(**field), base.uri)
+    channel = f"D6 {calibration.wavelengths[0]:.6f} µm ({calibration.version})"
+    query = Query(**field, channels={"D6": [channel]})
+    assert query.detectors == ["D6"]
+    records = [replace(base, identity=name, uri=base.uri.replace("match.fits", name + ".fits"),
+                       detector="D3" if name == "other-detector" else "D6")
+               for name in ["match", "other-subband", "other-detector", "ignored", "wrong-range", "small"]]
+    with fits.open(fixture) as hdus:
+        primary = hdus[0].header.copy()
+        def prefix():
+            return (primary.tostring() + hdus["IMAGE"].header.tostring()).encode("ascii").ljust(92160)
+        match = prefix()
+        primary["VERSION"] = "other"
+        nonmatch = prefix()
+        table = io.BytesIO()
+        fits.HDUList([fits.PrimaryHDU(), hdus["WCS-WAVE"].copy()]).writeto(table)
+        tail = table.getvalue().rjust(28800, b" ")
+
+    images, ranges = [], []
+    class NoImageBody(httpx.SyncByteStream):
+        def __iter__(self):
+            raise AssertionError("A metadata request consumed a rejected science image body")
+
+    def respond(request):
+        name = Path(request.url.path).stem
+        if "Range" not in request.headers:
+            assert "size" in request.url.params and "center" in request.url.params
+            images.append(name)
+            return httpx.Response(200, content=fixture.read_bytes())
+        assert request.url.query == b""
+        spec = request.headers["Range"]
+        ranges.append((name, spec))
+        if name == "ignored":
+            return httpx.Response(200, stream=NoImageBody())
+        if name == "wrong-range":
+            return httpx.Response(206, headers={"Content-Range": "bytes 0-199999/200000"}, stream=NoImageBody())
+        if name == "small":
+            return httpx.Response(206, headers={"Content-Range": "bytes 0-92159/100000"}, stream=NoImageBody())
+        if spec == "bytes=0-92159":
+            return httpx.Response(206, headers={"Content-Range": "bytes 0-92159/200000"},
+                                  content=nonmatch if name == "other-subband" else match)
+        assert spec == "bytes=-28800"
+        return httpx.Response(206, headers={"Content-Range": "bytes 171200-199999/200000"}, content=tail)
+
+    class FieldArchive(Archive):
+        def search(self, query, deadline, **kwargs):
+            return records, []
+
+    settings = Settings(cache_dir=tmp_path / "cache", batch_size=8, max_candidates=8)
+    archive = FieldArchive(settings)
+    archive.client.close()
+    archive.client = httpx.Client(transport=httpx.MockTransport(respond))
+    pipeline = Pipeline(settings, archive)
+    try:
+        manifest = pipeline.run(query, tmp_path, "field", lambda _: None)
+        assert {row.detector for row in manifest.observations} == {"D3", "D6"}
+        assert {row.id for row in manifest.observations if row.selection == "unavailable"} == {
+            "ignored", "wrong-range", "small",
+        }
+        assert images == ["match"]
+        assert sorted(ranges) == sorted(
+            [(name, "bytes=0-92159") for name in ("match", "other-subband", "ignored", "wrong-range", "small")]
+            + [(name, "bytes=-28800") for name in ("match", "other-subband")]
+        )
+        pipeline.load(manifest, [r.id for r in manifest.observations], tmp_path, "field", lambda _: None)
+        assert images == ["match"]
+        assert all(name != "other-detector" for name, _ in ranges)
+    finally:
+        pipeline.transfers.close()
+        archive.close()
+
+
 def test_reconciled_product_never_inherits_provisional_calibration(tmp_path):
     fixture = Path(__file__).parent / "fixtures" / "wise-d6.fits"
     obs = Observation("sample", "https://irsa.ipac.caltech.edu/ibe/data/spherex/qr3/a.fits",

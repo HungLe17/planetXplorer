@@ -59,6 +59,78 @@ const zoomValue = (page: Page) =>
     .innerText()
     .then((v) => Number.parseInt(v));
 
+test("only a confirmed right-click on the selection retrieves its spectrum for all dates in a new tab", async ({page, context}) => {
+  await page.setViewportSize({width: 1440, height: 900});
+  let opens = 0, catalogReads = 0, measurements = 0;
+  const records = [
+    {id: "old-D1", detector: "D1", release: "DR1", observed_at: "2025-07-01T00:00:00Z"},
+    {id: "new-D6", detector: "D6", release: "QR3", observed_at: "2026-07-01T00:00:00Z"},
+  ];
+  await context.route("**/api/region-spectra", route => {
+    opens++;
+    const body = route.request().postDataJSON();
+    expect(body).toMatchObject({ra_deg: 330, dec_deg: -50, width: 16, height: 16});
+    expect(body.box[0]).toBeLessThan(body.box[2]);
+    expect(body.box[1]).toBeLessThan(body.box[3]);
+    expect(Object.keys(body).sort()).toEqual(["box","dec_deg","fov_arcsec","height","ra_deg","width"]);
+    return route.fulfill({status: 201, json: {id: "region"}});
+  });
+  await context.route("**/region/catalog", route => {
+    catalogReads++;
+    return route.fulfill({json: catalogReads === 1 ? {discovering: true, count: 1} :
+      {discovering: false, count: 2, records, visits: records.map(r => ({
+        id: r.id, start_utc: r.observed_at, end_utc: r.observed_at, observation_ids: [r.id], kind: "supplemental", status: "pending", issues: [],
+      }))}});
+  });
+  await context.route("**/region/measure", route => {
+    measurements++;
+    expect(route.request().postDataJSON().ids).toEqual(measurements === 1 ? ["old-D1","new-D6"] : ["new-D6"]);
+    const id = measurements === 1 ? "old-D1" : "new-D6";
+    return route.fulfill({json: {measurements: [{id, bins: [{wave: measurements === 1 ? 1.1 : 4.4, mean: -3.2, finite: 1}], finite: 1, pixels: 4, covered: 4}],
+      errors: measurements === 1 ? {"new-D6": "Archive busy"} : {}}});
+  });
+  await setup(page);
+  const canvas = page.locator("canvas");
+  const center = async () => {
+    const r = (await canvas.boundingBox())!;
+    return {x: r.x + r.width/2, y: r.y + r.height/2};
+  };
+  let p = await center();
+  await page.mouse.move(p.x - 35, p.y - 35);
+  await page.mouse.down();
+  await page.mouse.move(p.x + 35, p.y + 35, {steps: 4});
+  await page.mouse.up();
+  await expect(page.getByRole("complementary", {name: "Frame details"})).toBeVisible();
+  p = await center();
+  await page.mouse.click(p.x + 120, p.y, {button: "right"});
+  const menu = page.getByRole("dialog", {name: "Selected region spectrum"});
+  await expect(menu).toHaveCount(0);
+  await page.mouse.move(p.x, p.y);
+  await page.mouse.down({button: "right"});
+  await page.mouse.move(p.x + 15, p.y, {steps: 3});
+  await page.mouse.up({button: "right"});
+  await expect(menu).toHaveCount(0);
+  await page.mouse.click(p.x, p.y, {button: "right"});
+  await expect(menu).toContainText("very long time");
+  await menu.getByRole("button", {name: "Cancel"}).click();
+  expect(opens).toBe(0);
+  await page.mouse.click(p.x, p.y, {button: "right"});
+  const opened = context.waitForEvent("page");
+  await menu.getByRole("link", {name: "Open in new tab"}).click();
+  const tab = await opened;
+  await expect(tab.getByRole("heading", {name: "Region spectrum"})).toBeVisible();
+  await expect(tab.getByRole("status")).toContainText("1 failed");
+  await expect(tab.getByRole("cell", {name: "-3.2", exact: true})).toBeVisible();
+  await tab.getByRole("combobox").selectOption("new-D6");
+  await expect(tab.getByRole("cell", {name: "Archive busy"})).toBeVisible();
+  await tab.getByRole("button", {name: "Retry lookup"}).click();
+  await expect(tab.getByRole("status")).toContainText("2 of 2 exposures measured · complete");
+  await expect(tab.getByRole("cell", {name: "4.4", exact: true})).toBeVisible();
+  expect(opens).toBe(1);
+  expect(measurements).toBe(2);
+  await expect(canvas).toBeVisible();
+});
+
 test("zoom geometry preserves the anchored image coordinate during pinch translation", () => {
   const before = { scale: 2, x: 30, y: -10 },
     from = { x: 120, y: 80 },

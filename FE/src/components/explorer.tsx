@@ -39,6 +39,7 @@ import ImageControls from "./image-controls";
 import WorkspacePanel from "./workspace-panel";
 import { CycleCatalog, ExposureTable } from "./observation-catalog";
 import SearchBands from "./search-bands";
+import { ObjectPanel, useKnownObjects } from "./known-objects";
 import { draftBands, fieldKey, inSearch, readBands, selectedBands, type BandDraft } from "@/lib/search-bands";
 import {
   activeChannels,
@@ -127,6 +128,10 @@ export default function Explorer() {
     [notice, setNotice] = useState(""),
     [copied, setCopied] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [knownOpen, setKnownOpen] = useState(false);
+  const [showMoving, setShowMoving] = useState(true);
+  const [objectKey, setObjectKey] = useState("");
+  const [preferredEpoch, setPreferredEpoch] = useState("");
   const [datesOpen, setDatesOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(true);
   const [fieldJobId, setFieldJobId] = useState("");
@@ -238,6 +243,21 @@ export default function Explorer() {
   const product = frame
     ? science.result[science.frames.indexOf(frame)]
     : undefined;
+  const contributors = useMemo(() => {
+    if (!frame) return empty;
+    if (!isVisitMap) return [frame];
+    const members = [...(product?.inputs ?? []), ...(product?.reference ?? [])];
+    return [...new Map(members.map(f => [f.observation_id, f])).values()];
+  }, [frame, isVisitMap, product]);
+  const epochs = useMemo(() => [...new Set(contributors.map(f => f.midpoint_utc || f.observed_at))]
+    .sort((a, b) => Date.parse(a) - Date.parse(b)), [contributors]);
+  const epoch = epochs.includes(preferredEpoch) ? preferredEpoch : epochs[0] ?? "";
+  const known = useKnownObjects(knownOpen, showMoving, displayedQuery, manifest, contributors, fieldJobId, epoch);
+  const chosenObject = known.markers.find(marker => marker.key === objectKey);
+  function selectObject(key: string) {
+    setObjectKey(key);
+    setPlaying(false);
+  }
   const observedFrames = useRef(allFrames);
   useEffect(() => {
     observedFrames.current = allFrames;
@@ -797,15 +817,21 @@ export default function Explorer() {
       if ((cycleMembers.has(o.id) || !hasCycles) && needed(o)) return 2;
       return display.prefetchBands ? 3 : 4;
     };
+    const needsMapFilter = (o: Observation) => !!channels[o.detector]?.length &&
+      !display.prefetchBands && o.id !== requestedId && !pinnedIds.has(o.id) &&
+      !(requestSpectra && inspectorOpen && visitMembers.has(o.id));
+    const attemptKey = (o: Observation) => JSON.stringify([o.id, needsMapFilter(o) ? channels[o.detector] : null]);
     const queued = wanted
-      .filter((o) => priority(o) < 4 && !attempted.current.has(o.id))
+      .filter((o) => priority(o) < 4 && !attempted.current.has(attemptKey(o)))
       .sort((a, b) => priority(a) - priority(b));
     if (!queued.length) return;
-    const batch = queued.slice(0, batchSize);
-    batch.forEach((o) => attempted.current.add(o.id));
+    const narrow = needsMapFilter(queued[0]);
+    const batch = queued.filter(o => needsMapFilter(o) === narrow).slice(0, batchSize);
+    batch.forEach((o) => attempted.current.add(attemptKey(o)));
     void load(displayedQuery, "", null, {
       jobId: fieldJobId,
       ids: batch.map((o) => o.id),
+      channels: narrow ? channels : undefined,
       size: batchSize,
       automatic: true,
     });
@@ -952,7 +978,8 @@ export default function Explorer() {
           setSelected(opening.id);
           setRa(String(opening.ra_deg));
           setDec(String(opening.dec_deg));
-          void load({ ra_deg: opening.ra_deg, dec_deg: opening.dec_deg });
+          if (opening.cached_manifest_available)
+            void load({ ra_deg: opening.ra_deg, dec_deg: opening.dec_deg });
         }
       })
       .catch(() => {});
@@ -1634,9 +1661,13 @@ export default function Explorer() {
           </div>
           <div
             className={
-              "workspace-grid" + (inspectorOpen ? "" : " inspector-collapsed")
+              "workspace-grid" + (inspectorOpen ? "" : " inspector-collapsed") +
+              (knownOpen && displayedQuery ? " with-catalog" : "")
             }
           >
+            {knownOpen && displayedQuery && <ObjectPanel query={displayedQuery} data={known}
+              chosen={chosenObject} select={selectObject} moving={showMoving} toggleMoving={setShowMoving}
+              times={epochs} epoch={epoch} changeEpoch={setPreferredEpoch} close={() => setKnownOpen(false)} />}
             <section className="viewer-section" aria-label="Observation viewer">
               <div className="section-heading">
                 <span className="field-readout mono">
@@ -1645,6 +1676,9 @@ export default function Explorer() {
                     : ""}
                 </span>
                 <div className="viewer-heading-actions">
+                  <button className={"inspector-toggle" + (knownOpen ? " is-active" : "")}
+                    aria-pressed={knownOpen} disabled={!displayedQuery || !frame}
+                    onClick={() => setKnownOpen(!knownOpen)}>Known objects</button>
                   <button
                     className={
                       "inspector-toggle " + (inspectorOpen ? "is-active" : "")
@@ -1761,8 +1795,12 @@ export default function Explorer() {
                       ]
                 }
                 colors={science.colors}
+                markers={known.markers}
+                chosenObject={chosenObject}
+                onMarker={selectObject}
                 selection={selection}
                 onSelect={(box) => {
+                  setObjectKey("");
                   setSelection(box);
                   setInspectorOpen(true);
                 }}

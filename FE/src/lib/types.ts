@@ -10,6 +10,7 @@ export type Query = {
   end_utc?: string;
 };
 export type Frame = {
+  midpoint_utc?: string;
   id: string;
   url: string;
   observation_id: string;
@@ -72,6 +73,7 @@ export type Manifest = {
   retrieved_at?: string;
   cached?: boolean;
   processing?: {
+    grid_header?: Record<string, string | number>;
     batch_size?: number;
     revision?: number;
     output_shape?: number[];

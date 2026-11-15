@@ -1,4 +1,30 @@
 import { test, expect } from "@playwright/test";
+import { defaults } from "../src/lib/imaging";
+
+test("background map loads pass unknown wavelengths through the map subband filter", async ({page}) => {
+  const label = "D1 1.020000 µm (v1)";
+  const view = {...defaults, maps: [{...defaults.maps[0], operands: {[label]: 1}}]};
+  const date = "2026-06-01T00:00:00Z";
+  const record = {id:"unknown", detector:"D1", observed_at:date, release:"DR1", status:"pending"};
+  const visit = {id:"cycle", kind:"cycle", start_utc:date, end_utc:date,
+    observation_ids:[record.id], status:"pending", issues:[]};
+  const batches: {channels?: Record<string, string[]>}[] = [];
+  await page.route("**/api/presets", r => r.fulfill({json:{presets:[]}}));
+  await page.route("**/api/jobs", r => r.fulfill({json:{job_id:"map-filter"}}));
+  await page.route("**/api/jobs/map-filter", r => r.fulfill({json:{status:"complete", manifest:{
+    observations:[record], visits:[visit], frames:[],
+  }}}));
+  await page.route("**/api/jobs/map-filter/load", r => {
+    batches.push(r.request().postDataJSON());
+    return r.fulfill({json:{job_id:"map-filter"}});
+  });
+  const params = new URLSearchParams({ra:"5", dec:"4", bands:JSON.stringify({detectors:["D1"]}), view:JSON.stringify(view)});
+  await page.goto("/explore?" + params);
+  await expect.poll(() => batches[0]?.channels).toEqual({D1:[label]});
+  await page.getByLabel(/in background/i).check();
+  await expect.poll(() => batches.length).toBe(2);
+  expect(batches[1].channels).toBeUndefined();
+});
 
 test("cycle navigation and selection preserve the whole spectrum; explicit spectrum and background loads honor scope", async ({
   page,

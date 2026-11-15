@@ -659,7 +659,8 @@ test("opens an available archive field on startup and honors shared coordinates"
     }),
   );
   const submitted: unknown[] = [];
-  await page.route("**/api/jobs", (r) => {
+  await page.route(/\/api\/jobs(?:\?prepared_only=true)?$/, (r) => {
+    expect(new URL(r.request().url()).searchParams.has("prepared_only")).toBe(!r.request().postDataJSON().live);
     submitted.push(r.request().postDataJSON());
     return r.fulfill({ status: 202, json: { job_id: "startup" } });
   });
@@ -714,6 +715,21 @@ test("opens an available archive field on startup and honors shared coordinates"
       channels: {},
     },
   ]);
+});
+
+test("an uncached preset fills coordinates and waits for an explicit band selection and search", async ({page}) => {
+  const requests: string[] = [];
+  await page.route("**/api/presets", r => r.fulfill({json:{presets:[
+    {id:"barnard", ra_deg:42, dec_deg:5, cached_manifest_available:false},
+  ]}}));
+  await page.route(/\/api\/jobs(?:\?|$)/, r => {
+    requests.push(r.request().url());
+    return r.abort();
+  });
+  await page.goto("/explore");
+  await expect(page.getByRole("textbox", {name:"Right ascension"})).toHaveValue("42");
+  await expect(page.getByRole("button", {name:"Search observations"})).toBeEnabled();
+  expect(requests).toEqual([]);
 });
 
 test("search progress is cancellable and preserves the previous field", async ({

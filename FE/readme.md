@@ -31,6 +31,12 @@ Expand observations for a larger table. On phones, this switches to the records 
 
 FOV controls the requested angular cutout (30-1,800 arcseconds); zoom controls its screen magnification. Editing coordinates, dates, or FOV does not silently change the currently displayed field. Submit Search to apply edits. Shared links restore query coordinates, dates, and FOV.
 
+## Inspect a field
+
+**Known objects** opens a left-hand Aladin Lite atlas centered on the displayed SPHEREx field. The circles on the SPHEREx image use its own saved projection. Click a circle or choose an entry under **Object on image** to inspect its identification, coordinates, source, and epoch. A click on empty sky still inspects a pixel. On a composite, choose a contributing epoch for the stellar positions. Asteroids and comets can have a separate circle for each exposure midpoint. Changing cycles clears markers that belong to the previous view. [Viewer integration](src/components/explorer.tsx) · [Catalog panel](src/components/known-objects.tsx) · [Projection](src/lib/known-objects.ts)
+
+Left-drag to select a region, then right-click inside it and choose **Open in new tab** for an all-date regional spectrum. The new tab requests D1–D6 independently of the original search filters. Right-drag continues to pan. [Viewer gestures](src/components/sky-viewer.tsx) · [Regional measurements](../BE/app/region_spectra.py)
+
 ## API contract
 
 - `POST /api/jobs`: `{ra_deg, dec_deg, fov_arcsec?, start_utc?, end_utc?, live?, detectors?, channels?}` returns `{job_id}`.

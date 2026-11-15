@@ -13,10 +13,13 @@ import httpx
 import truststore
 
 from .archive import Archive, ArchiveError
+from .known_catalog import router as known_catalog_router
 from .config import ROOT, Settings
 from . import desi, surveys
 from .jobs import CapacityError, Jobs, prepared_manifest
+from .moving_objects import MovingObjects, router as moving_router
 from .pipeline import Pipeline
+from .region_spectra import region_router
 from .schemas import Detector, Job, Query, Submitted, LoadRequest
 
 
@@ -29,14 +32,19 @@ def create_app(settings: Settings | None = None, pipeline=None):
         manager = Jobs(settings, pipeline or Pipeline(settings, archive))
         app.state.jobs = manager
         app.state.archive = archive or getattr(pipeline, "archive", None)
+        app.state.moving_objects = MovingObjects()
         try:
             yield
         finally:
             await asyncio.to_thread(manager.close)
+            await app.state.moving_objects.http.aclose()
             if archive:
                 archive.close()
 
     app = FastAPI(title="planetXplorer API", version="1.0.0", lifespan=lifespan)
+    app.include_router(moving_router)
+    app.include_router(known_catalog_router)
+    app.include_router(region_router(settings))
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.origins),
@@ -53,9 +61,9 @@ def create_app(settings: Settings | None = None, pipeline=None):
         return response
 
     @app.post("/api/jobs", response_model=Submitted, status_code=202)
-    def submit(query: Query, request: Request):
+    def submit(query: Query, request: Request, prepared_only: bool = False):
         try:
-            return Submitted(job_id=request.app.state.jobs.submit(query))
+            return Submitted(job_id=request.app.state.jobs.submit(query, prepared_only=prepared_only))
         except CapacityError as exc:
             raise HTTPException(429, str(exc), headers={"Retry-After": "10"}) from exc
 

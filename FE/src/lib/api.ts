@@ -78,7 +78,8 @@ export function validateManifest(input: Manifest): Manifest {
   };
 }
 export async function submit(query: Query, signal: AbortSignal) {
-  const value = await request<{ job_id: string }>("/api/jobs", signal, query);
+  const path = query.live ? "/api/jobs" : "/api/jobs?prepared_only=true";
+  const value = await request<{ job_id: string }>(path, signal, query);
   if (!value.job_id)
     throw new Error("The service did not return a request identifier.");
   return value.job_id;

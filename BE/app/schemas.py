@@ -54,6 +54,9 @@ class Query(BaseModel):
             raise ValueError("start_utc must not follow end_utc")
         if self.detectors is not None:
             self.detectors = sorted(set(self.detectors))
+        elif self.channels:
+            # A subband-only request explicitly names its detectors.
+            self.detectors = sorted(self.channels)
         for detector in calibrated_channels(self.channels):
             if self.detectors is not None and detector not in self.detectors:
                 raise ValueError("Channel selector belongs to an unrequested detector")
@@ -78,6 +81,7 @@ class Frame(BaseModel):
     url: str
     observation_id: str
     observed_at: str
+    midpoint_utc: str | None = None
     detector: str
     wavelength_um: float
     bandwidth_um: float

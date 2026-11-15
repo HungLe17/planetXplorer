@@ -50,6 +50,15 @@ def finished(client, job_id):
     pytest.fail("Background job did not finish")
 
 
+def test_prepared_only_startup_never_falls_back_to_archive(tmp_path):
+    with TestClient(create_app(settings(tmp_path), StubPipeline())) as client:
+        response = client.post("/api/jobs?prepared_only=true", json={"ra_deg": 2, "dec_deg": 3})
+        assert response.status_code == 202
+        job = client.get("/api/jobs/" + response.json()["job_id"]).json()
+        assert job["status"] == "failed" and "Choose bands" in job["error"]
+        assert job["job_id"] not in client.app.state.jobs.futures
+
+
 def test_job_assets_cache_and_contract(tmp_path):
     with TestClient(create_app(settings(tmp_path), StubPipeline())) as client:
         r = client.post("/api/jobs", json={"ra_deg": 1, "dec_deg": 2})

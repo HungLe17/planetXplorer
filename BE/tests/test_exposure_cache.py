@@ -16,12 +16,25 @@ FIELD = Query(ra_deg=32, dec_deg=-12, live=True)
 VISIT = Observation("visit", "https://irsa.ipac.caltech.edu/original", 60000, "D1", "DR1")
 
 
-def store(cache, obs=VISIT, value=1.0, quality=None):
+def store(cache, obs=VISIT, value=1.0, quality=None, wavelength=1.0):
     frame = Frame(id="old.png", url="/api/assets/old/old.png", observation_id=obs.identity,
                   observed_at="2023-02-25T00:00:00+00:00", detector=obs.detector,
-                  wavelength_um=1, bandwidth_um=.1, release=obs.release, source_url=obs.uri,
+                  wavelength_um=wavelength, bandwidth_um=.1, release=obs.release, source_url=obs.uri,
+                  processing_version="7.0",
                   quality="old-quality.bin" if quality is not None else None)
-    cache.store(FIELD, obs, frame, np.full((32, 32), value), np.ones(5), np.full(5, .1), quality)
+    cache.store(FIELD, obs, frame, np.full((32, 32), value), np.full(5, wavelength), np.full(5, .1), quality)
+
+
+def test_filtered_warm_start_uses_the_calibration_of_the_preferred_revision(tmp_path):
+    cache = ExposureCache(Settings(cache_dir=tmp_path), "1", quality_mask=0)
+    older = replace(VISIT, release="QR3", uri=VISIT.uri + "-qr3")
+    query = Query(ra_deg=32, dec_deg=-12, live=True, channels={"D1": ["D1 1.000000 µm (7.0)"]})
+    store(cache, older)
+    assert [entry.observation for entry in cache.load(query)] == [older]
+    store(cache, VISIT, wavelength=1.2)
+    assert cache.load(query) == []
+    assert cache.get(query, VISIT) is None
+    assert cache.get(FIELD, VISIT).frame.wavelength_um == 1.2
 
 
 def test_restart_preserves_display_mask_archive_readings_and_original_orientation(tmp_path):

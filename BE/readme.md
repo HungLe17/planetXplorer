@@ -167,6 +167,20 @@ The frontend contract is preserved: `manifest.frames` includes image URL, acquis
 
 ## Genuine cached demonstrations and validation
 
+### Known objects in a SPHEREx field
+
+The viewer requests catalog metadata when the overlay opens. The search cone encloses the pixel-rounded square and includes a motion allowance of 12 arcseconds per year from each catalog's epoch. Each service can contribute up to 1,500 candidates. A partial response identifies the service that failed or reached its limit. Complete field results expire after an hour, partial results after a minute. Exact, unambiguous release-specific aliases from SIMBAD join named objects to catalog records. Nearby objects without an identification stay separate. [Catalog implementation](app/known_catalog.py)
+
+Stars with both components of proper motion use a linear tangent velocity at the catalog epoch. Gaia's RA component includes the cosine of declination. CatWISE motion fits use MJD 57170 and arcseconds per year. A record lacking a usable motion retains its catalog position and epoch. These coordinates omit parallax and perspective acceleration. The markers share the displayed image's tangent-plane projection and north-up orientation. [Gaia DR3 astrometry](https://gea.esac.esa.int/archive/documentation/GDR3/Gaia_archive/chap_datamodel/sec_dm_main_source_catalogue/ssec_dm_gaia_source.html) · [CatWISE column definitions](https://irsa.ipac.caltech.edu/data/WISE/CatWISE/gator_docs/catwise_colDescriptions.html) · [Marker projection](../FE/src/lib/known-objects.ts)
+
+Moving objects require the FITS exposure midpoint, or the mean of its start and end times. Legacy frames can retrieve this from a bounded archive header read. JPL Horizons supplies the spacecraft's geocentric ICRF position and velocity for that instant. SB Identification uses this observer and its second-pass numerical orbit calculation. Center and epoch keys keep different exposures' results independent. Successful ephemerides expire after 24 hours. When spacecraft coverage or the midpoint is unavailable, the viewer reports the lookup failure. [SPHEREx Explanatory Supplement](https://irsa.ipac.caltech.edu/data/SPHEREx/docs/SPHEREx_Expsupp.pdf) · [JPL identification API](https://ssd-api.jpl.nasa.gov/doc/sb_ident.html) · [Moving-object service](app/moving_objects.py)
+
+Live checks on 15 November 2026 returned Barnard's star as Gaia DR3 4472832130942575872 and SIMBAD type BY Dra Variable. Its estimated position was 0.61 and 0.36 displayed pixels from the local brightness peak in the 21 August 2025 and 19 March 2026 D6 demo images. For Vesta, IRSA MOST's August 2025 example returned RA 222.866022°, Dec −11.907528° for exposure `2025W32_1A_0105_1D6`. At its FITS midpoint of 4 August 2025 11:05:01.098 UTC, the JPL field lookup returned RA 222.866208°, Dec −11.907556°, a separation of 0.66 arcseconds, or 0.11 display pixel. The offline regression rechecks both star images and the recorded JPL coordinate against these references. [Prepared Barnard frames](demos/barnard/manifest.json) · [IRSA's Vesta query](https://github.com/Caltech-IPAC/irsa-tutorials/blob/main/tutorials/techniques-and-tools/MOST_queries.md#5-spherex) · [Regression tests](tests/test_known_objects.py)
+
+### Prepared fields
+
+The viewer opens its startup preset with `POST /api/jobs?prepared_only=true`. If the prepared images are missing or unreadable, the backend returns a failed job without scheduling any FITS transfer. Pressing **Search observations** submits the detector and subband selection as a live job. The final transfer check uses the selected detector, calibrated subband and exact archive product. A server that ignores a wavelength metadata range cannot trigger a full image download through that lookup. [Job submission](app/jobs.py) · [Image download checks](app/pipeline.py) · [Metadata range tests](tests/test_field_visits.py)
+
 `demos/<target>/` contains prepared archive PNGs and their source manifest where available. An exact matching coordinate query with no date filters can reuse that sequence and is explicitly labelled cached with its actual retrieval date. Other fields/filters use live retrieval. There is no silent substitution of a different field. The short-lived exact-query cache also expires after two hours; prepared demonstrations remain protected.
 
 ```powershell
@@ -175,6 +189,12 @@ The frontend contract is preserved: `manifest.frames` includes image URL, acquis
 ```
 
 The proof script fetches each target, saves real-source reports under `.cache/validation/`, and optionally prepares demos. Reports state coverage/compatible frame results, not detections. Tests use a small recorded IRSA FITS fixture and synthetic test-only fields for coordinate, flag, calibration/wavelength, WCS, mask, stretch/orientation, API lifecycle, queue, expiry, and URL restriction checks. Unit tests do not depend on NASA availability. With both servers running, `node scripts/browser_smoke.cjs` verifies the real frontend/backend flow using the prepared Barnard sequence; it writes a screenshot and report under `.cache/integration/`.
+
+## Selected region spectra
+
+Right-click a selected rectangle in the viewer and choose **Open in new tab** to retrieve its spectral history. The tab searches all supported wide and deep SPHEREx collections for every detector and date. The selection uses the displayed field's 6.14″ ICRS TAN grid and inclusive pixel bounds. An enclosing SIA cone retrieves candidate exposures. The service intersects their published footprints with the selected rectangle and reconciles archive releases before requesting calibrated cutouts. Retrying within the same session reuses successful measurements. [IRSA image search](https://irsa.ipac.caltech.edu/ibe/sia.html) · [Region API](app/region_spectra.py)
+
+Each exposure keeps its observation time, detector and release. Each region pixel samples archived brightness and wavelength at the same nearest detector pixel. Finite signed brightness contributes regardless of its flags. Missing pixels and NaNs contribute no brightness. Within an exposure, bins begin at the lowest sampled wavelength and use the narrowest positive finite bandwidth among contributing pixels. If no bandwidth is available, samples group by exact wavelength. The graph and table report arithmetic mean wavelength and surface brightness per populated bin, with the finite pixel count. The graph connects measurements only in verified cycles. Conflicting and supplemental observations remain individually inspectable. [Sampling and reduction](app/region_spectra.py) · [Visit validation](app/visits.py)
 
 ## Sources and credit
 

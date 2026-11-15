@@ -28,7 +28,7 @@ from .exposure_cache import CachedExposure, ExposureCache
 from .pixel_quality import SOURCE_BIT, PixelQuality, PixelState
 from .schemas import Frame, Manifest, Query, Sequence
 from .visits import field_visits
-from .spectral import spectral_wcs
+from .spectral import exposure_midpoint, spectral_wcs
 from .transfers import CutoutQueue, PriorityLoads
 
 PIPELINE_VERSION = "3.0.0"
@@ -49,13 +49,14 @@ class Cutout:
     metadata: dict | None = None
     flag_names: dict | None = None
     quality: PixelQuality | None = None
+    midpoint_utc: str | None = None
 
 
-def decode(path: Path, obs: Observation, query: Query, source: str) -> Cutout:
+def decode(path: Path, obs: Observation, query: Query, source: str, *, region=False) -> Cutout:
     with fits.open(path, memmap=False, lazy_load_hdus=True) as hdus:
         image = hdus["IMAGE"]
         shape = (image.header.get("NAXIS2", 0), image.header.get("NAXIS1", 0))
-        if image.header.get("NAXIS") != 2 or min(shape) < 2 or max(shape) > 512:
+        if image.header.get("NAXIS") != 2 or min(shape) < (1 if region else 2) or max(shape) > 512:
             raise ValueError("Cutout image dimensions are outside supported limits")
         for name in ("FLAGS", "VARIANCE"):
             h = hdus[name].header
@@ -98,9 +99,11 @@ def decode(path: Path, obs: Observation, query: Query, source: str) -> Cutout:
         ]
         pixels = [wcs.world_to_pixel(c) for c in positions]
         if not (0 <= pixels[0][0] < shape[1] and 0 <= pixels[0][1] < shape[0]):
-            raise ValueError(
-                "Exposure does not cover the target"
-            )
+            if not region:
+                raise ValueError("Exposure does not cover the target")
+            # Edge-only footprint hits still have valid pixel spectra. The regional
+            # reducer uses the spectral grid, never this reference sample.
+            pixels[0] = ((shape[1] - 1) / 2, (shape[0] - 1) / 2)
         spectral = spectral_wcs(image.header, hdus)
         waves, bands = [], []
         for x, y in pixels:
@@ -112,7 +115,7 @@ def decode(path: Path, obs: Observation, query: Query, source: str) -> Cutout:
             waves.append(float(wave.to_value(u.um)))
             bands.append(float(band.to_value(u.um)))
         waves, bands = np.array(waves), np.array(bands)
-        if (
+        if not region and (
             not np.isfinite(waves[0])
             or not np.isfinite(bands[0])
             or np.any(bands <= 0)
@@ -136,6 +139,7 @@ def decode(path: Path, obs: Observation, query: Query, source: str) -> Cutout:
             {int(k[4:]): str(hdus["FLAGS"].header[k]) for k in hdus["FLAGS"].header
              if k.startswith("MSKN") and k[4:].isdigit()},
             quality,
+            exposure_midpoint(image.header),
         )
 
 
@@ -334,6 +338,7 @@ def frame_metadata(c: Cutout, quality: PixelQuality) -> Frame:
         .to_datetime(timezone=UTC)
         .isoformat(),
         detector=c.observation.detector,
+        midpoint_utc=c.midpoint_utc,
         wavelength_um=float(c.wavelengths[0]),
         bandwidth_um=float(c.bandwidths[0]),
         release=c.observation.release,
@@ -473,7 +478,12 @@ class _FrameJob:
             materialize(entry, self.directory, self.job_id, stem, self.progressive)
         self.accepted[entry.observation.identity] = entry
 
-    def retrieve(self, obs):
+    def retrieve(self, obs, record):
+        # Both the early transfer and the batch queue must carry a match for
+        # this exact release/revision to the point where network I/O starts.
+        if (record.id != obs.identity or record.source_url != obs.uri
+                or record.band_match(self.query) != "matched"):
+            raise ArchiveError("The exposure has no confirmed match to the selected bands.")
         path = self.directory / (product_stem(obs) + ".fits")
         try:
             self.report("fetch")
@@ -489,9 +499,6 @@ class _FrameJob:
                 return decode(path, obs, self.query, source)
         finally:
             path.unlink(missing_ok=True)
-
-    def submit_transfer(self, obs):
-        return self.transfers.submit(self.retrieve, obs)
 
     def accept(self, c):
         obs = c.observation
@@ -634,13 +641,13 @@ class _FrameJob:
         probe, probing = None, None
         checked = {}
 
-        def start_early(obs):
+        def start_early(obs, record):
             nonlocal early_obs, early_future
             early_obs = obs
             if self.restore(obs):
                 self.snapshot()
             else:
-                early_future = self.submit_transfer(obs)
+                early_future = self.transfers.submit(self.retrieve, obs, record)
                 early_future.add_done_callback(events.put)
 
         with ThreadPoolExecutor(max_workers=1) as metadata:
@@ -658,7 +665,7 @@ class _FrameJob:
                 elif event is probe:
                     record = probing.record()
                     if self.confirm(probing, record) and early_obs is None:
-                        start_early(probing)
+                        start_early(probing, record)
                     checked[probing] = record
                     probe = None
                 elif early_obs is None and not warm:
@@ -669,7 +676,7 @@ class _FrameJob:
                             record.set_spectral(cached)
                     match = record.band_match(self.query)
                     if match == "matched":
-                        start_early(event)
+                        start_early(event, record)
                     elif match == "unknown":
                         candidates.append(event)
                 if early_obs is None and not probe and candidates:
@@ -777,7 +784,7 @@ class _FrameJob:
                 cached = self.cache.get(self.query, obs)
                 if cached is not None:
                     return cached
-            return self.retrieve(obs)
+            return self.retrieve(obs, record)
 
         def submit(obs, priority=False):
             nonlocal early_used

@@ -11,14 +11,16 @@ import {
 
 const nfmt = (v: number) =>
   Number.isFinite(v) ? Number(v.toPrecision(5)).toString() : "—";
-function Graph({
+export function SpectrumGraph({
   title,
   rows,
   domain,
+  connect = true,
 }: {
   title: string;
   rows: SpectrumBin[];
   domain: number[];
+  connect?: boolean;
 }) {
   const clip = useId();
   const [xmin, xmax, ymin, ymax] = domain;
@@ -56,10 +58,10 @@ function Graph({
         </g>
         <defs><clipPath id={clip}><rect x="48" y="18" width="232" height="89" /></clipPath></defs>
         <g clipPath={`url(#${clip})`}>
-          <polyline points={pts.map(p => `${x(p.wave)},${y(p.mean)}`).join(" ")}
-            fill="none" stroke="currentColor" strokeWidth="1" />
-          {pts.map(({ wave, mean, detector, finite }) => (
-            <circle key={detector + ":" + wave} cx={x(wave)} cy={y(mean)} r="1.5" fill="currentColor">
+          {connect && <polyline points={pts.map(p => `${x(p.wave)},${y(p.mean)}`).join(" ")}
+            fill="none" stroke="currentColor" strokeWidth="1" />}
+          {pts.map(({ wave, mean, detector, finite }, index) => (
+            <circle key={index} cx={x(wave)} cy={y(mean)} r="1.5" fill="currentColor">
               <title>{detector} · {nfmt(wave)} µm · {nfmt(mean)} MJy/sr · {finite} pixels</title>
             </circle>
           ))}
@@ -140,8 +142,8 @@ export default function Spectrum({
       {wavelengths.failed > 0 && <p role="status">Per-pixel wavelengths unavailable.{" "}
         <button className="button" onClick={wavelengths.retry}>Retry wavelengths</button>
       </p>}
-      <Graph title="Whole field" rows={full.bins} domain={full.domain} />
-      <Graph title={title} rows={selected.bins} domain={full.domain} />
+      <SpectrumGraph title="Whole field" rows={full.bins} domain={full.domain} />
+      <SpectrumGraph title={title} rows={selected.bins} domain={full.domain} />
       {!!planes.length && !!missing.length && (
         <p>No loaded exposures for {missing.join(", ")}.</p>
       )}

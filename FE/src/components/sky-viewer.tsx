@@ -18,6 +18,8 @@ import {
   type RenderedFrame,
 } from "@/lib/imaging";
 import type { Query } from "@/lib/types";
+import type { Marker } from "@/lib/known-objects";
+import { ObjectInfo } from "./known-objects";
 import { useAssets } from "@/lib/use-assets";
 import {
   zoomAt,
@@ -66,6 +68,9 @@ export default function SkyViewer({
   query,
   bounds,
   colors,
+  markers,
+  chosenObject,
+  onMarker,
   selection,
   onSelect,
   message,
@@ -80,6 +85,9 @@ export default function SkyViewer({
   query: Query | null;
   bounds: number[];
   colors: number[][];
+  markers: Marker[];
+  chosenObject?: Marker;
+  onMarker: (key: string) => void;
   selection: PixelBox | null;
   onSelect: (selection: PixelBox) => void;
   message: string;
@@ -96,6 +104,30 @@ export default function SkyViewer({
   const pointers = useRef(new Map<number, Point>());
   const lastPointerType = useRef("");
   const panGesture = useRef(false);
+  const rightDrag = useRef(false);
+  const [regionMenu, setRegionMenu] = useState<Point | null>(null);
+  const regionMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { setRegionMenu(null); }, [query, selection, index]);
+  useEffect(() => {
+    if (!regionMenu) return;
+    regionMenuRef.current?.querySelector("a")?.focus();
+    const outside = (event: PointerEvent) => {
+      if (!regionMenuRef.current?.contains(event.target as Node)) setRegionMenu(null);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        setRegionMenu(null);
+        canvas.current?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", outside);
+    document.addEventListener("keydown", escape, true);
+    return () => {
+      document.removeEventListener("pointerdown", outside);
+      document.removeEventListener("keydown", escape, true);
+    };
+  }, [regionMenu]);
   const [dragBox, setDragBox] = useState<PixelBox | null>(null);
   const multiTouch = useRef(false),
     tap = useRef<{ point: Point; time: number } | null>(null),
@@ -436,6 +468,26 @@ export default function SkyViewer({
       ctx.clearRect(0, 0, rect.width, rect.height);
       if (!currentImage) return;
       paint(ctx, currentImage, rect.width, rect.height, currentWarnings);
+      if (markers.length) {
+        const g = geometry(currentImage, rect.width, rect.height);
+        ctx.save();
+        ctx.filter = "none";
+        ctx.beginPath();
+        ctx.rect(g.x, g.y, g.w, g.h);
+        ctx.clip();
+        for (const marker of markers) {
+          const selected = marker.key === chosenObject?.key;
+          ctx.beginPath();
+          ctx.arc(g.x + marker.u * g.w, g.y + marker.v * g.h, selected ? 8 : 6, 0, 2 * Math.PI);
+          ctx.lineWidth = 3.5;
+          ctx.strokeStyle = "#142024";
+          ctx.stroke();
+          ctx.lineWidth = selected ? 2 : 1.5;
+          ctx.strokeStyle = selected ? "#ffffff" : marker.moving ? "#ffc66a" : "#81e9fd";
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
       const area = dragBox ?? selection;
       if (area) {
         const g = geometry(currentImage, rect.width, rect.height);
@@ -475,6 +527,8 @@ export default function SkyViewer({
     display.markFlagged,
     dragBox,
     selection,
+    markers,
+    chosenObject,
   ]);
   function endPointer(
     event: React.PointerEvent<HTMLCanvasElement>,
@@ -485,6 +539,40 @@ export default function SkyViewer({
     if (event.currentTarget.hasPointerCapture(event.pointerId))
       event.currentTarget.releasePointerCapture(event.pointerId);
     if (pointers.current.size) return;
+    if (!cancelled && !multiTouch.current && !panGesture.current && start.current && currentImage &&
+        markers.length && Math.hypot(event.clientX - start.current.x, event.clientY - start.current.y) < 4) {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const g = geometry(currentImage, rect.width, rect.height);
+      const x = event.clientX - rect.left - g.x, y = event.clientY - rect.top - g.y;
+      let nearest: Marker | undefined;
+      let distance = 9;
+      if (x >= 0 && y >= 0 && x < g.w && y < g.h) {
+        for (const marker of markers) {
+          const d = Math.hypot(marker.u * g.w - x, marker.v * g.h - y);
+          if (d < distance) { nearest = marker; distance = d; }
+        }
+      }
+      if (nearest) {
+        if (tapSelection.current !== null) clearTimeout(tapSelection.current);
+        tap.current = null;
+        start.current = null;
+        setDragBox(null);
+        onMarker(nearest.key);
+        return;
+      }
+    }
+    if (!cancelled && !multiTouch.current && panGesture.current && !rightDrag.current && selection && query) {
+      const here = { x: event.clientX, y: event.clientY };
+      const cell = pixelBox(here, here);
+      if (cell && cell[0] >= selection[0] && cell[0] <= selection[2] &&
+          cell[1] >= selection[1] && cell[1] <= selection[3]) {
+        const rect = event.currentTarget.getBoundingClientRect();
+        setRegionMenu({
+          x: Math.max(0, Math.min(here.x - rect.left, rect.width - 250)),
+          y: Math.max(0, Math.min(here.y - rect.top, rect.height - 138)),
+        });
+      }
+    }
     const area =
       !cancelled && !multiTouch.current && start.current && !panGesture.current
         ? pixelBox(start.current, { x: event.clientX, y: event.clientY })
@@ -532,7 +620,7 @@ export default function SkyViewer({
           ref={canvas}
           tabIndex={0}
           role="img"
-          aria-description="Click to inspect a pixel or left-drag a region. Right-drag to pan. Use two fingers or scroll to pan and zoom."
+          aria-description="Click to inspect a pixel or left-drag a region. Right-click the selection for its full spectrum. Right-drag to pan. Use two fingers or scroll to pan and zoom."
           onContextMenu={(event) => {
             if (loaded) event.preventDefault();
           }}
@@ -561,6 +649,7 @@ export default function SkyViewer({
             });
             if (pointers.current.size === 1) {
               panGesture.current = event.button === 2;
+              rightDrag.current = false;
               start.current = { x: event.clientX, y: event.clientY };
             }
             if (pointers.current.size > 1) {
@@ -594,12 +683,17 @@ export default function SkyViewer({
                     midpoint(next),
                   ),
                 );
-            } else if (panGesture.current || multiTouch.current)
+            } else if (panGesture.current || multiTouch.current) {
+              if (panGesture.current && !rightDrag.current && start.current) {
+                if (Math.hypot(event.clientX - start.current.x, event.clientY - start.current.y) < 4) return;
+                rightDrag.current = true;
+              }
               commit({
                 ...transform.current,
                 x: transform.current.x + event.clientX - before.x,
                 y: transform.current.y + event.clientY - before.y,
               });
+            }
             else if (start.current)
               setDragBox(
                 pixelBox(start.current, { x: event.clientX, y: event.clientY }),
@@ -633,8 +727,24 @@ export default function SkyViewer({
             }
           }}
         />
+        {regionMenu && selection && query && currentImage && (
+          <div className="region-menu" ref={regionMenuRef} role="dialog" aria-label="Selected region spectrum"
+            style={{left:regionMenu.x, top:regionMenu.y}}>
+            <strong>Full region spectrum</strong>
+            <p>Retrieving all six bands across every available date can take a very long time.</p>
+            <div>
+              <a className="button" target="_blank" rel="noopener noreferrer" onClick={() => setRegionMenu(null)}
+                href={"/region-spectrum?" + new URLSearchParams({
+                  ra:String(query.ra_deg), dec:String(query.dec_deg), fov:String(query.fov_arcsec ?? 300),
+                  width:String(currentImage.width), height:String(currentImage.height), box:selection.join(","),
+                })}>Open in new tab</a>
+              <button className="button" onClick={() => setRegionMenu(null)}>Cancel</button>
+            </div>
+          </div>
+        )}
         {current && loaded && (
           <div className="image-readout" role="group" aria-label="Displayed image">
+            {fullscreen && chosenObject && <ObjectInfo point={chosenObject} />}
             {fullscreen && unmatchedFrames && (
               <span>Browse / unmatched observations</span>
             )}

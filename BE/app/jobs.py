@@ -142,10 +142,10 @@ class Jobs:
                 "Temporary storage is full; retry after cached jobs expire"
             )
 
-    def submit(self, query: Query) -> str:
+    def submit(self, query: Query, *, prepared_only: bool = False) -> str:
         with self.lock:
             self.cleanup()
-            key = cache_key(query)
+            key = ("prepared:" if prepared_only else "") + cache_key(query)
             cached = self.cache.get(key)
             if cached and self.records[cached].status in ("running", "queued"):
                 return cached
@@ -186,6 +186,12 @@ class Jobs:
                 job.stage = "render"
                 self._finish_timing(job)
                 self.cache[key] = job_id
+                return job_id
+            if prepared_only:
+                job = self.records[job_id]
+                job.status = "failed"
+                job.error = "Prepared images are unavailable. Choose bands and search this field."
+                self._finish_timing(job)
                 return job_id
             self.cancel_events[job_id] = threading.Event()
             self.priority_loads[job_id] = PriorityLoads()
@@ -275,8 +281,7 @@ class Jobs:
             requested = list(dict.fromkeys(ids)) if ids else [r.id for r in records.values() if r.status == "pending"]
             selected = [i for i in requested if records[i].status != "ready"
                         and records[i].selection != "excluded"
-                        and (not manifest.query.live or manifest.query.detectors is None
-                             or records[i].detector in manifest.query.detectors)
+                        and records[i].band_match(manifest.query) != "excluded"
                         and (detector is None or records[i].detector == detector)]
             selected = selected[:min(self.settings.batch_size, remaining)]
             if not selected:

@@ -155,12 +155,18 @@ class ExposureCache:
             return None
 
     def get(self, query: Query, observation: Observation) -> CachedExposure | None:
-        if not self.path.is_file():
+        if query.band_match(observation.detector) == "excluded" or not self.path.is_file():
             return None
         try:
             with self._open() as db:
-                return self._read(db, self._field(query), observation,
-                                  time.time() - self.settings.ttl_seconds)
+                entry = self._read(db, self._field(query), observation,
+                                   time.time() - self.settings.ttl_seconds)
+                if entry is not None and query.band_match(
+                    observation.detector, entry.frame.wavelength_um,
+                    entry.frame.bandwidth_um, entry.frame.processing_version,
+                ) == "matched":
+                    return entry
+                return None
         except (OSError, sqlite3.Error):
             logger.warning("Could not read exposure cache", exc_info=True)
             return None
@@ -182,12 +188,16 @@ class ExposureCache:
                     frame = json.loads(fields.pop("metadata"))["frame"]
                     obs = Observation(**fields)
                     old = available.get(obs.identity)
-                    if query.band_match(obs.detector, frame["wavelength_um"], frame["bandwidth_um"],
-                                        frame["processing_version"]) == "matched" and obs.release.lower() in RELEASES and (
-                        old is None or Archive._version_key(obs) > Archive._version_key(old)
+                    if obs.release.lower() in RELEASES and (
+                        old is None or Archive._version_key(obs) > Archive._version_key(old[0])
                     ):
-                        available[obs.identity] = obs
-                sample = Archive.candidates(list(available.values()), self.settings.max_candidates)
+                        available[obs.identity] = (obs, frame)
+                # A superseded calibration cannot establish a match for the
+                # preferred release of the same exposure.
+                matches = [obs for obs, frame in available.values() if query.band_match(
+                    obs.detector, frame["wavelength_um"], frame["bandwidth_um"], frame["processing_version"],
+                ) == "matched"]
+                sample = Archive.candidates(matches, self.settings.max_candidates)
                 return [entry for obs in sample if (entry := self._read(db, field, obs, since))]
         except (OSError, sqlite3.Error, ValueError, KeyError):
             logger.warning("Could not open cached field", exc_info=True)
